@@ -1,17 +1,17 @@
 {
-  "name": "oscar-regression-suite",
+  "name": "oscar-regression",
   "version": "1.1.0",
   "private": true,
   "description": "End-to-end regression, fault-injection, workflow, and performance validation for OSCAR test deployments.",
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ORNL/oscar-regression-suite.git"
+    "url": "git+https://github.com/ORNL/oscar-regression.git"
   },
   "bugs": {
-    "url": "https://github.com/ORNL/oscar-regression-suite/issues"
+    "url": "https://github.com/ORNL/oscar-regression/issues"
   },
-  "homepage": "https://github.com/ORNL/oscar-regression-suite#readme",
+  "homepage": "https://github.com/ORNL/oscar-regression#readme",
   "type": "module",
   "engines": {
     "node": ">=20.16.0"
