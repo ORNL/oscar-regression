@@ -67,7 +67,7 @@ Read references/TARGET_CHECKLIST.md before deploying to a new runner or target.
 
 Prefer an existing checkout. The canonical Linux runner checkout is
 /home/tyrone/projects/oscar-regression-suite. The source repository is
-git@github.com:tyronechrisharris/oscar-regression-suite.git.
+git@github.com:ORNL/oscar-regression-suite.git.
 
 On a new runner:
 

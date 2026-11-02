@@ -10,7 +10,7 @@ OSCAR, the RPM emulator, and the camera emulator. The current validated runner i
 Clone the repository into a non-shared directory and install locked dependencies:
 
 ```bash
-git clone git@github.com:tyronechrisharris/oscar-regression-suite.git
+git clone git@github.com:ORNL/oscar-regression-suite.git
 cd oscar-regression-suite
 npm ci
 ```

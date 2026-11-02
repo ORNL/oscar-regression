@@ -6,12 +6,12 @@
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tyronechrisharris/oscar-regression-suite.git"
+    "url": "git+https://github.com/ORNL/oscar-regression-suite.git"
   },
   "bugs": {
-    "url": "https://github.com/tyronechrisharris/oscar-regression-suite/issues"
+    "url": "https://github.com/ORNL/oscar-regression-suite/issues"
   },
-  "homepage": "https://github.com/tyronechrisharris/oscar-regression-suite#readme",
+  "homepage": "https://github.com/ORNL/oscar-regression-suite#readme",
   "type": "module",
   "engines": {
     "node": ">=20.16.0"
