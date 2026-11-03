@@ -52,6 +52,9 @@ source review before the suite can certify that version.
 - deterministic Alarm Transfer camera scanning, lifecycle cleanup, permission
   failure/retry, and exported QR PNG image import
 - full adjudication, confirmation, and audit-history display
+- continuous never-reloaded Wallboard Watcher + PWA Service Worker notification +
+  scoped/unscoped full Adjudication UI endurance testing
+  (`scripts/run-ui-endurance.sh`; see [`docs/UI_ENDURANCE.md`](docs/UI_ENDURANCE.md))
 - site, lane, event, state-of-health, and adjudication PDF reports
 - exact membership for all five location and both direction operational views,
   Health-navigation query persistence, and malformed/unassigned inputs failing closed
