@@ -231,6 +231,22 @@ export function assessPageZeroAlarmVisibility(params: {
 }
 
 /**
+ * Returns true when a Service Worker notification carries a non-empty operational-view
+ * `viewKey` from a prior scoped epoch (`viewKey !== activeScopedViewKey`), while keeping
+ * unscoped notifications (`viewKey == null`) and active-epoch notifications intact.
+ */
+export function shouldPurgePriorScopedNotification(
+  notificationViewKey: unknown,
+  activeScopedViewKey: string,
+): boolean {
+  return (
+    typeof notificationViewKey === "string" &&
+    notificationViewKey.length > 0 &&
+    notificationViewKey !== activeScopedViewKey
+  );
+}
+
+/**
  * Evaluates strict fail-closed Operational View isolation across `LaneStatus` cards,
  * `EventTable` rows, and Service Worker `alarm-notification-*` payloads.
  */

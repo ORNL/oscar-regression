@@ -29,6 +29,7 @@ import {
   MAX_BULK_ADJUDICATION_ROWS,
   parseUiEnduranceCliArgs,
   selectAdjudicationCandidates,
+  shouldPurgePriorScopedNotification,
   type AlarmEventSummary,
   type CycleExecutionPlan,
   type RenderedEventRow,
@@ -1029,6 +1030,30 @@ class UiEnduranceRunner {
     });
   }
 
+  private async purgePriorScopedNotifications(page: Page, activeScopedViewKey: string): Promise<void> {
+    const notifications = await this.readPwaNotifications(page).catch(() => []);
+    const staleTags = notifications
+      .filter((n) => shouldPurgePriorScopedNotification(n.viewKey, activeScopedViewKey))
+      .map((n) => n.tag)
+      .filter((tag) => tag.length > 0);
+    if (staleTags.length === 0) return;
+    await page.evaluate(
+      async ({tags, activeView}) => {
+        if (!("serviceWorker" in navigator)) return;
+        const tagSet = new Set(tags);
+        const reg = await navigator.serviceWorker.ready;
+        for (const n of await reg.getNotifications()) {
+          const data = (n.data ?? {}) as Record<string, unknown>;
+          const notifView = typeof data.viewKey === "string" ? data.viewKey : null;
+          if (tagSet.has(n.tag ?? "") || (notifView && notifView !== activeView)) {
+            n.close();
+          }
+        }
+      },
+      {tags: staleTags, activeView: activeScopedViewKey},
+    ).catch(() => undefined);
+  }
+
   private async readCdpMetrics(cdp: CDPSession | undefined): Promise<CdpMetricsSnapshot> {
     if (!cdp) return {jsHeapMb: 0, domNodes: 0, eventListeners: 0};
     try {
@@ -1124,9 +1149,10 @@ class UiEnduranceRunner {
     }
     this.scopedRotationCount += 1;
     const page = this.scopedWallboardPage!;
-    // Close notifications from the prior view epoch so scoped notification checks
-    // strictly evaluate notifications emitted while this viewKey is active.
-    await page.evaluate(async () => {
+    // Close notifications from the prior view epoch via `unscopedWallboardPage` (which is always
+    // mounted on the HTTPS origin, unlike `page` when `refreshScopedTab` opens `about:blank`).
+    const originNotificationPage = this.unscopedWallboardPage ?? page;
+    await originNotificationPage.evaluate(async () => {
       if (!("serviceWorker" in navigator)) return;
       const reg = await navigator.serviceWorker.ready;
       for (const n of await reg.getNotifications()) n.close();
@@ -1139,6 +1165,9 @@ class UiEnduranceRunner {
     await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
+    // Also purge any in-flight notification emitted by the outgoing view during navigation
+    // teardown while preserving unscoped (`viewKey === null`) and active-view notifications.
+    await this.purgePriorScopedNotifications(page, viewKey);
     await poll(
       () => this.readCardLanes(page),
       (lanes) => lanes.length === expectedLanes.length,
