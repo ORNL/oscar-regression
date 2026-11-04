@@ -5,6 +5,7 @@ import {REQUIRED_OPERATIONAL_VIEW_KEYS, type LaneConfigOracle} from "./lane-conf
 
 export const UI_ENDURANCE_PAGE_SIZE = 15;
 export const MAX_BULK_ADJUDICATION_ROWS = 2;
+export const DEFAULT_OPERATOR_RECYCLE_CYCLES = 12;
 
 export const UI_ENDURANCE_WORKFLOWS = [
   "pwa-notification-detail",
@@ -52,6 +53,7 @@ export interface CycleExecutionPlan {
   readonly workflow: UiEnduranceWorkflow;
   readonly scopedWatcherViewKey: string;
   readonly rotateScopedWatcher: boolean;
+  readonly recycleOperatorTab: boolean;
   readonly operatorViewKey: string | null;
   readonly secondaryInspection: SecondaryInspectionStatus;
   readonly isotopePlan: IsotopeTestPlan;
@@ -104,8 +106,29 @@ export interface UiEnduranceCliOptions {
   readonly durationSeconds?: number;
   readonly cycleIntervalMs: number;
   readonly scopedHoldCycles: number;
+  readonly operatorRecycleCycles: number;
   readonly wallboardSettleMs: number;
   readonly readOnlyWallboard: boolean;
+}
+
+const BENIGN_VIEWER_CONSOLE_FRAGMENTS = [
+  "Failed to load resource: the server responded with a status of 404",
+  "MUI X: useResizeContainer",
+  "QR Scan Error: No QR code found",
+  "Failed to fetch DRF values",
+  "net::ERR_CONNECTION_RESET",
+  "net::ERR_NAME_NOT_RESOLVED",
+  "net::ERR_NETWORK_CHANGED",
+] as const;
+
+/**
+ * Filters expected browser console noise (optional HLS/retained-media 404 probes,
+ * QR frame misses prior to detection, and offline external Sandia WebID DRF lookups)
+ * while preserving real application errors and Service Worker registration failures.
+ */
+export function isBenignViewerConsoleError(text: string): boolean {
+  if (text.includes("Service Worker registration failed")) return false;
+  return BENIGN_VIEWER_CONSOLE_FRAGMENTS.some((fragment) => text.includes(fragment));
 }
 
 const ALARM_PRIORITY_ORDER = ["Gamma & Neutron", "Neutron", "Gamma"] as const;
@@ -337,11 +360,13 @@ export function buildCycleExecutionPlan(params: {
   readonly runTag: string;
   readonly configuredViews?: readonly string[];
   readonly scopedHoldCycles: number;
+  readonly operatorRecycleCycles?: number;
 }): CycleExecutionPlan {
   if (!Number.isSafeInteger(params.cycleIndex) || params.cycleIndex < 0) {
     throw new Error("cycleIndex must be a non-negative safe integer");
   }
   const holdCycles = Math.max(1, params.scopedHoldCycles);
+  const recycleCycles = Math.max(1, params.operatorRecycleCycles ?? DEFAULT_OPERATOR_RECYCLE_CYCLES);
   const views = params.configuredViews && params.configuredViews.length > 0
     ? params.configuredViews
     : REQUIRED_OPERATIONAL_VIEW_KEYS;
@@ -350,6 +375,7 @@ export function buildCycleExecutionPlan(params: {
   const viewEpoch = Math.floor(params.cycleIndex / holdCycles);
   const scopedWatcherViewKey = views[viewEpoch % views.length]!;
   const rotateScopedWatcher = params.cycleIndex === 0 || params.cycleIndex % holdCycles === 0;
+  const recycleOperatorTab = params.cycleIndex > 0 && params.cycleIndex % recycleCycles === 0;
 
   // Alternate operator workflows across scoped and unscoped surfaces so every
   // adjudication workflow is exercised under operational-view scoping and unscoped mode.
@@ -381,6 +407,7 @@ export function buildCycleExecutionPlan(params: {
     workflow,
     scopedWatcherViewKey,
     rotateScopedWatcher,
+    recycleOperatorTab,
     operatorViewKey,
     secondaryInspection,
     isotopePlan,
@@ -401,6 +428,7 @@ export function parseUiEnduranceCliArgs(
     "--duration-seconds",
     "--interval-ms",
     "--scoped-hold-cycles",
+    "--operator-recycle-cycles",
     "--wallboard-settle-ms",
   ]);
   const switchFlags = new Set(["--continuous", "--read-only-wallboard"]);
@@ -466,6 +494,12 @@ export function parseUiEnduranceCliArgs(
     1,
     10_000,
   ) ?? (effectiveMaxCycles !== undefined && effectiveMaxCycles <= 8 ? 1 : 4);
+  const operatorRecycleCycles = parsePositiveInt(
+    values.get("--operator-recycle-cycles") ?? env.UI_ENDURANCE_OPERATOR_RECYCLE_CYCLES,
+    "operatorRecycleCycles",
+    1,
+    10_000,
+  ) ?? DEFAULT_OPERATOR_RECYCLE_CYCLES;
   const wallboardSettleMs = parsePositiveInt(
     values.get("--wallboard-settle-ms") ?? env.UI_ENDURANCE_WALLBOARD_SETTLE_MS,
     "wallboardSettleMs",
@@ -478,6 +512,7 @@ export function parseUiEnduranceCliArgs(
     ...(durationSeconds === undefined ? {} : {durationSeconds}),
     cycleIntervalMs,
     scopedHoldCycles,
+    operatorRecycleCycles,
     wallboardSettleMs,
     readOnlyWallboard,
   };

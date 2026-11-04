@@ -7,7 +7,9 @@ import {
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
   compareAlarmsByViewerPriority,
+  DEFAULT_OPERATOR_RECYCLE_CYCLES,
   deriveAlarmStatusFromResult,
+  isBenignViewerConsoleError,
   MAX_BULK_ADJUDICATION_ROWS,
   parseUiEnduranceCliArgs,
   SECONDARY_INSPECTION_STATUSES,
@@ -228,17 +230,70 @@ test("parseUiEnduranceCliArgs defaults to 4 bounded cycles and supports continuo
   const boundedDefault = parseUiEnduranceCliArgs([], {});
   assert.equal(boundedDefault.maxCycles, 4);
   assert.equal(boundedDefault.scopedHoldCycles, 1);
+  assert.equal(boundedDefault.operatorRecycleCycles, DEFAULT_OPERATOR_RECYCLE_CYCLES);
   assert.equal(boundedDefault.readOnlyWallboard, false);
 
   const daemon = parseUiEnduranceCliArgs(
-    ["--continuous", "--interval-ms", "15000", "--scoped-hold-cycles", "6"],
+    [
+      "--continuous",
+      "--interval-ms",
+      "15000",
+      "--scoped-hold-cycles",
+      "6",
+      "--operator-recycle-cycles",
+      "10",
+    ],
     {},
   );
   assert.equal(daemon.maxCycles, undefined);
   assert.equal(daemon.durationSeconds, undefined);
   assert.equal(daemon.cycleIntervalMs, 15_000);
   assert.equal(daemon.scopedHoldCycles, 6);
+  assert.equal(daemon.operatorRecycleCycles, 10);
 
   assert.throws(() => parseUiEnduranceCliArgs(["--unknown-flag"], {}));
   assert.throws(() => parseUiEnduranceCliArgs(["--max-cycles", "0"], {}));
+});
+
+test("buildCycleExecutionPlan schedules periodic operator tab recycling without recycling cycle 0", () => {
+  const c0 = buildCycleExecutionPlan({
+    cycleIndex: 0,
+    runTag: "MEM01",
+    scopedHoldCycles: 4,
+    operatorRecycleCycles: 12,
+  });
+  const c11 = buildCycleExecutionPlan({
+    cycleIndex: 11,
+    runTag: "MEM01",
+    scopedHoldCycles: 4,
+    operatorRecycleCycles: 12,
+  });
+  const c12 = buildCycleExecutionPlan({
+    cycleIndex: 12,
+    runTag: "MEM01",
+    scopedHoldCycles: 4,
+    operatorRecycleCycles: 12,
+  });
+  assert.equal(c0.recycleOperatorTab, false);
+  assert.equal(c11.recycleOperatorTab, false);
+  assert.equal(c12.recycleOperatorTab, true);
+});
+
+test("isBenignViewerConsoleError filters offline WebID DRF noise while keeping Service Worker errors fatal", () => {
+  assert.equal(
+    isBenignViewerConsoleError("Failed to fetch DRF values: TypeError: Failed to fetch"),
+    true,
+  );
+  assert.equal(
+    isBenignViewerConsoleError("Failed to load resource: net::ERR_CONNECTION_RESET"),
+    true,
+  );
+  assert.equal(
+    isBenignViewerConsoleError("Service Worker registration failed: SecurityError"),
+    false,
+  );
+  assert.equal(
+    isBenignViewerConsoleError("Uncaught TypeError: Cannot read properties of undefined"),
+    false,
+  );
 });
