@@ -26,6 +26,7 @@ import {
   buildCycleExecutionPlan,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
+  isAlarmGridHydrationSettled,
   isBenignViewerConsoleError,
   isUnadjudicatedAlarm,
   MAX_BULK_ADJUDICATION_ROWS,
@@ -1201,10 +1202,15 @@ class UiEnduranceRunner {
     }
   }
 
-  private async navigateAndWaitForAlarmGridHydration(page: Page, url: string): Promise<void> {
+  private async navigateAndWaitForAlarmGridHydration(
+    page: Page,
+    url: string,
+    expectedCardCount?: number,
+  ): Promise<void> {
     let seenObsRequests = 0;
     let inFlightObsRequests = 0;
     let lastObsEventMs = Date.now();
+    let cardsReadyAtMs: number | null = null;
     const isObsRequest = (reqUrl: string): boolean => reqUrl.includes("/sensorhub/api/observations") ||
       (reqUrl.includes("/datastreams/") && reqUrl.includes("/observations"));
 
@@ -1229,10 +1235,29 @@ class UiEnduranceRunner {
       await page.goto(url, {waitUntil: "domcontentloaded"});
       await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
       await poll(
-        async () =>
-          seenObsRequests >= 1 &&
-          inFlightObsRequests === 0 &&
-          Date.now() - lastObsEventMs >= 600,
+        async () => {
+          let renderedCardCount: number | undefined;
+          if (expectedCardCount !== undefined) {
+            renderedCardCount = (await this.readCardLanes(page)).length;
+            if (renderedCardCount >= expectedCardCount && cardsReadyAtMs === null) {
+              cardsReadyAtMs = Date.now();
+            }
+          }
+          const gridLoadingIndicators = await page
+            .locator(".MuiDataGrid-root .MuiCircularProgress-root")
+            .count()
+            .catch(() => 0);
+          return isAlarmGridHydrationSettled({
+            seenObsRequests,
+            inFlightObsRequests,
+            lastObsEventMs,
+            nowMs: Date.now(),
+            renderedCardCount,
+            expectedCardCount,
+            cardsReadyAtMs,
+            gridLoadingIndicators,
+          });
+        },
         Boolean,
         {
           timeoutMs: 35_000,
@@ -1255,7 +1280,11 @@ class UiEnduranceRunner {
     this.unscopedCdp = await this.wallboardContext.newCDPSession(page);
     await this.unscopedCdp.send("Performance.enable");
 
-    await this.navigateAndWaitForAlarmGridHydration(page, this.viewerUrl("/"));
+    await this.navigateAndWaitForAlarmGridHydration(
+      page,
+      this.viewerUrl("/"),
+      this.config.expectedLaneCount,
+    );
     await poll(
       () => this.readCardLanes(page),
       (lanes) => lanes.length === this.config.expectedLaneCount,
@@ -1318,6 +1347,7 @@ class UiEnduranceRunner {
     await this.navigateAndWaitForAlarmGridHydration(
       page,
       this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`),
+      expectedLanes.length,
     );
     await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
