@@ -25,6 +25,7 @@ import {
   buildCycleExecutionPlan,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
+  isBenignViewerConsoleError,
   MAX_BULK_ADJUDICATION_ROWS,
   parseUiEnduranceCliArgs,
   selectAdjudicationCandidates,
@@ -409,6 +410,7 @@ class UiEnduranceRunner {
   private unscopedMountId = "";
   private scopedMountId = "";
   private activeScopedViewKey = "";
+  private scopedRotationCount = 0;
   private pwaManifestVerified = false;
   private spkiCount = 0;
 
@@ -417,11 +419,24 @@ class UiEnduranceRunner {
   private currentCycle = 0;
   private stopRequested = false;
 
-  private readonly wallboardSamples: WallboardSampleRecord[] = [];
-  private readonly adjudicationRecords: AdjudicationRecord[] = [];
-  private readonly errorRecords: EnduranceErrorRecord[] = [];
+  // Bounded O(1) telemetry counters & recent ring buffers so multi-week continuous
+  // daemon runs never accumulate unbounded arrays or sets in Node.js heap.
+  private readonly recentAdjudicationRecords: AdjudicationRecord[] = [];
   private readonly recentlyAdjudicatedKeys = new Set<string>();
   private readonly seenWallboardNotificationTags = new Set<string>();
+  private uniqueNotificationTagCount = 0;
+  private totalWallboardSamples = 0;
+  private failedWallboardSamples = 0;
+  private unscopedMountPreservedAll = true;
+  private firstUnscopedHeapMb: number | undefined;
+  private latestUnscopedHeapMb = 0;
+  private readonly scopedViewsVerified = new Set<string>();
+  private passedAdjudicationCycles = 0;
+  private failedAdjudicationCycles = 0;
+  private skippedAdjudicationCycles = 0;
+  private readonly workflowsVerified = new Set<string>();
+  private hardErrorCount = 0;
+  private warningCount = 0;
 
   constructor(
     private readonly config: SuiteConfig,
@@ -491,9 +506,81 @@ class UiEnduranceRunner {
       message: sanitized,
       evidence,
     };
-    this.errorRecords.push(entry);
+    if (severity === "error") {
+      this.hardErrorCount += 1;
+    } else {
+      this.warningCount += 1;
+    }
     appendCsvLine(this.errorsCsvPath, [
       entry.timestamp, entry.cycle, entry.source, entry.severity, entry.message, entry.evidence,
+    ]);
+  }
+
+  private rememberAdjudicatedKey(identity: string): void {
+    this.recentlyAdjudicatedKeys.delete(identity);
+    this.recentlyAdjudicatedKeys.add(identity);
+    while (this.recentlyAdjudicatedKeys.size > 2_000) {
+      const oldest = this.recentlyAdjudicatedKeys.values().next().value;
+      if (oldest === undefined) break;
+      this.recentlyAdjudicatedKeys.delete(oldest);
+    }
+  }
+
+  private rememberNotificationTag(tag: string): void {
+    if (!this.seenWallboardNotificationTags.has(tag)) {
+      this.uniqueNotificationTagCount += 1;
+    }
+    this.seenWallboardNotificationTags.delete(tag);
+    this.seenWallboardNotificationTags.add(tag);
+    while (this.seenWallboardNotificationTags.size > 5_000) {
+      const oldest = this.seenWallboardNotificationTags.values().next().value;
+      if (oldest === undefined) break;
+      this.seenWallboardNotificationTags.delete(oldest);
+    }
+  }
+
+  private recordWallboardSample(sample: WallboardSampleRecord): void {
+    this.totalWallboardSamples += 1;
+    if (!sample.passed) this.failedWallboardSamples += 1;
+    if (sample.tab === "unscoped") {
+      if (!sample.mountPreserved) this.unscopedMountPreservedAll = false;
+      if (this.firstUnscopedHeapMb === undefined) this.firstUnscopedHeapMb = sample.jsHeapMb;
+      this.latestUnscopedHeapMb = sample.jsHeapMb;
+    } else {
+      this.scopedViewsVerified.add(sample.viewKey);
+    }
+    appendCsvLine(this.wallboardCsvPath, [
+      sample.timestamp, sample.cycle, sample.tab, sample.viewKey,
+      sample.mountPreserved, sample.pwaReady, sample.cardCount,
+      sample.totalRowCount, sample.visibleRows, sample.notificationsCount,
+      sample.eligibleNewAlarms, sample.expectedPageZeroNew,
+      sample.matchedPageZeroNew, sample.scopeIsolated, sample.jsHeapMb,
+      sample.domNodes, sample.eventListeners, sample.passed,
+      sample.detail,
+    ]);
+  }
+
+  private recordAdjudicationRecord(record: AdjudicationRecord): void {
+    if (record.status === "passed") {
+      this.passedAdjudicationCycles += 1;
+      this.workflowsVerified.add(record.workflow);
+    } else if (record.status === "failed") {
+      this.failedAdjudicationCycles += 1;
+    } else {
+      this.skippedAdjudicationCycles += 1;
+    }
+    this.recentAdjudicationRecords.push(record);
+    if (this.recentAdjudicationRecords.length > 25) {
+      this.recentAdjudicationRecords.splice(0, this.recentAdjudicationRecords.length - 25);
+    }
+    appendCsvLine(this.adjudicationsCsvPath, [
+      record.timestamp, record.cycle, record.workflow,
+      record.scopeView, record.laneId,
+      record.occupancyCount, record.observationId,
+      record.vehicleId, record.secondaryInspection,
+      record.isotopes, record.evidenceSummary,
+      record.consysVerified, record.uiRemovedLive,
+      record.durationMs, record.status, record.detail,
     ]);
   }
 
@@ -504,12 +591,7 @@ class UiEnduranceRunner {
     page.on("console", (msg) => {
       if (msg.type() !== "error") return;
       const text = msg.text();
-      const benign = [
-        "Failed to load resource: the server responded with a status of 404",
-        "MUI X: useResizeContainer",
-        "QR Scan Error: No QR code found",
-      ].some((fragment) => text.includes(fragment));
-      if (!benign) {
+      if (!isBenignViewerConsoleError(text)) {
         // Notice: Service Worker SecurityError is deliberately NOT suppressed here because
         // SPKI pinning must keep `/sw.js` clean!
         const isSwFailure = text.includes("Service Worker registration failed");
@@ -1006,16 +1088,42 @@ class UiEnduranceRunner {
     this.unscopedMountId = await this.stampMountToken(page, "__oscarUnscopedMountId");
   }
 
+  /**
+   * Periodically replaces only `operatorPage` inside `operatorContext` so native Chromium
+   * FFmpeg/GPU `<video>` decoder buffers from `/event-details` media playback do not
+   * accumulate across multi-day runs. `wallboardContext` (never-reloaded unscoped Wallboard)
+   * and `operatorContext` (auth cookies, camera fixture, `/sw.js` Service Worker) stay intact.
+   */
+  private async recycleOperatorPage(): Promise<void> {
+    if (!this.operatorContext) return;
+    const previousPage = this.operatorPage;
+    const replacementPage = await this.operatorContext.newPage();
+    this.attachPageTelemetry(replacementPage, "operator");
+    this.operatorPage = replacementPage;
+    await previousPage?.close().catch(() => undefined);
+  }
+
   private async rotateScopedWallboard(viewKey: string): Promise<void> {
     if (!this.wallboardContext) throw new Error("Wallboard context unavailable");
-    if (!this.scopedWallboardPage) {
+    // Refresh the rotating scoped tab once every full 7-view sweep to shed navigation
+    // history / BFCache entries while keeping Tab 1 (`unscopedWallboardPage`) never-reloaded.
+    const refreshScopedTab =
+      !this.scopedWallboardPage ||
+      (this.scopedRotationCount > 0 &&
+        this.scopedRotationCount % REQUIRED_OPERATIONAL_VIEW_KEYS.length === 0);
+    if (refreshScopedTab) {
+      const oldCdp = this.scopedCdp;
+      const oldPage = this.scopedWallboardPage;
       const page = await this.wallboardContext.newPage();
       this.attachPageTelemetry(page, "wallboard-scoped");
       this.scopedWallboardPage = page;
       this.scopedCdp = await this.wallboardContext.newCDPSession(page);
       await this.scopedCdp.send("Performance.enable");
+      await oldCdp?.detach().catch(() => undefined);
+      await oldPage?.close().catch(() => undefined);
     }
-    const page = this.scopedWallboardPage;
+    this.scopedRotationCount += 1;
+    const page = this.scopedWallboardPage!;
     // Close notifications from the prior view epoch so scoped notification checks
     // strictly evaluate notifications emitted while this viewKey is active.
     await page.evaluate(async () => {
@@ -1089,7 +1197,7 @@ class UiEnduranceRunner {
     const unscopedTotalCount = await this.readTotalRowCount(unscopedPage);
     const allNotifications = await this.readPwaNotifications(unscopedPage);
     const alarmNotifications = allNotifications.filter((n) => n.tag.startsWith("alarm-notification-"));
-    for (const n of alarmNotifications) this.seenWallboardNotificationTags.add(n.tag);
+    for (const n of alarmNotifications) this.rememberNotificationTag(n.tag);
     const unscopedCdpMetrics = await this.readCdpMetrics(this.unscopedCdp);
 
     const unscopedPwaReady = await unscopedPage.evaluate(async () => {
@@ -1134,16 +1242,7 @@ class UiEnduranceRunner {
       passed: unscopedPassed,
       detail: unscopedPageZero.reason,
     };
-    this.wallboardSamples.push(unscopedSample);
-    appendCsvLine(this.wallboardCsvPath, [
-      unscopedSample.timestamp, unscopedSample.cycle, unscopedSample.tab, unscopedSample.viewKey,
-      unscopedSample.mountPreserved, unscopedSample.pwaReady, unscopedSample.cardCount,
-      unscopedSample.totalRowCount, unscopedSample.visibleRows, unscopedSample.notificationsCount,
-      unscopedSample.eligibleNewAlarms, unscopedSample.expectedPageZeroNew,
-      unscopedSample.matchedPageZeroNew, unscopedSample.scopeIsolated, unscopedSample.jsHeapMb,
-      unscopedSample.domNodes, unscopedSample.eventListeners, unscopedSample.passed,
-      unscopedSample.detail,
-    ]);
+    this.recordWallboardSample(unscopedSample);
 
     // 2. Scoped Operational View Wallboard Check
     const viewKey = this.activeScopedViewKey;
@@ -1236,16 +1335,7 @@ class UiEnduranceRunner {
       passed: scopedPassed,
       detail: `${isolation.reason}; ${scopedPageZero.reason}`,
     };
-    this.wallboardSamples.push(scopedSample);
-    appendCsvLine(this.wallboardCsvPath, [
-      scopedSample.timestamp, scopedSample.cycle, scopedSample.tab, scopedSample.viewKey,
-      scopedSample.mountPreserved, scopedSample.pwaReady, scopedSample.cardCount,
-      scopedSample.totalRowCount, scopedSample.visibleRows, scopedSample.notificationsCount,
-      scopedSample.eligibleNewAlarms, scopedSample.expectedPageZeroNew,
-      scopedSample.matchedPageZeroNew, scopedSample.scopeIsolated, scopedSample.jsHeapMb,
-      scopedSample.domNodes, scopedSample.eventListeners, scopedSample.passed,
-      scopedSample.detail,
-    ]);
+    this.recordWallboardSample(scopedSample);
 
     return {unscopedPassed, scopedPassed};
   }
@@ -1269,12 +1359,35 @@ class UiEnduranceRunner {
     await page.getByText("Adjudication Form", {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
+    // Wait for the Event Details summary card (`Adjudicated`) above the form to hydrate so
+    // asynchronous header/media mounting does not shift layout during the Code-0 Submit check.
+    await page.getByText("Adjudicated", {exact: true}).first().waitFor({
+      timeout: this.config.uiTimeoutMs,
+    }).catch(() => undefined);
 
-    // 1. Empty code (Code 0) submission guard
-    await page.getByRole("button", {name: "Submit", exact: true}).click();
-    await page
-      .getByText("Please select a valid adjudication code before submitting.", {exact: true})
-      .waitFor({timeout: 10_000});
+    // 1. Empty code (Code 0) submission guard (with bounded retry if above-the-fold media shifts layout)
+    const emptyCodeAlert = page.getByText(
+      "Please select a valid adjudication code before submitting.",
+      {exact: true},
+    );
+    await poll(
+      async () => {
+        if (await emptyCodeAlert.isVisible().catch(() => false)) return true;
+        const submitBtn = page.getByRole("button", {name: "Submit", exact: true});
+        await submitBtn.scrollIntoViewIfNeeded().catch(() => undefined);
+        await submitBtn.click({timeout: 5_000}).catch(() => undefined);
+        return emptyCodeAlert
+          .waitFor({state: "visible", timeout: 2_000})
+          .then(() => true)
+          .catch(() => false);
+      },
+      Boolean,
+      {
+        timeoutMs: 12_000,
+        intervalMs: 250,
+        description: "Code-0 validation snackbar on Adjudication Form",
+      },
+    );
     const prematureConfirmVisible = await page
       .getByRole("dialog", {name: /Confirm Adjudication Submission/i})
       .isVisible()
@@ -1685,7 +1798,7 @@ class UiEnduranceRunner {
       targetNotification.eventId,
     );
 
-    this.recentlyAdjudicatedKeys.add(
+    this.rememberAdjudicatedKey(
       `${targetNotification.laneId}#${targetNotification.occupancyCount}`,
     );
 
@@ -1831,7 +1944,7 @@ class UiEnduranceRunner {
       this.operatorContext.request,
       observationId,
     );
-    this.recentlyAdjudicatedKeys.add(`${target.laneId}#${target.occupancyCount}`);
+    this.rememberAdjudicatedKey(`${target.laneId}#${target.occupancyCount}`);
 
     const passed = uiRemovedLive && consysVerified;
     return {
@@ -1991,7 +2104,7 @@ class UiEnduranceRunner {
       {timeoutMs: 25_000, intervalMs: 400, description: "Event Log Adjudicated=Yes column verification"},
     ).then(() => true, () => false);
 
-    this.recentlyAdjudicatedKeys.add(`${target.laneId}#${target.occupancyCount}`);
+    this.rememberAdjudicatedKey(`${target.laneId}#${target.occupancyCount}`);
     const passed = detailOutcome.consysVerified && verifiedAdjudicatedYes;
 
     return {
@@ -2127,8 +2240,8 @@ class UiEnduranceRunner {
     ]);
     const consysVerified = ok1 && ok2;
 
-    this.recentlyAdjudicatedKeys.add(`${first.laneId}#${first.occupancyCount}`);
-    this.recentlyAdjudicatedKeys.add(`${second.laneId}#${second.occupancyCount}`);
+    this.rememberAdjudicatedKey(`${first.laneId}#${first.occupancyCount}`);
+    this.rememberAdjudicatedKey(`${second.laneId}#${second.occupancyCount}`);
 
     const passed = uiRemovedLive && consysVerified;
     return {
@@ -2152,21 +2265,16 @@ class UiEnduranceRunner {
   }
 
   private writeSummary(finalStatus: "running" | "passed" | "failed" | "stopped"): void {
-    const passedCycles = this.adjudicationRecords.filter((r) => r.status === "passed").length;
-    const failedCycles = this.adjudicationRecords.filter((r) => r.status === "failed").length;
-    const skippedCycles = this.adjudicationRecords.filter((r) => r.status === "skipped").length;
-    const failedWallboards = this.wallboardSamples.filter((s) => !s.passed).length;
-    const hardErrors = this.errorRecords.filter((e) => e.severity === "error").length;
+    const passedCycles = this.passedAdjudicationCycles;
+    const failedCycles = this.failedAdjudicationCycles;
+    const skippedCycles = this.skippedAdjudicationCycles;
+    const failedWallboards = this.failedWallboardSamples;
+    const hardErrors = this.hardErrorCount;
 
-    const unscopedSamples = this.wallboardSamples.filter((s) => s.tab === "unscoped");
-    const firstHeap = unscopedSamples[0]?.jsHeapMb ?? 0;
-    const lastHeap = unscopedSamples[unscopedSamples.length - 1]?.jsHeapMb ?? 0;
-    const viewsCovered = [...new Set(
-      this.wallboardSamples.filter((s) => s.tab === "scoped").map((s) => s.viewKey),
-    )];
-    const workflowsCovered = [...new Set(
-      this.adjudicationRecords.filter((r) => r.status === "passed").map((r) => r.workflow),
-    )];
+    const firstHeap = this.firstUnscopedHeapMb ?? 0;
+    const lastHeap = this.latestUnscopedHeapMb;
+    const viewsCovered = [...this.scopedViewsVerified];
+    const workflowsCovered = [...this.workflowsVerified];
 
     const summary = {
       runId: this.runId,
@@ -2178,12 +2286,12 @@ class UiEnduranceRunner {
       pwa: {
         manifestAndServiceWorkerVerified: this.pwaManifestVerified,
         pinnedTlsSpkiCount: this.spkiCount,
-        uniqueLiveAlarmNotificationTags: this.seenWallboardNotificationTags.size,
+        uniqueLiveAlarmNotificationTags: this.uniqueNotificationTagCount,
       },
       wallboards: {
-        totalSamples: this.wallboardSamples.length,
+        totalSamples: this.totalWallboardSamples,
         failedSamples: failedWallboards,
-        unscopedMountPreservedAllCycles: unscopedSamples.every((s) => s.mountPreserved),
+        unscopedMountPreservedAllCycles: this.unscopedMountPreservedAll,
         scopedViewsVerified: viewsCovered,
         unscopedJsHeapFirstMb: firstHeap,
         unscopedJsHeapLatestMb: lastHeap,
@@ -2198,7 +2306,7 @@ class UiEnduranceRunner {
       },
       errors: {
         errorCount: hardErrors,
-        warningCount: this.errorRecords.filter((e) => e.severity === "warning").length,
+        warningCount: this.warningCount,
       },
     };
 
@@ -2210,8 +2318,8 @@ class UiEnduranceRunner {
       `- **Run ID:** \`${this.runId}\``,
       `- **Status:** \`${finalStatus.toUpperCase()}\``,
       `- **Started:** \`${this.startedAtIso}\` (elapsed \`${summary.elapsedSeconds}s\`)`,
-      `- **PWA Service Worker (\`/sw.js\` + SPKI TLS Pinning):** \`${this.pwaManifestVerified ? "ACTIVATED" : "NOT_READY"}\` (\`${this.spkiCount}\` SPKI pin(s), \`${this.seenWallboardNotificationTags.size}\` unique live alarm notification tags)`,
-      `- **Wallboard Samples:** \`${this.wallboardSamples.length - failedWallboards}/${this.wallboardSamples.length} PASS\` (unscoped never-reloaded mount preserved: \`${summary.wallboards.unscopedMountPreservedAllCycles}\`, heap \`${firstHeap} MB -> ${lastHeap} MB\`)`,
+      `- **PWA Service Worker (\`/sw.js\` + SPKI TLS Pinning):** \`${this.pwaManifestVerified ? "ACTIVATED" : "NOT_READY"}\` (\`${this.spkiCount}\` SPKI pin(s), \`${this.uniqueNotificationTagCount}\` unique live alarm notification tags)`,
+      `- **Wallboard Samples:** \`${this.totalWallboardSamples - failedWallboards}/${this.totalWallboardSamples} PASS\` (unscoped never-reloaded mount preserved: \`${summary.wallboards.unscopedMountPreservedAllCycles}\`, heap \`${firstHeap} MB -> ${lastHeap} MB\`)`,
       `- **Scoped Views Verified:** \`${viewsCovered.join(", ") || "none"}\``,
       `- **Adjudication Workflows:** \`${passedCycles} passed\`, \`${failedCycles} failed\`, \`${skippedCycles} skipped\` (workflows: \`${workflowsCovered.join(", ") || "none"}\`; reserved lane \`${this.config.testLaneLabel}\` excluded)`,
       `- **Browser/HTTP Errors:** \`${hardErrors}\` error(s), \`${summary.errors.warningCount}\` warning(s)`,
@@ -2220,7 +2328,7 @@ class UiEnduranceRunner {
       ``,
       `| Cycle | Workflow | View | Target | Vehicle ID | Inspection | Isotopes | ConSys | Live UI | Duration | Status |`,
       `| ---: | :--- | :--- | :--- | :--- | :--- | :--- | :---: | :---: | ---: | :---: |`,
-      ...this.adjudicationRecords.slice(-20).map((r) =>
+      ...this.recentAdjudicationRecords.slice(-20).map((r) =>
         `| ${r.cycle + 1} | \`${r.workflow}\` | \`${r.scopeView}\` | \`${r.laneId}#${r.occupancyCount}\` | \`${r.vehicleId}\` | \`${r.secondaryInspection}\` | \`${r.isotopes}\` | ${r.consysVerified ? "YES" : "NO"} | ${r.uiRemovedLive ? "YES" : "NO"} | ${r.durationMs}ms | \`${r.status.toUpperCase()}\` |`,
       ),
       ``,
@@ -2311,10 +2419,14 @@ class UiEnduranceRunner {
           runTag: this.runId.slice(-6).toUpperCase(),
           configuredViews,
           scopedHoldCycles: this.options.scopedHoldCycles,
+          operatorRecycleCycles: this.options.operatorRecycleCycles,
         });
 
         if (plan.rotateScopedWatcher) {
           await this.rotateScopedWallboard(plan.scopedWatcherViewKey);
+        }
+        if (!this.options.readOnlyWallboard && plan.recycleOperatorTab) {
+          await this.recycleOperatorPage();
         }
 
         const windowStartIso = this.lastAlarmPollIso;
@@ -2390,20 +2502,12 @@ class UiEnduranceRunner {
                 status: "failed",
                 detail: message,
               };
+              await this.recycleOperatorPage().catch(() => undefined);
             }
           }
 
           if (adjudicationRecord) {
-            this.adjudicationRecords.push(adjudicationRecord);
-            appendCsvLine(this.adjudicationsCsvPath, [
-              adjudicationRecord.timestamp, adjudicationRecord.cycle, adjudicationRecord.workflow,
-              adjudicationRecord.scopeView, adjudicationRecord.laneId,
-              adjudicationRecord.occupancyCount, adjudicationRecord.observationId,
-              adjudicationRecord.vehicleId, adjudicationRecord.secondaryInspection,
-              adjudicationRecord.isotopes, adjudicationRecord.evidenceSummary,
-              adjudicationRecord.consysVerified, adjudicationRecord.uiRemovedLive,
-              adjudicationRecord.durationMs, adjudicationRecord.status, adjudicationRecord.detail,
-            ]);
+            this.recordAdjudicationRecord(adjudicationRecord);
             if (adjudicationRecord.status === "failed") anyFailure = true;
           }
         }
@@ -2437,6 +2541,11 @@ class UiEnduranceRunner {
           await sleep(this.options.cycleIntervalMs);
         }
       }
+    } catch (fatalError) {
+      anyFailure = true;
+      this.recordError("runner-fatal", describeError(fatalError), "error");
+      this.writeSummary("failed");
+      throw fatalError;
     } finally {
       await this.unscopedCdp?.detach().catch(() => undefined);
       await this.scopedCdp?.detach().catch(() => undefined);
@@ -2445,8 +2554,7 @@ class UiEnduranceRunner {
       await this.browser?.close().catch(() => undefined);
     }
 
-    const hardErrors = this.errorRecords.filter((e) => e.severity === "error").length;
-    const finalFailed = anyFailure || hardErrors > 0;
+    const finalFailed = anyFailure || this.hardErrorCount > 0;
     const finalStatus = this.stopRequested && !finalFailed
       ? "stopped"
       : finalFailed
