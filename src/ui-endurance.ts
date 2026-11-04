@@ -1016,9 +1016,13 @@ class UiEnduranceRunner {
     );
   }
 
-  private async readRenderedRows(page: Page): Promise<RenderedEventRow[]> {
-    return page.locator(".MuiDataGrid-row").evaluateAll((elements) =>
-      elements.map((row) => {
+  private async readRenderedRows(
+    page: Page,
+    options?: {includeVirtualizedPageRows?: boolean},
+  ): Promise<RenderedEventRow[]> {
+    const includeVirtualized = Boolean(options?.includeVirtualizedPageRows);
+    return page.evaluate(async (scanAllPageRows) => {
+      const parseRowElement = (row: Element) => {
         const laneSpan = row.querySelector('[data-field="laneId"] span');
         const laneCell = row.querySelector('[data-field="laneId"]');
         const occCell = row.querySelector('[data-field="occupancyCount"]');
@@ -1031,8 +1035,59 @@ class UiEnduranceRunner {
           status: (statusCell?.textContent ?? "").trim(),
           startTimeText: (startCell?.textContent ?? "").trim(),
         };
-      }).filter((r) => Boolean(r.laneId && r.occupancyCount)),
-    );
+      };
+
+      if (!scanAllPageRows) {
+        return Array.from(document.querySelectorAll(".MuiDataGrid-row"))
+          .map(parseRowElement)
+          .filter((r) => Boolean(r.laneId && r.occupancyCount));
+      }
+
+      const collected = new Map<string, {rowIndex: number; row: ReturnType<typeof parseRowElement>}>();
+      const collectMounted = () => {
+        for (const el of Array.from(document.querySelectorAll(".MuiDataGrid-row"))) {
+          const parsed = parseRowElement(el);
+          if (!parsed.laneId || !parsed.occupancyCount) continue;
+          const idxAttr = Number(el.getAttribute("data-rowindex"));
+          const rowIndex = Number.isFinite(idxAttr) ? idxAttr : collected.size + 10_000;
+          const key = parsed.rowKey || `${parsed.laneId}#${parsed.occupancyCount}`;
+          if (!collected.has(key)) {
+            collected.set(key, {rowIndex, row: parsed});
+          }
+        }
+      };
+
+      const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+      const savedScrollTop = scroller?.scrollTop ?? 0;
+      collectMounted();
+
+      if (scroller && scroller.scrollHeight > scroller.clientHeight + 4) {
+        const waitFrame = () =>
+          new Promise<void>((resolve) => {
+            setTimeout(() => requestAnimationFrame(() => resolve()), 45);
+          });
+        const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+        const step = Math.max(120, Math.floor(scroller.clientHeight * 0.75));
+        for (let target = step; target < maxScroll; target += step) {
+          scroller.scrollTop = target;
+          scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+          await waitFrame();
+          collectMounted();
+        }
+        scroller.scrollTop = maxScroll;
+        scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+        await waitFrame();
+        collectMounted();
+
+        scroller.scrollTop = savedScrollTop;
+        scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+        await waitFrame();
+      }
+
+      return [...collected.values()]
+        .sort((a, b) => a.rowIndex - b.rowIndex)
+        .map((entry) => entry.row);
+    }, includeVirtualized);
   }
 
   private async readTotalRowCount(page: Page): Promise<number> {
@@ -1242,7 +1297,9 @@ class UiEnduranceRunner {
       newlyArrivedAlarms,
     );
 
-    let unscopedRows = await this.readRenderedRows(unscopedPage);
+    let unscopedRows = await this.readRenderedRows(unscopedPage, {
+      includeVirtualizedPageRows: true,
+    });
     let unscopedPageZero = assessPageZeroAlarmVisibility({
       currentPageZeroEvents: unscopedTopSnapshot,
       newlyArrivedEvents: newlyArrivedAlarms,
@@ -1252,7 +1309,9 @@ class UiEnduranceRunner {
       // Allow brief MQTT/ConSys settlement if an alarm landed right at the window boundary
       await poll(
         async () => {
-          unscopedRows = await this.readRenderedRows(unscopedPage);
+          unscopedRows = await this.readRenderedRows(unscopedPage, {
+            includeVirtualizedPageRows: true,
+          });
           unscopedPageZero = assessPageZeroAlarmVisibility({
             currentPageZeroEvents: unscopedTopSnapshot,
             newlyArrivedEvents: newlyArrivedAlarms,
@@ -1321,7 +1380,9 @@ class UiEnduranceRunner {
     const scopedMountNow = await this.readMountToken(scopedPage, "__oscarScopedMountId");
     const scopedMountPreserved = scopedMountNow === this.scopedMountId;
     const scopedCards = await this.readCardLanes(scopedPage);
-    let scopedRows = await this.readRenderedRows(scopedPage);
+    let scopedRows = await this.readRenderedRows(scopedPage, {
+      includeVirtualizedPageRows: true,
+    });
     const allowedSet = new Set(oracle?.lanesByView.get(viewKey) ?? []);
     const scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
       request,
@@ -1338,7 +1399,9 @@ class UiEnduranceRunner {
     if (!scopedPageZero.passed) {
       await poll(
         async () => {
-          scopedRows = await this.readRenderedRows(scopedPage);
+          scopedRows = await this.readRenderedRows(scopedPage, {
+            includeVirtualizedPageRows: true,
+          });
           scopedPageZero = assessPageZeroAlarmVisibility({
             currentPageZeroEvents: scopedTopSnapshot,
             newlyArrivedEvents: newlyArrivedAlarms,
