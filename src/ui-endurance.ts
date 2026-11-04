@@ -820,21 +820,24 @@ class UiEnduranceRunner {
 
   private async fetchTopPrioritySnapshot(
     request: APIRequestContext,
-    newlyArrivedAlarms: readonly AlarmEventSummary[],
     allowedLanes?: ReadonlySet<string>,
+    newlyArrivedAlarms?: readonly AlarmEventSummary[],
   ): Promise<AlarmEventSummary[]> {
     if (!this.catalog) return [];
-    const eligibleNew = newlyArrivedAlarms
-      .filter(isUnadjudicatedAlarm)
-      .filter((event) => !allowedLanes || allowedLanes.has(event.laneId));
-    if (eligibleNew.length === 0) return [];
+    let maxIncomingRank = 2;
+    if (newlyArrivedAlarms !== undefined) {
+      const eligibleNew = newlyArrivedAlarms
+        .filter(isUnadjudicatedAlarm)
+        .filter((event) => !allowedLanes || allowedLanes.has(event.laneId));
+      if (eligibleNew.length === 0) return [];
+      maxIncomingRank = Math.max(...eligibleNew.map((event) => alarmPriorityRank(event.status)));
+    }
 
     const streamIds = allowedLanes
       ? [...allowedLanes].flatMap((lane) => this.catalog?.laneToStreamIds.get(lane) ?? [])
       : [...this.catalog.allStreamIds];
     if (streamIds.length === 0) return [];
 
-    const maxIncomingRank = Math.max(...eligibleNew.map((event) => alarmPriorityRank(event.status)));
     const priorityPredicates = [
       "gammaAlarm=true AND neutronAlarm=true",
       "gammaAlarm=false AND neutronAlarm=true",
@@ -1233,7 +1236,11 @@ class UiEnduranceRunner {
     const unscopedMountNow = await this.readMountToken(unscopedPage, "__oscarUnscopedMountId");
     const unscopedMountPreserved = unscopedMountNow === this.unscopedMountId;
     const unscopedCards = await this.readCardLanes(unscopedPage);
-    const unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(request, newlyArrivedAlarms);
+    const unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+      request,
+      undefined,
+      newlyArrivedAlarms,
+    );
 
     let unscopedRows = await this.readRenderedRows(unscopedPage);
     let unscopedPageZero = assessPageZeroAlarmVisibility({
@@ -1318,8 +1325,8 @@ class UiEnduranceRunner {
     const allowedSet = new Set(oracle?.lanesByView.get(viewKey) ?? []);
     const scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
       request,
-      newlyArrivedAlarms,
       allowedSet,
+      newlyArrivedAlarms,
     );
 
     let scopedPageZero = assessPageZeroAlarmVisibility({
