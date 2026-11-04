@@ -6,9 +6,11 @@ import {
   assessPageZeroAlarmVisibility,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
+  buildEventRowCssSelector,
   compareAlarmsByViewerPriority,
   DEFAULT_OPERATOR_RECYCLE_CYCLES,
   deriveAlarmStatusFromResult,
+  isAlarmGridHydrationSettled,
   isBenignViewerConsoleError,
   MAX_BULK_ADJUDICATION_ROWS,
   parseUiEnduranceCliArgs,
@@ -318,4 +320,80 @@ test("shouldPurgePriorScopedNotification purges prior scoped views while preserv
   assert.equal(shouldPurgePriorScopedNotification(null, "east-gate"), false);
   assert.equal(shouldPurgePriorScopedNotification(undefined, "east-gate"), false);
   assert.equal(shouldPurgePriorScopedNotification("", "east-gate"), false);
+});
+
+test("isAlarmGridHydrationSettled prevents premature return during cold 7th-view tab recycle discovery", () => {
+  // Early observation probe finished >800ms ago, but scoped LaneStatus cards are still hydrating (0/10): must NOT settle.
+  assert.equal(
+    isAlarmGridHydrationSettled({
+      seenObsRequests: 1,
+      inFlightObsRequests: 0,
+      lastObsEventMs: 1_000,
+      nowMs: 2_500,
+      renderedCardCount: 0,
+      expectedCardCount: 10,
+      cardsReadyAtMs: null,
+      gridLoadingIndicators: 0,
+    }),
+    false,
+  );
+
+  // Cards just finished hydrating (10/10 at t=2_400), quiet window since cardsReadyAtMs not yet elapsed: must NOT settle.
+  assert.equal(
+    isAlarmGridHydrationSettled({
+      seenObsRequests: 2,
+      inFlightObsRequests: 0,
+      lastObsEventMs: 1_500,
+      nowMs: 2_900,
+      renderedCardCount: 10,
+      expectedCardCount: 10,
+      cardsReadyAtMs: 2_400,
+      gridLoadingIndicators: 0,
+    }),
+    false,
+  );
+
+  // DataGrid spinner still visible even after quiet window: must NOT settle.
+  assert.equal(
+    isAlarmGridHydrationSettled({
+      seenObsRequests: 4,
+      inFlightObsRequests: 0,
+      lastObsEventMs: 2_500,
+      nowMs: 3_500,
+      renderedCardCount: 10,
+      expectedCardCount: 10,
+      cardsReadyAtMs: 2_400,
+      gridLoadingIndicators: 1,
+    }),
+    false,
+  );
+
+  // Cards hydrated, zero in-flight requests, zero grid spinners, and >=800ms elapsed after both cardsReadyAtMs and lastObsEventMs: settled.
+  assert.equal(
+    isAlarmGridHydrationSettled({
+      seenObsRequests: 4,
+      inFlightObsRequests: 0,
+      lastObsEventMs: 2_600,
+      nowMs: 3_450,
+      renderedCardCount: 10,
+      expectedCardCount: 10,
+      cardsReadyAtMs: 2_400,
+      gridLoadingIndicators: 0,
+    }),
+    true,
+  );
+});
+
+test("buildEventRowCssSelector matches both upgraded durable observationId rowKey and pre-resolution MQTT rowKey", () => {
+  const mqttRowKey = "Local Node\u001fLane21\u001f2026-11-04T13:49:01.183Z\u001f2026-11-04T13:49:07.216Z";
+  assert.equal(
+    buildEventRowCssSelector(mqttRowKey, "0jmb179t"),
+    '.MuiDataGrid-row[data-id="Local Node\u001f0jmb179t"], .MuiDataGrid-row[data-id="Local Node\u001fLane21\u001f2026-11-04T13:49:01.183Z\u001f2026-11-04T13:49:07.216Z"]',
+  );
+
+  // Already-durable REST rowKey does not duplicate the selector
+  assert.equal(
+    buildEventRowCssSelector("Local Node\u001f0jmb179t", "0jmb179t"),
+    '.MuiDataGrid-row[data-id="Local Node\u001f0jmb179t"]',
+  );
 });

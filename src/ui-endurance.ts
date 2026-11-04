@@ -24,8 +24,10 @@ import {
   assessPageZeroAlarmVisibility,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
+  buildEventRowCssSelector,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
+  isAlarmGridHydrationSettled,
   isBenignViewerConsoleError,
   isUnadjudicatedAlarm,
   MAX_BULK_ADJUDICATION_ROWS,
@@ -119,10 +121,6 @@ interface OccupancyCatalog {
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function escapeCssAttributeValue(value: string): string {
-  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
 function writeAtomicPrivateFile(targetPath: string, contents: string): void {
@@ -1201,10 +1199,15 @@ class UiEnduranceRunner {
     }
   }
 
-  private async navigateAndWaitForAlarmGridHydration(page: Page, url: string): Promise<void> {
+  private async navigateAndWaitForAlarmGridHydration(
+    page: Page,
+    url: string,
+    expectedCardCount?: number,
+  ): Promise<void> {
     let seenObsRequests = 0;
     let inFlightObsRequests = 0;
     let lastObsEventMs = Date.now();
+    let cardsReadyAtMs: number | null = null;
     const isObsRequest = (reqUrl: string): boolean => reqUrl.includes("/sensorhub/api/observations") ||
       (reqUrl.includes("/datastreams/") && reqUrl.includes("/observations"));
 
@@ -1229,10 +1232,29 @@ class UiEnduranceRunner {
       await page.goto(url, {waitUntil: "domcontentloaded"});
       await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
       await poll(
-        async () =>
-          seenObsRequests >= 1 &&
-          inFlightObsRequests === 0 &&
-          Date.now() - lastObsEventMs >= 600,
+        async () => {
+          let renderedCardCount: number | undefined;
+          if (expectedCardCount !== undefined) {
+            renderedCardCount = (await this.readCardLanes(page)).length;
+            if (renderedCardCount >= expectedCardCount && cardsReadyAtMs === null) {
+              cardsReadyAtMs = Date.now();
+            }
+          }
+          const gridLoadingIndicators = await page
+            .locator(".MuiDataGrid-root .MuiCircularProgress-root")
+            .count()
+            .catch(() => 0);
+          return isAlarmGridHydrationSettled({
+            seenObsRequests,
+            inFlightObsRequests,
+            lastObsEventMs,
+            nowMs: Date.now(),
+            renderedCardCount,
+            expectedCardCount,
+            cardsReadyAtMs,
+            gridLoadingIndicators,
+          });
+        },
         Boolean,
         {
           timeoutMs: 35_000,
@@ -1255,7 +1277,11 @@ class UiEnduranceRunner {
     this.unscopedCdp = await this.wallboardContext.newCDPSession(page);
     await this.unscopedCdp.send("Performance.enable");
 
-    await this.navigateAndWaitForAlarmGridHydration(page, this.viewerUrl("/"));
+    await this.navigateAndWaitForAlarmGridHydration(
+      page,
+      this.viewerUrl("/"),
+      this.config.expectedLaneCount,
+    );
     await poll(
       () => this.readCardLanes(page),
       (lanes) => lanes.length === this.config.expectedLaneCount,
@@ -1318,6 +1344,7 @@ class UiEnduranceRunner {
     await this.navigateAndWaitForAlarmGridHydration(
       page,
       this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`),
+      expectedLanes.length,
     );
     await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
@@ -2088,9 +2115,16 @@ class UiEnduranceRunner {
       target.occupancyCount,
     );
 
-    // Click row to open QuickView inline panel
+    // Click row to open QuickView inline panel (resilient to live->durable data-id upgrade)
+    await page.evaluate(() => {
+      const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+      if (scroller && scroller.scrollTop > 0) {
+        scroller.scrollTop = 0;
+        scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+      }
+    });
     const rowLocator = page.locator(
-      `.MuiDataGrid-row[data-id="${escapeCssAttributeValue(target.rowKey)}"]`,
+      buildEventRowCssSelector(target.rowKey, observationId),
     ).first();
     await rowLocator.locator('[data-field="laneId"]').click();
 
@@ -2387,16 +2421,23 @@ class UiEnduranceRunner {
       second.occupancyCount,
     );
 
-    const checkRow = async (rowKey: string) => {
+    const checkRow = async (rowKey: string, observationId: string) => {
+      await page.evaluate(() => {
+        const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+        if (scroller && scroller.scrollTop > 0) {
+          scroller.scrollTop = 0;
+          scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+        }
+      });
       const row = page.locator(
-        `.MuiDataGrid-row[data-id="${escapeCssAttributeValue(rowKey)}"]`,
+        buildEventRowCssSelector(rowKey, observationId),
       ).first();
       await row.locator('[data-field="__check__"] input[type="checkbox"]').check();
     };
 
     // Select exactly 2 rows (NEVER Select all filtered alarms!)
-    await checkRow(first.rowKey);
-    await checkRow(second.rowKey);
+    await checkRow(first.rowKey, obsId1);
+    await checkRow(second.rowKey, obsId2);
 
     const bulkOpenBtn = page.getByRole("button", {name: "Adjudicate 2 selected", exact: true});
     await bulkOpenBtn.waitFor({timeout: 10_000});
@@ -2406,8 +2447,8 @@ class UiEnduranceRunner {
     await bulkOpenBtn.waitFor({state: "hidden", timeout: 10_000});
 
     // Re-select the 2 bounded rows and open Bulk adjudication dialog
-    await checkRow(first.rowKey);
-    await checkRow(second.rowKey);
+    await checkRow(first.rowKey, obsId1);
+    await checkRow(second.rowKey, obsId2);
     await bulkOpenBtn.waitFor({timeout: 10_000});
     await bulkOpenBtn.click();
 
