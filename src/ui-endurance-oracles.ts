@@ -186,14 +186,47 @@ export function assessPageZeroAlarmVisibility(params: {
     .filter(isUnadjudicatedAlarm)
     .filter((event) => !params.allowedLanes || params.allowedLanes.has(event.laneId));
 
+  if (eligibleNewAlarms.length === 0) {
+    return {
+      eligibleNewAlarms,
+      expectedOnPageZero: [],
+      missingFromDom: [],
+      matchedInDom: [],
+      passed: true,
+      reason: "matched 0/0 Page-0 eligible alarms (0 total new in scope)",
+    };
+  }
+
+  const incomingIdentities = new Set(
+    eligibleNewAlarms.map((event) => `${event.laneId}:${String(event.occupancyCount).trim()}`),
+  );
   const byKey = new Map<string, AlarmEventSummary>();
+  for (const row of params.renderedRows) {
+    if (alarmPriorityRank(row.status) >= ALARM_PRIORITY_ORDER.length) continue;
+    if (params.allowedLanes && !params.allowedLanes.has(row.laneId)) continue;
+    const identity = `${row.laneId}:${String(row.occupancyCount).trim()}`;
+    if (incomingIdentities.has(identity)) continue;
+    byKey.set(`dom:${identity}`, {
+      observationId: `dom:${identity}`,
+      laneId: row.laneId,
+      occupancyCount: String(row.occupancyCount).trim(),
+      startTime: "1970-01-01T00:00:00.000Z",
+      endTime: "1970-01-01T00:00:00.000Z",
+      status: row.status,
+      adjudicatedIdsCount: 0,
+    });
+  }
   for (const existing of params.currentPageZeroEvents) {
     if (!isUnadjudicatedAlarm(existing)) continue;
     if (params.allowedLanes && !params.allowedLanes.has(existing.laneId)) continue;
-    byKey.set(`${existing.laneId}:${existing.occupancyCount}:${existing.startTime}`, existing);
+    const identity = `${existing.laneId}:${String(existing.occupancyCount).trim()}`;
+    byKey.delete(`dom:${identity}`);
+    byKey.set(`${identity}:${existing.startTime}`, existing);
   }
   for (const incoming of eligibleNewAlarms) {
-    byKey.set(`${incoming.laneId}:${incoming.occupancyCount}:${incoming.startTime}`, incoming);
+    const identity = `${incoming.laneId}:${String(incoming.occupancyCount).trim()}`;
+    byKey.delete(`dom:${identity}`);
+    byKey.set(`${identity}:${incoming.startTime}`, incoming);
   }
 
   const projectedPageZero = [...byKey.values()]

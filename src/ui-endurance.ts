@@ -20,16 +20,19 @@ import {csvCell} from "./csv.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS, type LaneConfigOracle} from "./lane-config.js";
 import type {SuiteConfig} from "./types.js";
 import {
+  alarmPriorityRank,
   assessPageZeroAlarmVisibility,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
   isBenignViewerConsoleError,
+  isUnadjudicatedAlarm,
   MAX_BULK_ADJUDICATION_ROWS,
   parseUiEnduranceCliArgs,
   selectAdjudicationCandidates,
   shouldPurgePriorScopedNotification,
+  UI_ENDURANCE_PAGE_SIZE,
   type AlarmEventSummary,
   type CycleExecutionPlan,
   type RenderedEventRow,
@@ -817,38 +820,70 @@ class UiEnduranceRunner {
 
   private async fetchTopPrioritySnapshot(
     request: APIRequestContext,
+    newlyArrivedAlarms: readonly AlarmEventSummary[],
     allowedLanes?: ReadonlySet<string>,
   ): Promise<AlarmEventSummary[]> {
     if (!this.catalog) return [];
+    const eligibleNew = newlyArrivedAlarms
+      .filter(isUnadjudicatedAlarm)
+      .filter((event) => !allowedLanes || allowedLanes.has(event.laneId));
+    if (eligibleNew.length === 0) return [];
+
     const streamIds = allowedLanes
       ? [...allowedLanes].flatMap((lane) => this.catalog?.laneToStreamIds.get(lane) ?? [])
       : [...this.catalog.allStreamIds];
     if (streamIds.length === 0) return [];
 
+    const maxIncomingRank = Math.max(...eligibleNew.map((event) => alarmPriorityRank(event.status)));
     const priorityPredicates = [
       "gammaAlarm=true AND neutronAlarm=true",
       "gammaAlarm=false AND neutronAlarm=true",
       "gammaAlarm=true AND neutronAlarm=false",
-    ];
-    const nowIso = new Date().toISOString();
-    const pages = await Promise.all(
-      priorityPredicates.map(async (predicate) => {
-        const params = new URLSearchParams({
-          dataStream: streamIds.join(","),
-          resultTime: `../${nowIso}`,
-          filter: `adjudicatedIdsCount=0 AND (${predicate})`,
-          order: "desc",
-          limit: "15",
-        });
-        const res = await request.get(this.viewerUrl(`/sensorhub/api/observations?${params}`));
-        if (!res.ok()) return [];
-        const body = (await res.json()) as {items?: unknown[]};
-        return (body.items ?? [])
-          .map((item) => this.parseObservationSummary(item))
-          .filter((item): item is AlarmEventSummary => item !== null);
-      }),
-    );
-    return pages.flat();
+    ].slice(0, Math.min(3, maxIncomingRank + 1));
+
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const recentStartIso = new Date(nowMs - 2 * 3600_000).toISOString();
+    const collectedById = new Map<string, AlarmEventSummary>();
+
+    const queryTier = async (predicate: string, phenomenonRange: string): Promise<AlarmEventSummary[]> => {
+      const params = new URLSearchParams({
+        dataStream: streamIds.join(","),
+        phenomenonTime: phenomenonRange,
+        filter: `adjudicatedIdsCount=0 AND (${predicate})`,
+        order: "desc",
+        limit: String(UI_ENDURANCE_PAGE_SIZE),
+      });
+      const url = this.viewerUrl(`/sensorhub/api/observations?${params}`);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await request.get(url, {timeout: 45_000});
+          if (res.ok()) {
+            const body = (await res.json()) as {items?: unknown[]};
+            return (body.items ?? [])
+              .map((item) => this.parseObservationSummary(item))
+              .filter((item): item is AlarmEventSummary => item !== null);
+          }
+        } catch {
+          // Retry once if a concurrent cold-archive query contended on DuckDB.
+        }
+        await sleep(500);
+      }
+      return [];
+    };
+
+    for (const predicate of priorityPredicates) {
+      const recentItems = await queryTier(predicate, `${recentStartIso}/${nowIso}`);
+      for (const item of recentItems) collectedById.set(item.observationId, item);
+      if (collectedById.size >= UI_ENDURANCE_PAGE_SIZE) break;
+
+      if (recentItems.length < UI_ENDURANCE_PAGE_SIZE) {
+        const fullItems = await queryTier(predicate, `../${nowIso}`);
+        for (const item of fullItems) collectedById.set(item.observationId, item);
+        if (collectedById.size >= UI_ENDURANCE_PAGE_SIZE) break;
+      }
+    }
+    return [...collectedById.values()];
   }
 
   private async resolveObservationIdForLaneOccupancy(
@@ -1198,7 +1233,7 @@ class UiEnduranceRunner {
     const unscopedMountNow = await this.readMountToken(unscopedPage, "__oscarUnscopedMountId");
     const unscopedMountPreserved = unscopedMountNow === this.unscopedMountId;
     const unscopedCards = await this.readCardLanes(unscopedPage);
-    const unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(request);
+    const unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(request, newlyArrivedAlarms);
 
     let unscopedRows = await this.readRenderedRows(unscopedPage);
     let unscopedPageZero = assessPageZeroAlarmVisibility({
@@ -1281,7 +1316,11 @@ class UiEnduranceRunner {
     const scopedCards = await this.readCardLanes(scopedPage);
     let scopedRows = await this.readRenderedRows(scopedPage);
     const allowedSet = new Set(oracle?.lanesByView.get(viewKey) ?? []);
-    const scopedTopSnapshot = await this.fetchTopPrioritySnapshot(request, allowedSet);
+    const scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+      request,
+      newlyArrivedAlarms,
+      allowedSet,
+    );
 
     let scopedPageZero = assessPageZeroAlarmVisibility({
       currentPageZeroEvents: scopedTopSnapshot,

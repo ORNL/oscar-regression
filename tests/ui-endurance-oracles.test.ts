@@ -122,6 +122,18 @@ test("assessPageZeroAlarmVisibility distinguishes expected lower-priority overfl
   });
   assert.equal(presentResult.passed, true);
   assert.equal(presentResult.matchedInDom.length, 1);
+
+  // Even if ConSys snapshot is partial, 15 rendered Neutron rows in DOM prevent false Gamma failure
+  const renderedFifteenNeutron = Array.from({length: 15}, (_, idx) =>
+    makeRow("Lane10", String(200 + idx), "Neutron"),
+  );
+  const partialSnapshotResult = assessPageZeroAlarmVisibility({
+    currentPageZeroEvents: [],
+    newlyArrivedEvents: [gammaOnlyNew],
+    renderedRows: renderedFifteenNeutron,
+  });
+  assert.equal(partialSnapshotResult.passed, true);
+  assert.equal(partialSnapshotResult.expectedOnPageZero.length, 0);
 });
 
 test("assessScopedViewIsolation passes exact membership and flags leaked cards, rows, and notifications", () => {
