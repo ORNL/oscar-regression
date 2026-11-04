@@ -1016,78 +1016,96 @@ class UiEnduranceRunner {
     );
   }
 
+  private async readMountedDomRows(
+    page: Page,
+  ): Promise<Array<{rowIndex: number; row: RenderedEventRow}>> {
+    return page.locator(".MuiDataGrid-row").evaluateAll((elements) =>
+      elements
+        .map((row, fallbackIdx) => {
+          const laneSpan = row.querySelector('[data-field="laneId"] span');
+          const laneCell = row.querySelector('[data-field="laneId"]');
+          const occCell = row.querySelector('[data-field="occupancyCount"]');
+          const statusCell = row.querySelector('[data-field="status"]');
+          const startCell = row.querySelector('[data-field="startTime"]');
+          const idxAttr = Number(row.getAttribute("data-rowindex"));
+          return {
+            rowIndex: Number.isFinite(idxAttr) ? idxAttr : fallbackIdx + 10_000,
+            row: {
+              rowKey: row.getAttribute("data-id") ?? "",
+              laneId: (laneSpan?.textContent ?? laneCell?.textContent ?? "").trim(),
+              occupancyCount: (occCell?.textContent ?? "").trim(),
+              status: (statusCell?.textContent ?? "").trim(),
+              startTimeText: (startCell?.textContent ?? "").trim(),
+            },
+          };
+        })
+        .filter((entry) => Boolean(entry.row.laneId && entry.row.occupancyCount)),
+    );
+  }
+
   private async readRenderedRows(
     page: Page,
     options?: {includeVirtualizedPageRows?: boolean},
   ): Promise<RenderedEventRow[]> {
-    const includeVirtualized = Boolean(options?.includeVirtualizedPageRows);
-    return page.evaluate(async (scanAllPageRows) => {
-      const parseRowElement = (row: Element) => {
-        const laneSpan = row.querySelector('[data-field="laneId"] span');
-        const laneCell = row.querySelector('[data-field="laneId"]');
-        const occCell = row.querySelector('[data-field="occupancyCount"]');
-        const statusCell = row.querySelector('[data-field="status"]');
-        const startCell = row.querySelector('[data-field="startTime"]');
-        return {
-          rowKey: row.getAttribute("data-id") ?? "",
-          laneId: (laneSpan?.textContent ?? laneCell?.textContent ?? "").trim(),
-          occupancyCount: (occCell?.textContent ?? "").trim(),
-          status: (statusCell?.textContent ?? "").trim(),
-          startTimeText: (startCell?.textContent ?? "").trim(),
-        };
-      };
+    const initial = await this.readMountedDomRows(page);
+    if (!options?.includeVirtualizedPageRows) {
+      return initial.map((entry) => entry.row);
+    }
 
-      if (!scanAllPageRows) {
-        return Array.from(document.querySelectorAll(".MuiDataGrid-row"))
-          .map(parseRowElement)
-          .filter((r) => Boolean(r.laneId && r.occupancyCount));
-      }
+    const collected = new Map<string, {rowIndex: number; row: RenderedEventRow}>();
+    for (const entry of initial) {
+      const key = entry.row.rowKey || `${entry.row.laneId}#${entry.row.occupancyCount}`;
+      if (!collected.has(key)) collected.set(key, entry);
+    }
 
-      const collected = new Map<string, {rowIndex: number; row: ReturnType<typeof parseRowElement>}>();
-      const collectMounted = () => {
-        for (const el of Array.from(document.querySelectorAll(".MuiDataGrid-row"))) {
-          const parsed = parseRowElement(el);
-          if (!parsed.laneId || !parsed.occupancyCount) continue;
-          const idxAttr = Number(el.getAttribute("data-rowindex"));
-          const rowIndex = Number.isFinite(idxAttr) ? idxAttr : collected.size + 10_000;
-          const key = parsed.rowKey || `${parsed.laneId}#${parsed.occupancyCount}`;
-          if (!collected.has(key)) {
-            collected.set(key, {rowIndex, row: parsed});
-          }
-        }
-      };
-
+    const scrollerGeom = await page.evaluate(() => {
       const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
-      const savedScrollTop = scroller?.scrollTop ?? 0;
-      collectMounted();
+      if (!scroller) return null;
+      return {
+        scrollTop: scroller.scrollTop,
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+      };
+    });
 
-      if (scroller && scroller.scrollHeight > scroller.clientHeight + 4) {
-        const waitFrame = () =>
-          new Promise<void>((resolve) => {
-            setTimeout(() => requestAnimationFrame(() => resolve()), 45);
-          });
-        const maxScroll = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-        const step = Math.max(120, Math.floor(scroller.clientHeight * 0.75));
-        for (let target = step; target < maxScroll; target += step) {
-          scroller.scrollTop = target;
-          scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
-          await waitFrame();
-          collectMounted();
+    if (scrollerGeom && scrollerGeom.scrollHeight > scrollerGeom.clientHeight + 4) {
+      const maxScroll = Math.max(0, scrollerGeom.scrollHeight - scrollerGeom.clientHeight);
+      const step = Math.max(120, Math.floor(scrollerGeom.clientHeight * 0.75));
+      const targets: number[] = [];
+      for (let target = step; target < maxScroll; target += step) {
+        targets.push(target);
+      }
+      targets.push(maxScroll);
+
+      for (const target of targets) {
+        await page.evaluate((top) => {
+          const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+          if (scroller) {
+            scroller.scrollTop = top;
+            scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+          }
+        }, target);
+        await sleep(60);
+        const batch = await this.readMountedDomRows(page);
+        for (const entry of batch) {
+          const key = entry.row.rowKey || `${entry.row.laneId}#${entry.row.occupancyCount}`;
+          if (!collected.has(key)) collected.set(key, entry);
         }
-        scroller.scrollTop = maxScroll;
-        scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
-        await waitFrame();
-        collectMounted();
-
-        scroller.scrollTop = savedScrollTop;
-        scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
-        await waitFrame();
       }
 
-      return [...collected.values()]
-        .sort((a, b) => a.rowIndex - b.rowIndex)
-        .map((entry) => entry.row);
-    }, includeVirtualized);
+      await page.evaluate((savedTop) => {
+        const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+        if (scroller) {
+          scroller.scrollTop = savedTop;
+          scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+        }
+      }, scrollerGeom.scrollTop);
+      await sleep(30);
+    }
+
+    return [...collected.values()]
+      .sort((a, b) => a.rowIndex - b.rowIndex)
+      .map((entry) => entry.row);
   }
 
   private async readTotalRowCount(page: Page): Promise<number> {
