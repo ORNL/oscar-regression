@@ -1201,6 +1201,52 @@ class UiEnduranceRunner {
     }
   }
 
+  private async navigateAndWaitForAlarmGridHydration(page: Page, url: string): Promise<void> {
+    let seenObsRequests = 0;
+    let inFlightObsRequests = 0;
+    let lastObsEventMs = Date.now();
+    const isObsRequest = (reqUrl: string): boolean => reqUrl.includes("/sensorhub/api/observations") ||
+      (reqUrl.includes("/datastreams/") && reqUrl.includes("/observations"));
+
+    const onRequest = (req: {url: () => string}) => {
+      if (isObsRequest(req.url())) {
+        seenObsRequests += 1;
+        inFlightObsRequests += 1;
+        lastObsEventMs = Date.now();
+      }
+    };
+    const onDone = (req: {url: () => string}) => {
+      if (isObsRequest(req.url())) {
+        inFlightObsRequests = Math.max(0, inFlightObsRequests - 1);
+        lastObsEventMs = Date.now();
+      }
+    };
+
+    page.on("request", onRequest);
+    page.on("requestfinished", onDone);
+    page.on("requestfailed", onDone);
+    try {
+      await page.goto(url, {waitUntil: "domcontentloaded"});
+      await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+      await poll(
+        async () =>
+          seenObsRequests >= 1 &&
+          inFlightObsRequests === 0 &&
+          Date.now() - lastObsEventMs >= 600,
+        Boolean,
+        {
+          timeoutMs: 35_000,
+          intervalMs: 250,
+          description: "initial AlarmTable observation priority-tier hydration",
+        },
+      ).catch(() => undefined);
+    } finally {
+      page.off("request", onRequest);
+      page.off("requestfinished", onDone);
+      page.off("requestfailed", onDone);
+    }
+  }
+
   private async openUnscopedWallboard(): Promise<void> {
     if (!this.wallboardContext) throw new Error("Wallboard context unavailable");
     const page = await this.wallboardContext.newPage();
@@ -1209,7 +1255,7 @@ class UiEnduranceRunner {
     this.unscopedCdp = await this.wallboardContext.newCDPSession(page);
     await this.unscopedCdp.send("Performance.enable");
 
-    await page.goto(this.viewerUrl("/"), {waitUntil: "domcontentloaded"});
+    await this.navigateAndWaitForAlarmGridHydration(page, this.viewerUrl("/"));
     await poll(
       () => this.readCardLanes(page),
       (lanes) => lanes.length === this.config.expectedLaneCount,
@@ -1219,7 +1265,6 @@ class UiEnduranceRunner {
         description: `all ${this.config.expectedLaneCount} unscoped LaneStatus cards`,
       },
     );
-    await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
     await this.verifyPwaManifestAndServiceWorker(page);
     this.unscopedMountId = await this.stampMountToken(page, "__oscarUnscopedMountId");
   }
@@ -1270,9 +1315,10 @@ class UiEnduranceRunner {
     }).catch(() => undefined);
 
     const expectedLanes = this.config.laneConfigOracle?.lanesByView.get(viewKey) ?? [];
-    await page.goto(this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`), {
-      waitUntil: "domcontentloaded",
-    });
+    await this.navigateAndWaitForAlarmGridHydration(
+      page,
+      this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`),
+    );
     await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
@@ -1288,7 +1334,6 @@ class UiEnduranceRunner {
         description: `${expectedLanes.length} scoped LaneStatus cards for ${viewKey}`,
       },
     );
-    await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
     this.activeScopedViewKey = viewKey;
     this.scopedMountId = await this.stampMountToken(page, "__oscarScopedMountId");
   }
@@ -2550,8 +2595,8 @@ class UiEnduranceRunner {
       this.attachPageTelemetry(this.operatorPage, "operator");
     }
 
-    this.lastAlarmPollIso = new Date().toISOString();
     await this.openUnscopedWallboard();
+    this.lastAlarmPollIso = new Date().toISOString();
 
     const configuredViews = this.config.laneConfigOracle
       ? [...REQUIRED_OPERATIONAL_VIEW_KEYS]
@@ -2580,6 +2625,9 @@ class UiEnduranceRunner {
 
         if (plan.rotateScopedWatcher) {
           await this.rotateScopedWallboard(plan.scopedWatcherViewKey);
+          if (cycleIndex === 0) {
+            this.lastAlarmPollIso = new Date().toISOString();
+          }
         }
         if (!this.options.readOnlyWallboard && plan.recycleOperatorTab) {
           await this.recycleOperatorPage();
