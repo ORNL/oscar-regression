@@ -1354,7 +1354,7 @@ class UiEnduranceRunner {
     const unscopedMountNow = await this.readMountToken(unscopedPage, "__oscarUnscopedMountId");
     const unscopedMountPreserved = unscopedMountNow === this.unscopedMountId;
     const unscopedCards = await this.readCardLanes(unscopedPage);
-    const unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+    let unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(
       request,
       undefined,
       newlyArrivedAlarms,
@@ -1369,9 +1369,14 @@ class UiEnduranceRunner {
       renderedRows: unscopedRows,
     });
     if (!unscopedPageZero.passed) {
-      // Allow brief MQTT/ConSys settlement if an alarm landed right at the window boundary
+      // Allow brief MQTT/ConSys settlement or Page-0 displacement refresh if newer alarms arrived concurrently
       await poll(
         async () => {
+          unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+            request,
+            undefined,
+            newlyArrivedAlarms,
+          );
           unscopedRows = await this.readRenderedRows(unscopedPage, {
             includeVirtualizedPageRows: true,
           });
@@ -1447,7 +1452,7 @@ class UiEnduranceRunner {
       includeVirtualizedPageRows: true,
     });
     const allowedSet = new Set(oracle?.lanesByView.get(viewKey) ?? []);
-    const scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+    let scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
       request,
       allowedSet,
       newlyArrivedAlarms,
@@ -1462,6 +1467,11 @@ class UiEnduranceRunner {
     if (!scopedPageZero.passed) {
       await poll(
         async () => {
+          scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+            request,
+            allowedSet,
+            newlyArrivedAlarms,
+          );
           scopedRows = await this.readRenderedRows(scopedPage, {
             includeVirtualizedPageRows: true,
           });

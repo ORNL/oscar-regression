@@ -206,12 +206,16 @@ export function assessPageZeroAlarmVisibility(params: {
     if (params.allowedLanes && !params.allowedLanes.has(row.laneId)) continue;
     const identity = `${row.laneId}:${String(row.occupancyCount).trim()}`;
     if (incomingIdentities.has(identity)) continue;
+    const parsedDomStartMs = row.startTimeText ? Date.parse(row.startTimeText) : Number.NaN;
+    const domStartIso = Number.isFinite(parsedDomStartMs)
+      ? new Date(parsedDomStartMs).toISOString()
+      : "1970-01-01T00:00:00.000Z";
     byKey.set(`dom:${identity}`, {
       observationId: `dom:${identity}`,
       laneId: row.laneId,
       occupancyCount: String(row.occupancyCount).trim(),
-      startTime: "1970-01-01T00:00:00.000Z",
-      endTime: "1970-01-01T00:00:00.000Z",
+      startTime: domStartIso,
+      endTime: domStartIso,
       status: row.status,
       adjudicatedIdsCount: 0,
     });
