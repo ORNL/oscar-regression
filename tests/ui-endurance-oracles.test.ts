@@ -6,6 +6,7 @@ import {
   assessPageZeroAlarmVisibility,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
+  buildEventRowCssSelector,
   compareAlarmsByViewerPriority,
   DEFAULT_OPERATOR_RECYCLE_CYCLES,
   deriveAlarmStatusFromResult,
@@ -380,5 +381,19 @@ test("isAlarmGridHydrationSettled prevents premature return during cold 7th-view
       gridLoadingIndicators: 0,
     }),
     true,
+  );
+});
+
+test("buildEventRowCssSelector matches both upgraded durable observationId rowKey and pre-resolution MQTT rowKey", () => {
+  const mqttRowKey = "Local Node\u001fLane21\u001f2026-11-04T13:49:01.183Z\u001f2026-11-04T13:49:07.216Z";
+  assert.equal(
+    buildEventRowCssSelector(mqttRowKey, "0jmb179t"),
+    '.MuiDataGrid-row[data-id="Local Node\u001f0jmb179t"], .MuiDataGrid-row[data-id="Local Node\u001fLane21\u001f2026-11-04T13:49:01.183Z\u001f2026-11-04T13:49:07.216Z"]',
+  );
+
+  // Already-durable REST rowKey does not duplicate the selector
+  assert.equal(
+    buildEventRowCssSelector("Local Node\u001f0jmb179t", "0jmb179t"),
+    '.MuiDataGrid-row[data-id="Local Node\u001f0jmb179t"]',
   );
 });

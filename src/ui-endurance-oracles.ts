@@ -671,3 +671,31 @@ export function isAlarmGridHydrationSettled(state: AlarmGridHydrationState): boo
     : state.lastObsEventMs;
   return state.nowMs - anchorMs >= quietWindowMs;
 }
+
+function escapeCssAttr(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+}
+
+/**
+ * Builds a Playwright CSS selector for an EventTable DataGrid row that remains resilient
+ * when `EventTable.tsx` upgrades a live MQTT event's `data-id` via `replaceRealtimeEventIdentity`:
+ * - Fresh live MQTT rows initially carry `${parentNode}\u001f${laneId}\u001f${startTime}\u001f${endTime}`
+ * - Once `resolveRealtimeEventForNotification` resolves `occupancyObsId`, `eventSelectionKey`
+ *   upgrades the mounted row's `data-id` in-place to `${parentNode}\u001f${observationId}`.
+ */
+export function buildEventRowCssSelector(rowKey: string, observationId?: string): string {
+  const selectors: string[] = [];
+  const trimmedObsId = observationId?.trim() ?? "";
+  if (trimmedObsId.length > 0) {
+    const separatorIndex = rowKey.indexOf("\u001f");
+    const parentNode = separatorIndex > 0 ? rowKey.slice(0, separatorIndex) : "Local Node";
+    const resolvedKey = `${parentNode}\u001f${trimmedObsId}`;
+    selectors.push(`.MuiDataGrid-row[data-id="${escapeCssAttr(resolvedKey)}"]`);
+    if (resolvedKey !== rowKey && rowKey.length > 0) {
+      selectors.push(`.MuiDataGrid-row[data-id="${escapeCssAttr(rowKey)}"]`);
+    }
+  } else if (rowKey.length > 0) {
+    selectors.push(`.MuiDataGrid-row[data-id="${escapeCssAttr(rowKey)}"]`);
+  }
+  return selectors.join(", ");
+}

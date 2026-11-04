@@ -24,6 +24,7 @@ import {
   assessPageZeroAlarmVisibility,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
+  buildEventRowCssSelector,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
   isAlarmGridHydrationSettled,
@@ -120,10 +121,6 @@ interface OccupancyCatalog {
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function escapeCssAttributeValue(value: string): string {
-  return value.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
 function writeAtomicPrivateFile(targetPath: string, contents: string): void {
@@ -2118,9 +2115,16 @@ class UiEnduranceRunner {
       target.occupancyCount,
     );
 
-    // Click row to open QuickView inline panel
+    // Click row to open QuickView inline panel (resilient to live->durable data-id upgrade)
+    await page.evaluate(() => {
+      const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+      if (scroller && scroller.scrollTop > 0) {
+        scroller.scrollTop = 0;
+        scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+      }
+    });
     const rowLocator = page.locator(
-      `.MuiDataGrid-row[data-id="${escapeCssAttributeValue(target.rowKey)}"]`,
+      buildEventRowCssSelector(target.rowKey, observationId),
     ).first();
     await rowLocator.locator('[data-field="laneId"]').click();
 
@@ -2417,16 +2421,23 @@ class UiEnduranceRunner {
       second.occupancyCount,
     );
 
-    const checkRow = async (rowKey: string) => {
+    const checkRow = async (rowKey: string, observationId: string) => {
+      await page.evaluate(() => {
+        const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+        if (scroller && scroller.scrollTop > 0) {
+          scroller.scrollTop = 0;
+          scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+        }
+      });
       const row = page.locator(
-        `.MuiDataGrid-row[data-id="${escapeCssAttributeValue(rowKey)}"]`,
+        buildEventRowCssSelector(rowKey, observationId),
       ).first();
       await row.locator('[data-field="__check__"] input[type="checkbox"]').check();
     };
 
     // Select exactly 2 rows (NEVER Select all filtered alarms!)
-    await checkRow(first.rowKey);
-    await checkRow(second.rowKey);
+    await checkRow(first.rowKey, obsId1);
+    await checkRow(second.rowKey, obsId2);
 
     const bulkOpenBtn = page.getByRole("button", {name: "Adjudicate 2 selected", exact: true});
     await bulkOpenBtn.waitFor({timeout: 10_000});
@@ -2436,8 +2447,8 @@ class UiEnduranceRunner {
     await bulkOpenBtn.waitFor({state: "hidden", timeout: 10_000});
 
     // Re-select the 2 bounded rows and open Bulk adjudication dialog
-    await checkRow(first.rowKey);
-    await checkRow(second.rowKey);
+    await checkRow(first.rowKey, obsId1);
+    await checkRow(second.rowKey, obsId2);
     await bulkOpenBtn.waitFor({timeout: 10_000});
     await bulkOpenBtn.click();
 
