@@ -20,15 +20,19 @@ import {csvCell} from "./csv.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS, type LaneConfigOracle} from "./lane-config.js";
 import type {SuiteConfig} from "./types.js";
 import {
+  alarmPriorityRank,
   assessPageZeroAlarmVisibility,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
   isBenignViewerConsoleError,
+  isUnadjudicatedAlarm,
   MAX_BULK_ADJUDICATION_ROWS,
   parseUiEnduranceCliArgs,
   selectAdjudicationCandidates,
+  shouldPurgePriorScopedNotification,
+  UI_ENDURANCE_PAGE_SIZE,
   type AlarmEventSummary,
   type CycleExecutionPlan,
   type RenderedEventRow,
@@ -817,8 +821,18 @@ class UiEnduranceRunner {
   private async fetchTopPrioritySnapshot(
     request: APIRequestContext,
     allowedLanes?: ReadonlySet<string>,
+    newlyArrivedAlarms?: readonly AlarmEventSummary[],
   ): Promise<AlarmEventSummary[]> {
     if (!this.catalog) return [];
+    let maxIncomingRank = 2;
+    if (newlyArrivedAlarms !== undefined) {
+      const eligibleNew = newlyArrivedAlarms
+        .filter(isUnadjudicatedAlarm)
+        .filter((event) => !allowedLanes || allowedLanes.has(event.laneId));
+      if (eligibleNew.length === 0) return [];
+      maxIncomingRank = Math.max(...eligibleNew.map((event) => alarmPriorityRank(event.status)));
+    }
+
     const streamIds = allowedLanes
       ? [...allowedLanes].flatMap((lane) => this.catalog?.laneToStreamIds.get(lane) ?? [])
       : [...this.catalog.allStreamIds];
@@ -828,26 +842,51 @@ class UiEnduranceRunner {
       "gammaAlarm=true AND neutronAlarm=true",
       "gammaAlarm=false AND neutronAlarm=true",
       "gammaAlarm=true AND neutronAlarm=false",
-    ];
-    const nowIso = new Date().toISOString();
-    const pages = await Promise.all(
-      priorityPredicates.map(async (predicate) => {
-        const params = new URLSearchParams({
-          dataStream: streamIds.join(","),
-          resultTime: `../${nowIso}`,
-          filter: `adjudicatedIdsCount=0 AND (${predicate})`,
-          order: "desc",
-          limit: "15",
-        });
-        const res = await request.get(this.viewerUrl(`/sensorhub/api/observations?${params}`));
-        if (!res.ok()) return [];
-        const body = (await res.json()) as {items?: unknown[]};
-        return (body.items ?? [])
-          .map((item) => this.parseObservationSummary(item))
-          .filter((item): item is AlarmEventSummary => item !== null);
-      }),
-    );
-    return pages.flat();
+    ].slice(0, Math.min(3, maxIncomingRank + 1));
+
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const recentStartIso = new Date(nowMs - 2 * 3600_000).toISOString();
+    const collectedById = new Map<string, AlarmEventSummary>();
+
+    const queryTier = async (predicate: string, phenomenonRange: string): Promise<AlarmEventSummary[]> => {
+      const params = new URLSearchParams({
+        dataStream: streamIds.join(","),
+        phenomenonTime: phenomenonRange,
+        filter: `adjudicatedIdsCount=0 AND (${predicate})`,
+        order: "desc",
+        limit: String(UI_ENDURANCE_PAGE_SIZE),
+      });
+      const url = this.viewerUrl(`/sensorhub/api/observations?${params}`);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await request.get(url, {timeout: 45_000});
+          if (res.ok()) {
+            const body = (await res.json()) as {items?: unknown[]};
+            return (body.items ?? [])
+              .map((item) => this.parseObservationSummary(item))
+              .filter((item): item is AlarmEventSummary => item !== null);
+          }
+        } catch {
+          // Retry once if a concurrent cold-archive query contended on DuckDB.
+        }
+        await sleep(500);
+      }
+      return [];
+    };
+
+    for (const predicate of priorityPredicates) {
+      const recentItems = await queryTier(predicate, `${recentStartIso}/${nowIso}`);
+      for (const item of recentItems) collectedById.set(item.observationId, item);
+      if (collectedById.size >= UI_ENDURANCE_PAGE_SIZE) break;
+
+      if (recentItems.length < UI_ENDURANCE_PAGE_SIZE) {
+        const fullItems = await queryTier(predicate, `../${nowIso}`);
+        for (const item of fullItems) collectedById.set(item.observationId, item);
+        if (collectedById.size >= UI_ENDURANCE_PAGE_SIZE) break;
+      }
+    }
+    return [...collectedById.values()];
   }
 
   private async resolveObservationIdForLaneOccupancy(
@@ -977,23 +1016,96 @@ class UiEnduranceRunner {
     );
   }
 
-  private async readRenderedRows(page: Page): Promise<RenderedEventRow[]> {
+  private async readMountedDomRows(
+    page: Page,
+  ): Promise<Array<{rowIndex: number; row: RenderedEventRow}>> {
     return page.locator(".MuiDataGrid-row").evaluateAll((elements) =>
-      elements.map((row) => {
-        const laneSpan = row.querySelector('[data-field="laneId"] span');
-        const laneCell = row.querySelector('[data-field="laneId"]');
-        const occCell = row.querySelector('[data-field="occupancyCount"]');
-        const statusCell = row.querySelector('[data-field="status"]');
-        const startCell = row.querySelector('[data-field="startTime"]');
-        return {
-          rowKey: row.getAttribute("data-id") ?? "",
-          laneId: (laneSpan?.textContent ?? laneCell?.textContent ?? "").trim(),
-          occupancyCount: (occCell?.textContent ?? "").trim(),
-          status: (statusCell?.textContent ?? "").trim(),
-          startTimeText: (startCell?.textContent ?? "").trim(),
-        };
-      }).filter((r) => Boolean(r.laneId && r.occupancyCount)),
+      elements
+        .map((row, fallbackIdx) => {
+          const laneSpan = row.querySelector('[data-field="laneId"] span');
+          const laneCell = row.querySelector('[data-field="laneId"]');
+          const occCell = row.querySelector('[data-field="occupancyCount"]');
+          const statusCell = row.querySelector('[data-field="status"]');
+          const startCell = row.querySelector('[data-field="startTime"]');
+          const idxAttr = Number(row.getAttribute("data-rowindex"));
+          return {
+            rowIndex: Number.isFinite(idxAttr) ? idxAttr : fallbackIdx + 10_000,
+            row: {
+              rowKey: row.getAttribute("data-id") ?? "",
+              laneId: (laneSpan?.textContent ?? laneCell?.textContent ?? "").trim(),
+              occupancyCount: (occCell?.textContent ?? "").trim(),
+              status: (statusCell?.textContent ?? "").trim(),
+              startTimeText: (startCell?.textContent ?? "").trim(),
+            },
+          };
+        })
+        .filter((entry) => Boolean(entry.row.laneId && entry.row.occupancyCount)),
     );
+  }
+
+  private async readRenderedRows(
+    page: Page,
+    options?: {includeVirtualizedPageRows?: boolean},
+  ): Promise<RenderedEventRow[]> {
+    const initial = await this.readMountedDomRows(page);
+    if (!options?.includeVirtualizedPageRows) {
+      return initial.map((entry) => entry.row);
+    }
+
+    const collected = new Map<string, {rowIndex: number; row: RenderedEventRow}>();
+    for (const entry of initial) {
+      const key = entry.row.rowKey || `${entry.row.laneId}#${entry.row.occupancyCount}`;
+      if (!collected.has(key)) collected.set(key, entry);
+    }
+
+    const scrollerGeom = await page.evaluate(() => {
+      const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+      if (!scroller) return null;
+      return {
+        scrollTop: scroller.scrollTop,
+        scrollHeight: scroller.scrollHeight,
+        clientHeight: scroller.clientHeight,
+      };
+    });
+
+    if (scrollerGeom && scrollerGeom.scrollHeight > scrollerGeom.clientHeight + 4) {
+      const maxScroll = Math.max(0, scrollerGeom.scrollHeight - scrollerGeom.clientHeight);
+      const step = Math.max(120, Math.floor(scrollerGeom.clientHeight * 0.75));
+      const targets: number[] = [];
+      for (let target = step; target < maxScroll; target += step) {
+        targets.push(target);
+      }
+      targets.push(maxScroll);
+
+      for (const target of targets) {
+        await page.evaluate((top) => {
+          const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+          if (scroller) {
+            scroller.scrollTop = top;
+            scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+          }
+        }, target);
+        await sleep(60);
+        const batch = await this.readMountedDomRows(page);
+        for (const entry of batch) {
+          const key = entry.row.rowKey || `${entry.row.laneId}#${entry.row.occupancyCount}`;
+          if (!collected.has(key)) collected.set(key, entry);
+        }
+      }
+
+      await page.evaluate((savedTop) => {
+        const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+        if (scroller) {
+          scroller.scrollTop = savedTop;
+          scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+        }
+      }, scrollerGeom.scrollTop);
+      await sleep(30);
+    }
+
+    return [...collected.values()]
+      .sort((a, b) => a.rowIndex - b.rowIndex)
+      .map((entry) => entry.row);
   }
 
   private async readTotalRowCount(page: Page): Promise<number> {
@@ -1027,6 +1139,30 @@ class UiEnduranceRunner {
         };
       });
     });
+  }
+
+  private async purgePriorScopedNotifications(page: Page, activeScopedViewKey: string): Promise<void> {
+    const notifications = await this.readPwaNotifications(page).catch(() => []);
+    const staleTags = notifications
+      .filter((n) => shouldPurgePriorScopedNotification(n.viewKey, activeScopedViewKey))
+      .map((n) => n.tag)
+      .filter((tag) => tag.length > 0);
+    if (staleTags.length === 0) return;
+    await page.evaluate(
+      async ({tags, activeView}) => {
+        if (!("serviceWorker" in navigator)) return;
+        const tagSet = new Set(tags);
+        const reg = await navigator.serviceWorker.ready;
+        for (const n of await reg.getNotifications()) {
+          const data = (n.data ?? {}) as Record<string, unknown>;
+          const notifView = typeof data.viewKey === "string" ? data.viewKey : null;
+          if (tagSet.has(n.tag ?? "") || (notifView && notifView !== activeView)) {
+            n.close();
+          }
+        }
+      },
+      {tags: staleTags, activeView: activeScopedViewKey},
+    ).catch(() => undefined);
   }
 
   private async readCdpMetrics(cdp: CDPSession | undefined): Promise<CdpMetricsSnapshot> {
@@ -1065,6 +1201,52 @@ class UiEnduranceRunner {
     }
   }
 
+  private async navigateAndWaitForAlarmGridHydration(page: Page, url: string): Promise<void> {
+    let seenObsRequests = 0;
+    let inFlightObsRequests = 0;
+    let lastObsEventMs = Date.now();
+    const isObsRequest = (reqUrl: string): boolean => reqUrl.includes("/sensorhub/api/observations") ||
+      (reqUrl.includes("/datastreams/") && reqUrl.includes("/observations"));
+
+    const onRequest = (req: {url: () => string}) => {
+      if (isObsRequest(req.url())) {
+        seenObsRequests += 1;
+        inFlightObsRequests += 1;
+        lastObsEventMs = Date.now();
+      }
+    };
+    const onDone = (req: {url: () => string}) => {
+      if (isObsRequest(req.url())) {
+        inFlightObsRequests = Math.max(0, inFlightObsRequests - 1);
+        lastObsEventMs = Date.now();
+      }
+    };
+
+    page.on("request", onRequest);
+    page.on("requestfinished", onDone);
+    page.on("requestfailed", onDone);
+    try {
+      await page.goto(url, {waitUntil: "domcontentloaded"});
+      await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+      await poll(
+        async () =>
+          seenObsRequests >= 1 &&
+          inFlightObsRequests === 0 &&
+          Date.now() - lastObsEventMs >= 600,
+        Boolean,
+        {
+          timeoutMs: 35_000,
+          intervalMs: 250,
+          description: "initial AlarmTable observation priority-tier hydration",
+        },
+      ).catch(() => undefined);
+    } finally {
+      page.off("request", onRequest);
+      page.off("requestfinished", onDone);
+      page.off("requestfailed", onDone);
+    }
+  }
+
   private async openUnscopedWallboard(): Promise<void> {
     if (!this.wallboardContext) throw new Error("Wallboard context unavailable");
     const page = await this.wallboardContext.newPage();
@@ -1073,7 +1255,7 @@ class UiEnduranceRunner {
     this.unscopedCdp = await this.wallboardContext.newCDPSession(page);
     await this.unscopedCdp.send("Performance.enable");
 
-    await page.goto(this.viewerUrl("/"), {waitUntil: "domcontentloaded"});
+    await this.navigateAndWaitForAlarmGridHydration(page, this.viewerUrl("/"));
     await poll(
       () => this.readCardLanes(page),
       (lanes) => lanes.length === this.config.expectedLaneCount,
@@ -1083,7 +1265,6 @@ class UiEnduranceRunner {
         description: `all ${this.config.expectedLaneCount} unscoped LaneStatus cards`,
       },
     );
-    await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
     await this.verifyPwaManifestAndServiceWorker(page);
     this.unscopedMountId = await this.stampMountToken(page, "__oscarUnscopedMountId");
   }
@@ -1124,21 +1305,26 @@ class UiEnduranceRunner {
     }
     this.scopedRotationCount += 1;
     const page = this.scopedWallboardPage!;
-    // Close notifications from the prior view epoch so scoped notification checks
-    // strictly evaluate notifications emitted while this viewKey is active.
-    await page.evaluate(async () => {
+    // Close notifications from the prior view epoch via `unscopedWallboardPage` (which is always
+    // mounted on the HTTPS origin, unlike `page` when `refreshScopedTab` opens `about:blank`).
+    const originNotificationPage = this.unscopedWallboardPage ?? page;
+    await originNotificationPage.evaluate(async () => {
       if (!("serviceWorker" in navigator)) return;
       const reg = await navigator.serviceWorker.ready;
       for (const n of await reg.getNotifications()) n.close();
     }).catch(() => undefined);
 
     const expectedLanes = this.config.laneConfigOracle?.lanesByView.get(viewKey) ?? [];
-    await page.goto(this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`), {
-      waitUntil: "domcontentloaded",
-    });
+    await this.navigateAndWaitForAlarmGridHydration(
+      page,
+      this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`),
+    );
     await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
+    // Also purge any in-flight notification emitted by the outgoing view during navigation
+    // teardown while preserving unscoped (`viewKey === null`) and active-view notifications.
+    await this.purgePriorScopedNotifications(page, viewKey);
     await poll(
       () => this.readCardLanes(page),
       (lanes) => lanes.length === expectedLanes.length,
@@ -1148,7 +1334,6 @@ class UiEnduranceRunner {
         description: `${expectedLanes.length} scoped LaneStatus cards for ${viewKey}`,
       },
     );
-    await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
     this.activeScopedViewKey = viewKey;
     this.scopedMountId = await this.stampMountToken(page, "__oscarScopedMountId");
   }
@@ -1169,19 +1354,32 @@ class UiEnduranceRunner {
     const unscopedMountNow = await this.readMountToken(unscopedPage, "__oscarUnscopedMountId");
     const unscopedMountPreserved = unscopedMountNow === this.unscopedMountId;
     const unscopedCards = await this.readCardLanes(unscopedPage);
-    const unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(request);
+    let unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+      request,
+      undefined,
+      newlyArrivedAlarms,
+    );
 
-    let unscopedRows = await this.readRenderedRows(unscopedPage);
+    let unscopedRows = await this.readRenderedRows(unscopedPage, {
+      includeVirtualizedPageRows: true,
+    });
     let unscopedPageZero = assessPageZeroAlarmVisibility({
       currentPageZeroEvents: unscopedTopSnapshot,
       newlyArrivedEvents: newlyArrivedAlarms,
       renderedRows: unscopedRows,
     });
     if (!unscopedPageZero.passed) {
-      // Allow brief MQTT/ConSys settlement if an alarm landed right at the window boundary
+      // Allow brief MQTT/ConSys settlement or Page-0 displacement refresh if newer alarms arrived concurrently
       await poll(
         async () => {
-          unscopedRows = await this.readRenderedRows(unscopedPage);
+          unscopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+            request,
+            undefined,
+            newlyArrivedAlarms,
+          );
+          unscopedRows = await this.readRenderedRows(unscopedPage, {
+            includeVirtualizedPageRows: true,
+          });
           unscopedPageZero = assessPageZeroAlarmVisibility({
             currentPageZeroEvents: unscopedTopSnapshot,
             newlyArrivedEvents: newlyArrivedAlarms,
@@ -1250,9 +1448,15 @@ class UiEnduranceRunner {
     const scopedMountNow = await this.readMountToken(scopedPage, "__oscarScopedMountId");
     const scopedMountPreserved = scopedMountNow === this.scopedMountId;
     const scopedCards = await this.readCardLanes(scopedPage);
-    let scopedRows = await this.readRenderedRows(scopedPage);
+    let scopedRows = await this.readRenderedRows(scopedPage, {
+      includeVirtualizedPageRows: true,
+    });
     const allowedSet = new Set(oracle?.lanesByView.get(viewKey) ?? []);
-    const scopedTopSnapshot = await this.fetchTopPrioritySnapshot(request, allowedSet);
+    let scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+      request,
+      allowedSet,
+      newlyArrivedAlarms,
+    );
 
     let scopedPageZero = assessPageZeroAlarmVisibility({
       currentPageZeroEvents: scopedTopSnapshot,
@@ -1263,7 +1467,14 @@ class UiEnduranceRunner {
     if (!scopedPageZero.passed) {
       await poll(
         async () => {
-          scopedRows = await this.readRenderedRows(scopedPage);
+          scopedTopSnapshot = await this.fetchTopPrioritySnapshot(
+            request,
+            allowedSet,
+            newlyArrivedAlarms,
+          );
+          scopedRows = await this.readRenderedRows(scopedPage, {
+            includeVirtualizedPageRows: true,
+          });
           scopedPageZero = assessPageZeroAlarmVisibility({
             currentPageZeroEvents: scopedTopSnapshot,
             newlyArrivedEvents: newlyArrivedAlarms,
@@ -2394,8 +2605,8 @@ class UiEnduranceRunner {
       this.attachPageTelemetry(this.operatorPage, "operator");
     }
 
-    this.lastAlarmPollIso = new Date().toISOString();
     await this.openUnscopedWallboard();
+    this.lastAlarmPollIso = new Date().toISOString();
 
     const configuredViews = this.config.laneConfigOracle
       ? [...REQUIRED_OPERATIONAL_VIEW_KEYS]
@@ -2424,6 +2635,9 @@ class UiEnduranceRunner {
 
         if (plan.rotateScopedWatcher) {
           await this.rotateScopedWallboard(plan.scopedWatcherViewKey);
+          if (cycleIndex === 0) {
+            this.lastAlarmPollIso = new Date().toISOString();
+          }
         }
         if (!this.options.readOnlyWallboard && plan.recycleOperatorTab) {
           await this.recycleOperatorPage();

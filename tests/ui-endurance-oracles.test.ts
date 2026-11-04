@@ -14,6 +14,7 @@ import {
   parseUiEnduranceCliArgs,
   SECONDARY_INSPECTION_STATUSES,
   selectAdjudicationCandidates,
+  shouldPurgePriorScopedNotification,
   UI_ENDURANCE_WORKFLOWS,
   type AlarmEventSummary,
   type RenderedEventRow,
@@ -121,6 +122,18 @@ test("assessPageZeroAlarmVisibility distinguishes expected lower-priority overfl
   });
   assert.equal(presentResult.passed, true);
   assert.equal(presentResult.matchedInDom.length, 1);
+
+  // Even if ConSys snapshot is partial, 15 rendered Neutron rows in DOM prevent false Gamma failure
+  const renderedFifteenNeutron = Array.from({length: 15}, (_, idx) =>
+    makeRow("Lane10", String(200 + idx), "Neutron"),
+  );
+  const partialSnapshotResult = assessPageZeroAlarmVisibility({
+    currentPageZeroEvents: [],
+    newlyArrivedEvents: [gammaOnlyNew],
+    renderedRows: renderedFifteenNeutron,
+  });
+  assert.equal(partialSnapshotResult.passed, true);
+  assert.equal(partialSnapshotResult.expectedOnPageZero.length, 0);
 });
 
 test("assessScopedViewIsolation passes exact membership and flags leaked cards, rows, and notifications", () => {
@@ -296,4 +309,13 @@ test("isBenignViewerConsoleError filters offline WebID DRF noise while keeping S
     isBenignViewerConsoleError("Uncaught TypeError: Cannot read properties of undefined"),
     false,
   );
+});
+
+test("shouldPurgePriorScopedNotification purges prior scoped views while preserving unscoped and active views", () => {
+  assert.equal(shouldPurgePriorScopedNotification("exit", "east-gate"), true);
+  assert.equal(shouldPurgePriorScopedNotification("west-gate", "east-gate"), true);
+  assert.equal(shouldPurgePriorScopedNotification("east-gate", "east-gate"), false);
+  assert.equal(shouldPurgePriorScopedNotification(null, "east-gate"), false);
+  assert.equal(shouldPurgePriorScopedNotification(undefined, "east-gate"), false);
+  assert.equal(shouldPurgePriorScopedNotification("", "east-gate"), false);
 });
