@@ -1417,19 +1417,21 @@ export class RegressionScenarios {
         );
         const snapshot = () => indicators.evaluateAll((nodes) => nodes.map((node) => ({
           testId: node.getAttribute("data-testid") ?? "",
+          componentId: node.getAttribute("data-component-id"),
           state: node.getAttribute("data-state"),
           label: node.getAttribute("aria-label") ?? "",
         })));
+        const expectedTotal = this.config.expectedLaneCount + this.config.expectedCameraCount;
         const states = await poll(
           snapshot,
-          (values) => assessDashboardConnectionResolution(values, expectedIds).passed,
+          (values) => assessDashboardConnectionResolution(values, expectedIds, this.config.expectedCameraCount).passed,
           {timeoutMs: 45_000, intervalMs: 1_000, description: "every exact dashboard RPM and camera indicator to resolve online"},
         ).catch(snapshot);
-        const assessment = assessDashboardConnectionResolution(states, expectedIds);
+        const assessment = assessDashboardConnectionResolution(states, expectedIds, this.config.expectedCameraCount);
         const evidence = assessment.passed ? "" : await this.screenshotOnFailure(page, "dashboard-health-live-connections");
         return {
           passed: assessment.passed,
-          observed: `${assessment.online}/${expectedIds.length} exact indicators Online; missing=${assessment.missing.join("|") || "none"}; unexpected=${assessment.unexpected.join("|") || "none"}; duplicates=${assessment.duplicates.join("|") || "none"}; unresolved=${assessment.unresolved.join("|") || "none"}`,
+          observed: `${assessment.online}/${expectedTotal} exact indicators Online; missing=${assessment.missing.join("|") || "none"}; unexpected=${assessment.unexpected.join("|") || "none"}; duplicates=${assessment.duplicates.join("|") || "none"}; unresolved=${assessment.unresolved.join("|") || "none"}`,
           evidence,
         };
       });
@@ -1839,6 +1841,80 @@ export class RegressionScenarios {
           }).then(r => r.dispose()).catch(() => undefined);
         }
       });
+      if (this.config.expectedCameraCount > this.config.expectedLaneCount) {
+        await this.check({
+          scenario: "lane-video",
+          category: "video",
+          action: "switch live camera feeds on multi-camera lane",
+          target: "multi-camera lane",
+          expected: "both Camera 0 and Camera 1 serve distinct live .m3u8 manifests and decode advancing video frames",
+        }, async () => {
+          await this.goto(page, "/");
+          const cards = page.locator('[data-testid^="lane-health-card-"]');
+          await cards.first().waitFor({timeout: this.config.uiTimeoutMs});
+          const dualLaneName = await cards.evaluateAll((nodes) => {
+            for (const node of nodes) {
+              if (node.querySelectorAll('[data-testid$="-camera"]').length >= 2) {
+                return (node.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, "");
+              }
+            }
+            return "";
+          });
+          if (!dualLaneName) {
+            return {passed: false, observed: "no lane card with >=2 camera indicators found on Dashboard"};
+          }
+          observedM3u8Url = "";
+          await page.getByTestId(`lane-health-card-${dualLaneName}`).getByRole("link").click();
+          await page.waitForURL(/\/lane-view/);
+          await page.waitForFunction(() => {
+            const element = document.querySelector("video") as HTMLVideoElement | null;
+            return Boolean(element && element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0);
+          }, undefined, {timeout: 60_000});
+          await poll(async () => observedM3u8Url, (url) => url.length > 0, {
+            timeoutMs: 15_000,
+            intervalMs: 250,
+            description: `${dualLaneName} Camera 0 .m3u8 manifest`,
+          });
+          const cam0Url = observedM3u8Url;
+          const video = page.locator("video").first();
+          const cam0 = await video.evaluate((el: HTMLVideoElement) => ({
+            width: el.videoWidth,
+            height: el.videoHeight,
+          }));
+
+          observedM3u8Url = "";
+          const nextCameraButton = page.locator("button:has([data-testid='NavigateNextIcon'])").first();
+          await nextCameraButton.click();
+          await poll(async () => observedM3u8Url, (url) => url.length > 0 && url !== cam0Url, {
+            timeoutMs: 30_000,
+            intervalMs: 250,
+            description: `${dualLaneName} Camera 1 distinct .m3u8 manifest`,
+          });
+          const cam1Url = observedM3u8Url;
+          await page.waitForFunction(() => {
+            const element = document.querySelector("video") as HTMLVideoElement | null;
+            return Boolean(element && element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0);
+          }, undefined, {timeout: 60_000});
+          const cam1Start = await video.evaluate((el: HTMLVideoElement) => ({
+            readyState: el.readyState,
+            width: el.videoWidth,
+            height: el.videoHeight,
+            currentTime: el.currentTime,
+          }));
+          await page.waitForTimeout(2_000);
+          const cam1Later = await video.evaluate((el: HTMLVideoElement) => el.currentTime);
+          const cam1Advanced = cam1Later > cam1Start.currentTime;
+          const passed = cam0.width > 0 && cam0.height > 0 &&
+            cam1Url !== cam0Url &&
+            cam1Start.readyState >= 2 && cam1Start.width > 0 && cam1Start.height > 0 && cam1Advanced;
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, `lane-video-dual-camera-${dualLaneName}`);
+          return {
+            passed,
+            observed: `lane=${dualLaneName}; cam0=${cam0.width}x${cam0.height}; cam1=${cam1Start.width}x${cam1Start.height}; distinctM3u8=${cam1Url !== cam0Url}; advanced=${cam1Advanced}`,
+            evidence,
+          };
+        });
+      }
     } finally {
       page.off("response", captureM3u8);
       await page.close();
