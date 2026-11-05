@@ -1277,9 +1277,9 @@ test("full retained-media proof self-seeds without weakening smoke fixture requi
   const policyStart = scenarios.indexOf("private fullRunCanSelfSeedRetainedMedia");
   const policyEnd = scenarios.indexOf("private async check", policyStart);
   const policy = scenarios.slice(policyStart, policyEnd);
-  assert.match(policy, /\["full", "3\.9\.2-release"\]\.includes\(this\.config\.profile\)/);
+  assert.match(policy, /\["full", "3\.9\.2-release", "3\.11\.0-release"\]\.includes\(this\.config\.profile\)/);
   assert.match(policy, /this\.selected\("storage-lifecycle"\)/);
-  for (const producer of ["rpm-alarms", "event-uuid", "adjudication"]) {
+  for (const producer of ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication"]) {
     assert.ok(policy.includes(`"${producer}"`), `missing retained-media producer ${producer}`);
   }
 

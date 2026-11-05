@@ -129,7 +129,8 @@ export class RunReporter {
     const restore = this.metadata.profile === "restore-drill" &&
       normalized === "storage-restore-drill-disruption";
     const lifecycleDisruption = (this.metadata.profile === "full" ||
-      this.metadata.profile === "3.9.2-release") && [
+      this.metadata.profile === "3.9.2-release" ||
+      this.metadata.profile === "3.11.0-release") && [
       "storage-lifecycle-export-disruption",
       "storage-lifecycle-restart-disruption",
       "storage-lifecycle-backup-disruption",

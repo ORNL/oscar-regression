@@ -14,7 +14,7 @@ function runner(status = "", commit = COMMIT): GitCommandRunner {
 }
 
 test("strict certification profiles require a clean canonical suite commit", () => {
-  for (const profile of ["3.9.2-release", "restore-drill"] as const) {
+  for (const profile of ["3.9.2-release", "3.11.0-release", "restore-drill"] as const) {
     assert.equal(suiteGitCommit(profile, runner()), COMMIT);
     assert.throws(
       () => suiteGitCommit(profile, runner(" M src/scenarios.ts\n?? local-helper.mjs\n")),
@@ -37,7 +37,7 @@ test("non-certification profiles record dirty or unavailable identity without cl
 });
 
 test("strict certification refuses an unavailable Git checkout", () => {
-  for (const profile of ["3.9.2-release", "restore-drill"] as Profile[]) {
+  for (const profile of ["3.9.2-release", "3.11.0-release", "restore-drill"] as Profile[]) {
     assert.throws(
       () => suiteGitCommit(profile, () => { throw new Error("git unavailable"); }),
       /requires an available clean Git suite checkout with a canonical HEAD/,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import {mkdtempSync, readFileSync, writeFileSync} from "node:fs";
+import {mkdtempSync, readFileSync, rmSync, writeFileSync} from "node:fs";
 import {tmpdir} from "node:os";
 import {join, resolve} from "node:path";
 import test from "node:test";
@@ -208,6 +208,43 @@ test("3.9.2 release certification is unfiltered and requires every release gate"
     OSCAR_3_9_2_RESTORE_EVIDENCE_DIR: "/tmp/oscar-restore-evidence"}, () => {
     assert.equal(loadConfig(["--profile", "3.9.2-release"]).storageBackupMode, "single");
   });
+  withEnvironment({...releaseEnvironment,
+    OSCAR_BUILD_LABEL: "oscar-3.11.0-candidate-def456",
+    EML_WORKFLOW: "auto"}, () => {
+    assert.throws(() => loadConfig(["--profile", "3.11.0-release"]), /requires .* workflows/);
+  });
+  withEnvironment({...releaseEnvironment,
+    OSCAR_BUILD_LABEL: "oscar-3.11.0-candidate-def456",
+    EML_WORKFLOW: "required",
+    OSCAR_EML_PLUGIN_PATH: ""}, () => {
+    assert.throws(() => loadConfig(["--profile", "3.11.0-release"]), /OSCAR_EML_PLUGIN_PATH/);
+  });
+  withEnvironment({...releaseEnvironment,
+    OSCAR_BUILD_LABEL: "oscar-3.11.0-candidate-def456",
+    EML_WORKFLOW: "required",
+    OSCAR_EML_PLUGIN_PATH: "fixtures/oscar-50-lane-config.csv"}, () => {
+    assert.throws(() => loadConfig(["--profile", "3.11.0-release"]), /must end with \.jar/);
+  });
+  const tempEmlDir = mkdtempSync(join(tmpdir(), "oscar-eml-cfg-"));
+  const tempEmlJar = join(tempEmlDir, "synthetic-plugin.jar");
+  writeFileSync(tempEmlJar, "PK\x03\x04");
+  try {
+    withEnvironment({...releaseEnvironment,
+      OSCAR_BUILD_LABEL: "oscar-3.11.0-candidate-def456",
+      EML_WORKFLOW: "required",
+      OSCAR_EML_PLUGIN_PATH: tempEmlJar,
+      OSCAR_BACKUP_MODE: "single",
+      OSCAR_3_11_0_RESTORE_EVIDENCE_DIR: "/tmp/oscar-311-restore-evidence"}, () => {
+      const config = loadConfig(["--profile", "3.11.0-release"]);
+      assert.equal(config.profile, "3.11.0-release");
+      assert.equal(config.emlWorkflow, "required");
+      assert.equal(config.emlPluginPath, tempEmlJar);
+      assert.equal(config.releaseRestoreEvidenceDirectory, "/tmp/oscar-311-restore-evidence");
+      assert.equal(requiresRemoteSuiteLease(config), true);
+    });
+  } finally {
+    rmSync(tempEmlDir, {recursive: true, force: true});
+  }
 });
 
 test("retained-media configuration accepts bounded OSCAR public observation identities", () => {

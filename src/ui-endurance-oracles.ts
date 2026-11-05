@@ -206,9 +206,13 @@ export function assessPageZeroAlarmVisibility(params: {
     if (params.allowedLanes && !params.allowedLanes.has(row.laneId)) continue;
     const identity = `${row.laneId}:${String(row.occupancyCount).trim()}`;
     if (incomingIdentities.has(identity)) continue;
+    // EventTable formats startTime via `Date.prototype.toLocaleString()`, which has 1-second
+    // resolution. Add +999 ms upper-bound tolerance for DOM-only rows (`dom:*`) so a concurrent
+    // live MQTT row sharing the same displayed second at the Page-0 boundary (row 15) cannot
+    // falsely sort behind a millisecond-precision incoming alarm that it legitimately displaced.
     const parsedDomStartMs = row.startTimeText ? Date.parse(row.startTimeText) : Number.NaN;
     const domStartIso = Number.isFinite(parsedDomStartMs)
-      ? new Date(parsedDomStartMs).toISOString()
+      ? new Date(parsedDomStartMs + 999).toISOString()
       : "1970-01-01T00:00:00.000Z";
     byKey.set(`dom:${identity}`, {
       observationId: `dom:${identity}`,

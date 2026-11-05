@@ -136,6 +136,30 @@ test("assessPageZeroAlarmVisibility distinguishes expected lower-priority overfl
   });
   assert.equal(partialSnapshotResult.passed, true);
   assert.equal(partialSnapshotResult.expectedOnPageZero.length, 0);
+
+  // Same-second sub-second tie at row 15: DOM toLocaleString() drops milliseconds (.000s vs .620s)
+  const sameSecondDomRows: RenderedEventRow[] = Array.from({length: 15}, (_, idx) => ({
+    rowKey: `Lane20:${300 + idx}`,
+    laneId: "Lane20",
+    occupancyCount: String(300 + idx),
+    status: "Gamma",
+    startTimeText: "11/3/2026, 12:10:00 PM",
+    startTimeMs: Date.parse("2026-11-03T12:10:00.000Z"),
+  }));
+  const sameSecondGammaArrival = makeAlarm({
+    observationId: "gamma-same-second",
+    laneId: "Lane21",
+    occupancyCount: "901",
+    status: "Gamma",
+    startTime: "2026-11-03T12:10:00.620Z",
+  });
+  const sameSecondTieResult = assessPageZeroAlarmVisibility({
+    currentPageZeroEvents: [],
+    newlyArrivedEvents: [sameSecondGammaArrival],
+    renderedRows: sameSecondDomRows,
+  });
+  assert.equal(sameSecondTieResult.passed, true);
+  assert.equal(sameSecondTieResult.expectedOnPageZero.length, 0);
 });
 
 test("assessScopedViewIsolation passes exact membership and flags leaked cards, rows, and notifications", () => {

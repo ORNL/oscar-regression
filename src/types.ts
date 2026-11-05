@@ -1,6 +1,6 @@
 import type {LaneConfigOracle} from "./lane-config.js";
 
-export type Profile = "smoke" | "full" | "3.9.2-release" | "restore-drill";
+export type Profile = "smoke" | "full" | "3.9.2-release" | "3.11.0-release" | "restore-drill";
 
 export type CapabilityMode = "auto" | "required" | "disabled";
 
@@ -42,6 +42,8 @@ export interface SuiteConfig {
   extendedOccupancySeconds: number;
   eventUuidWorkflow: CapabilityMode;
   alarmTransferCameraWorkflow: CapabilityMode;
+  emlWorkflow: CapabilityMode;
+  emlPluginPath?: string;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.11.0";
   storageBackupWorkflow: CapabilityMode;
@@ -208,6 +210,8 @@ export interface RunMetadata {
   operationalViewLaneCounts?: Record<string, number>;
   eventUuidWorkflow: CapabilityMode;
   alarmTransferCameraWorkflow: CapabilityMode;
+  emlWorkflow?: CapabilityMode;
+  emlPluginConfigured?: boolean;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.11.0";
   storageBackupWorkflow: CapabilityMode;
