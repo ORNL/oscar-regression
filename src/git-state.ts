@@ -3,7 +3,7 @@ import type {Profile} from "./types.js";
 
 export type GitCommandRunner = (args: string[]) => string;
 
-const STRICT_IDENTITY_PROFILES = new Set<Profile>(["3.9.2-release", "restore-drill"]);
+const STRICT_IDENTITY_PROFILES = new Set<Profile>(["3.9.2-release", "3.11.0-release", "restore-drill"]);
 
 function defaultGitRunner(args: string[]): string {
   return execFileSync("git", args, {

@@ -218,6 +218,36 @@ export class RpmEmulatorClient {
     };
   }
 
+  distributedNormAlarmConfig(original: RpmConfig, durationSeconds = 8): RpmConfig {
+    return {
+      ...this.quietConfig(original),
+      occupancy_duration_range: [durationSeconds, durationSeconds],
+      is_distributed: true,
+      distributed_source_sigma: 0.85,
+      source_pos_length: 0.5,
+      source_pos_width: 0.5,
+      source_pos_height: 0.5,
+      eml_enabled: true,
+      eml_collimated: true,
+      lane_width: 4.82,
+    };
+  }
+
+  localizedThreatAlarmConfig(original: RpmConfig, durationSeconds = 6): RpmConfig {
+    return {
+      ...this.quietConfig(original),
+      occupancy_duration_range: [durationSeconds, durationSeconds],
+      is_distributed: false,
+      point_source_sigma: 0.12,
+      source_pos_length: 0.5,
+      source_pos_width: 0.05,
+      source_pos_height: 0.1,
+      eml_enabled: true,
+      eml_collimated: true,
+      lane_width: 4.82,
+    };
+  }
+
   extendedOccupancyConfig(original: RpmConfig, durationSeconds: number): RpmConfig {
     return {
       ...this.quietConfig(original),

@@ -346,9 +346,9 @@ export class RegressionScenarios {
   }
 
   private fullRunCanSelfSeedRetainedMedia(): boolean {
-    return ["full", "3.9.2-release"].includes(this.config.profile) &&
+    return ["full", "3.9.2-release", "3.11.0-release"].includes(this.config.profile) &&
       this.selected("storage-lifecycle") &&
-      ["rpm-alarms", "event-uuid", "adjudication"].some(scenario => this.selected(scenario));
+      ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication"].some(scenario => this.selected(scenario));
   }
 
   private async check<T>(metadata: CheckMetadata, probe: () => Promise<ProbeResult<T>>): Promise<T | undefined> {
@@ -591,6 +591,7 @@ export class RegressionScenarios {
         await this.scenario("rpm-alarms", () => this.alarms());
         await this.scenario("event-uuid", () => this.eventUuidWorkflow());
         await this.scenario("adjudication", () => this.adjudicationAndAlarmTransfer());
+        await this.scenario("eml-auto-adjudication", () => this.emlAutoAdjudication());
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([{reportType: "ADJUDICATION"}]));
         // Keep the reserved RPM's automatic occupancy/alarm generation disabled until the
@@ -760,6 +761,114 @@ export class RegressionScenarios {
           return {passed, observed: `HTTP ${status}; marker visible=${markerVisible}`, evidence};
         });
       }
+
+      const localeChecks = [
+        {
+          locale: "en",
+          loginHeading: "OSCAR sign in",
+          laneStatus: "Lane Status",
+          events: "Events",
+          health: "Status of Health",
+        },
+        {
+          locale: "es",
+          loginHeading: "Iniciar sesión en OSCAR",
+          laneStatus: "Estado del carril",
+          events: "Eventos",
+          health: "Estado de funcionamiento",
+        },
+        {
+          locale: "fr",
+          loginHeading: "Connexion OSCAR",
+          laneStatus: "État de la voie",
+          events: "Événements",
+          health: "État de fonctionnement",
+        },
+        {
+          locale: "el",
+          loginHeading: "Σύνδεση OSCAR",
+          laneStatus: "Κατάσταση λωρίδας",
+          events: "Συμβάντα",
+          health: "Κατάσταση λειτουργίας",
+        },
+      ] as const;
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "i18n",
+        action: "verify 4-locale login, Viewer localization, and container fit",
+        target: "en, es, fr, el @ 1280x800 and 1920x1080",
+        expected: "every supported locale renders exact localized headings on /login, /, /event-log, and /health with zero horizontal document overflow at 1280x800 and 1920x1080",
+      }, async () => {
+        const failures: string[] = [];
+        const checkOverflow = async (label: string) => {
+          for (const viewport of [
+            {width: 1280, height: 800},
+            {width: 1920, height: 1080},
+          ] as const) {
+            await page.setViewportSize(viewport);
+            await page.waitForTimeout(100);
+            const metrics = await page.evaluate(() => ({
+              scrollWidth: document.documentElement.scrollWidth,
+              innerWidth: window.innerWidth,
+            }));
+            if (metrics.scrollWidth > metrics.innerWidth + 1) {
+              failures.push(`${label}@${viewport.width}x${viewport.height}:overflow(${metrics.scrollWidth}>${metrics.innerWidth})`);
+            }
+          }
+        };
+
+        try {
+          for (const spec of localeChecks) {
+            await page.goto(this.viewerUrl(`/login?lang=${spec.locale}`), {waitUntil: "domcontentloaded"});
+            const loginVisible = await page.getByRole("heading", {name: spec.loginHeading, exact: true})
+              .first()
+              .waitFor({timeout: this.config.uiTimeoutMs})
+              .then(() => true)
+              .catch(() => false);
+            if (!loginVisible) failures.push(`${spec.locale}:loginHeading`);
+            await checkOverflow(`${spec.locale}:/login`);
+
+            await page.evaluate((lang) => {
+              window.localStorage.setItem("language", lang);
+              document.cookie = `osh-language=${lang}; path=/; SameSite=Lax`;
+            }, spec.locale);
+
+            for (const [routePath, expectedHeading] of [
+              ["/", spec.laneStatus],
+              ["/event-log", spec.events],
+              ["/health", spec.health],
+            ] as const) {
+              await this.goto(page, routePath);
+              const headingVisible = await page.getByRole("heading", {name: expectedHeading, exact: true})
+                .first()
+                .waitFor({timeout: this.config.uiTimeoutMs})
+                .then(() => true)
+                .catch(() => false);
+              if (!headingVisible) failures.push(`${spec.locale}:${routePath}(${expectedHeading})`);
+              await checkOverflow(`${spec.locale}:${routePath}`);
+            }
+          }
+        } finally {
+          await page.setViewportSize({width: 1600, height: 1000}).catch(() => undefined);
+          await page.goto(this.viewerUrl("/login?lang=en"), {waitUntil: "domcontentloaded"}).catch(() => undefined);
+          await page.evaluate(() => {
+            window.localStorage.setItem("language", "en");
+            document.cookie = "osh-language=en; path=/; SameSite=Lax";
+          }).catch(() => undefined);
+          await this.goto(page, "/").catch(() => undefined);
+        }
+
+        const passed = failures.length === 0;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "viewer-i18n-container-fit-failed");
+        return {
+          passed,
+          observed: passed
+            ? "en, es, fr, el verified across /login, /, /event-log, /health at 1280x800 and 1920x1080 with 0 overflow"
+            : `failures=${failures.join("; ")}`,
+          evidence,
+        };
+      });
     } finally { await page.close(); }
   }
 
@@ -1576,6 +1685,13 @@ export class RegressionScenarios {
 
   private async laneVideo(): Promise<void> {
     const page = await this.browser.oscarPage();
+    let observedM3u8Url = "";
+    const captureM3u8 = (response: Response) => {
+      if (response.status() === 200 && /\.m3u8(?:\?|$)/i.test(response.url())) {
+        observedM3u8Url = response.url();
+      }
+    };
+    page.on("response", captureM3u8);
     try {
       await this.goto(page, "/");
       const laneSection = page.getByText("Lane Status", {exact: true}).locator("xpath=ancestor::*[contains(@class,'MuiStack-root')][1]");
@@ -1663,7 +1779,70 @@ export class RegressionScenarios {
           observed: `readyState=${state.readyState}; ${state.width}x${state.height}; paused=${state.paused}; advanced=${advanced}`,
         };
       });
-    } finally { await page.close(); }
+      await this.check({
+        scenario: "lane-video",
+        category: "video",
+        action: "verify multi-viewer HLS lease sharing",
+        target: this.config.testLaneLabel,
+        expected: "concurrent X-OSCAR-HLS-Viewer leases both serve #EXTM3U with Cache-Control: no-store, heartbeat returns 204, and closing one viewer leaves the second viewer streaming",
+      }, async () => {
+        if (!observedM3u8Url) {
+          throw new Error("No live .m3u8 manifest URL was observed during lane video playback");
+        }
+        const request = page.context().request;
+        const viewerA = `reg-hls-a-${randomUUID().slice(0, 12)}`;
+        const viewerB = `reg-hls-b-${randomUUID().slice(0, 12)}`;
+        try {
+          const [resA, resB] = await Promise.all([
+            request.get(observedM3u8Url, {headers: {"X-OSCAR-HLS-Viewer": viewerA}}),
+            request.get(observedM3u8Url, {headers: {"X-OSCAR-HLS-Viewer": viewerB}}),
+          ]);
+          const [bodyA, bodyB] = await Promise.all([resA.text(), resB.text()]);
+          const cacheA = resA.headers()["cache-control"] ?? "";
+          await Promise.all([resA.dispose(), resB.dispose()]);
+
+          const heartbeatB = await request.get(observedM3u8Url, {
+            headers: {"X-OSCAR-HLS-Viewer": viewerB, "X-OSCAR-HLS-Viewer-State": "heartbeat"},
+          });
+          const heartbeatStatus = heartbeatB.status();
+          await heartbeatB.dispose();
+
+          const closeA = await request.get(observedM3u8Url, {
+            headers: {"X-OSCAR-HLS-Viewer": viewerA, "X-OSCAR-HLS-Viewer-State": "closing"},
+          });
+          const closeAStatus = closeA.status();
+          await closeA.dispose();
+
+          const postCloseB = await request.get(observedM3u8Url, {
+            headers: {"X-OSCAR-HLS-Viewer": viewerB},
+          });
+          const postCloseBodyB = await postCloseB.text();
+          const postCloseStatusB = postCloseB.status();
+          await postCloseB.dispose();
+
+          const passed = resA.status() === 200 && resB.status() === 200 &&
+            bodyA.includes("#EXTM3U") && bodyB.includes("#EXTM3U") &&
+            /no-store/i.test(cacheA) &&
+            heartbeatStatus === 204 && closeAStatus === 204 &&
+            postCloseStatusB === 200 && postCloseBodyB.includes("#EXTM3U");
+          return {
+            passed,
+            observed: `A=${resA.status()}; B=${resB.status()}; cache=${cacheA || "missing"}; ` +
+              `heartbeat=${heartbeatStatus}; closeA=${closeAStatus}; postCloseB=${postCloseStatusB}`,
+          };
+        } finally {
+          await request.get(observedM3u8Url, {
+            headers: {"X-OSCAR-HLS-Viewer": viewerA, "X-OSCAR-HLS-Viewer-State": "closing"},
+          }).then(r => r.dispose()).catch(() => undefined);
+          await request.get(observedM3u8Url, {
+            headers: {"X-OSCAR-HLS-Viewer": viewerB, "X-OSCAR-HLS-Viewer-State": "closing"},
+          }).then(r => r.dispose()).catch(() => undefined);
+        }
+      });
+    } finally {
+      page.off("response", captureM3u8);
+      await page.close();
+    }
   }
 
   private waitForEventObservationPage(
@@ -1784,6 +1963,51 @@ export class RegressionScenarios {
         return {
           passed: texts.length > 0 && texts.every((text) => text.includes(this.config.testLaneLabel)),
           observed: `${texts.length} visible rows; all match lane=${texts.every((text) => text.includes(this.config.testLaneLabel))}`,
+        };
+      });
+      await this.check({
+        scenario: "event-filtering",
+        category: "events",
+        action: "verify CQL array-membership filter for EML Non-Threat",
+        target: "Event Log authenticated observations API",
+        expected: "adjudicatedIds='eml-non-threat' and adjudicatedIds!='eml-non-threat' both return HTTP 200 with exact array-membership semantics",
+      }, async () => {
+        const sourcePromise = this.waitForEventObservationPage(page, "event-log");
+        await this.goto(page, "/event-log");
+        const sourceResponse = await sourcePromise;
+        const baseObsUrl = new URL(sourceResponse.url());
+        baseObsUrl.searchParams.delete("offset");
+        baseObsUrl.searchParams.set("limit", "25");
+
+        const eqUrl = new URL(baseObsUrl.toString());
+        eqUrl.searchParams.set("filter", "adjudicatedIds='eml-non-threat'");
+        const neUrl = new URL(baseObsUrl.toString());
+        neUrl.searchParams.set("filter", "adjudicatedIds!='eml-non-threat'");
+
+        const [eqRes, neRes] = await Promise.all([
+          page.evaluate(boundedFetch, {url: eqUrl.toString(), maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES, decodeImage: false}),
+          page.evaluate(boundedFetch, {url: neUrl.toString(), maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES, decodeImage: false}),
+        ]);
+        const eqPayload = eqRes.ok ? (parseBoundedEventApiJson(eqRes, "CQL adjudicatedIds equals") as {items?: unknown[]}) : null;
+        const nePayload = neRes.ok ? (parseBoundedEventApiJson(neRes, "CQL adjudicatedIds notEquals") as {items?: unknown[]}) : null;
+        const eqItems = Array.isArray(eqPayload?.items) ? eqPayload.items : [];
+        const neItems = Array.isArray(nePayload?.items) ? nePayload.items : [];
+
+        const itemHasMarker = (item: unknown): boolean => {
+          const rec = item as {result?: {adjudicatedIds?: unknown[]}; properties?: {result?: {adjudicatedIds?: unknown[]}}};
+          const ids = rec?.result?.adjudicatedIds ?? rec?.properties?.result?.adjudicatedIds;
+          return Array.isArray(ids) && ids.some(v => String(v ?? "").trim() === "eml-non-threat");
+        };
+
+        const eqExact = eqItems.every(itemHasMarker);
+        const neExact = neItems.every(item => !itemHasMarker(item));
+        const passed = eqRes.status === 200 && neRes.status === 200 &&
+          Array.isArray(eqPayload?.items) && Array.isArray(nePayload?.items) &&
+          eqExact && neExact;
+        return {
+          passed,
+          observed: `eq HTTP=${eqRes.status} (items=${eqItems.length}, exact=${eqExact}); ` +
+            `ne HTTP=${neRes.status} (items=${neItems.length}, exact=${neExact})`,
         };
       });
     } finally { await page.close(); }
@@ -3849,6 +4073,424 @@ export class RegressionScenarios {
         };
       });
     } finally { await page.close(); }
+  }
+
+  private async emlAutoAdjudication(): Promise<void> {
+    if (!this.originalRpmConfig) throw new Error("Original RPM configuration is unavailable");
+    const detectMeta: CheckMetadata = {
+      scenario: "eml-auto-adjudication",
+      category: "eml",
+      action: "verify or upload external EML runtime plugin in SensorHub Admin",
+      target: "/sensorhub/admin",
+      expected: "Services -> OSCAR Service -> EML Plugin Path reports Active EML runtime and never exposes the JAR over HTTP buckets",
+    };
+    if (this.config.emlWorkflow === "disabled") {
+      this.skip(detectMeta, "EML_WORKFLOW=disabled");
+      return;
+    }
+
+    const quiet = this.emulator.quietConfig(this.originalRpmConfig);
+    const page = await this.browser.oscarPage();
+    try {
+      await this.ensureAlarmMediaBaseline("eml-auto-adjudication");
+
+      await this.goto(page, "/sensorhub/admin");
+      const servicesHeader = page.locator(".v-accordion-item-caption").filter({hasText: /^Services$/i}).first();
+      await servicesHeader.waitFor({timeout: this.config.uiTimeoutMs});
+      await servicesHeader.click();
+      const oscarServiceItem = page.locator(".v-table-cell-wrapper").filter({hasText: /OSCAR Service/i}).first();
+      await oscarServiceItem.waitFor({timeout: this.config.uiTimeoutMs});
+      await oscarServiceItem.click();
+
+      const emlRow = page.locator("tr.v-formlayout-row").filter({hasText: /EML Plugin Path/i}).first();
+      const emlRowPresent = await emlRow.waitFor({timeout: this.config.uiTimeoutMs})
+        .then(() => true)
+        .catch(() => false);
+      if (!emlRowPresent) {
+        if (this.config.emlWorkflow === "auto") {
+          this.skip(detectMeta, "EML Plugin Path control is not present on this build (auto detection)");
+        } else {
+          this.reporter.outcome(
+            detectMeta.scenario, detectMeta.category, detectMeta.action, detectMeta.target,
+            detectMeta.expected, "EML Plugin Path form row is absent", "incorrect", 0,
+            await this.screenshotOnFailure(page, "eml-admin-row-missing"),
+          );
+        }
+        return;
+      }
+
+      const initialRowText = (await emlRow.innerText()).replace(/\s+/g, " ").trim();
+      const alreadyActive = /Active:\s*\S+/i.test(initialRowText);
+      if (!this.config.emlPluginPath && !alreadyActive) {
+        if (this.config.emlWorkflow === "auto") {
+          this.skip(detectMeta, "OSCAR_EML_PLUGIN_PATH is unset and no EML plugin is currently loaded on target");
+        } else {
+          this.reporter.outcome(
+            detectMeta.scenario, detectMeta.category, detectMeta.action, detectMeta.target,
+            detectMeta.expected, `OSCAR_EML_PLUGIN_PATH is unset and row shows: ${initialRowText}`, "incorrect", 0,
+          );
+        }
+        return;
+      }
+
+      const pluginReady = await this.check({
+        ...detectMeta,
+      }, async () => {
+        if (this.config.emlPluginPath) {
+          const expectedFileName = basename(this.config.emlPluginPath);
+          const fileInput = emlRow.locator('input[type="file"]').first();
+          await fileInput.setInputFiles(this.config.emlPluginPath);
+          const uploadBtn = emlRow.locator(".v-upload .v-button").first();
+          await uploadBtn.click();
+          await poll(
+            async () => (await emlRow.innerText()).replace(/\s+/g, " ").trim(),
+            text => text.includes(`Active: ${expectedFileName}`) || /Active:\s*\S+/i.test(text),
+            {timeoutMs: 30_000, intervalMs: 500, description: "EML plugin upload to activate runtime"},
+          );
+          // Dismiss any transient Vaadin notification banner if present before clicking Apply Changes / Save.
+          const notif = page.locator(".v-Notification").first();
+          if (await notif.isVisible().catch(() => false)) {
+            await notif.click().catch(() => undefined);
+          }
+          const applyBtn = page.locator(".v-button").filter({hasText: /^Apply Changes$/i}).first();
+          if (await applyBtn.isVisible().catch(() => false)) {
+            await applyBtn.click();
+            await sleep(500);
+          }
+          const saveBtn = page.locator(".v-button").filter({hasText: /^Save$/i}).first();
+          if (await saveBtn.isVisible().catch(() => false)) {
+            await saveBtn.click();
+            const confirmYes = page.locator(".v-window .v-button").filter({hasText: /^Yes$/i}).first();
+            await confirmYes.waitFor({timeout: 10_000});
+            await confirmYes.click();
+            await sleep(500);
+          }
+        }
+
+        const updatedRowText = (await emlRow.innerText()).replace(/\s+/g, " ").trim();
+        const activeMatched = /Active:\s*\S+/i.test(updatedRowText);
+
+        // Verify private storage isolation: neither /sensorhub/buckets nor /sensorhub/buckets/eml-plugin exposes the JAR.
+        const request = page.context().request;
+        const [bucketsRoot, emlBucketProbe] = await Promise.all([
+          request.get(this.viewerUrl("/sensorhub/buckets")),
+          request.get(this.viewerUrl("/sensorhub/buckets/eml-plugin")),
+        ]);
+        const bucketsRootBody = await bucketsRoot.text().catch(() => "");
+        const emlBucketStatus = emlBucketProbe.status();
+        await Promise.all([bucketsRoot.dispose(), emlBucketProbe.dispose()]);
+
+        const bucketUnexposed = !/eml-plugin|eml-vm250/i.test(bucketsRootBody) &&
+          (emlBucketStatus === 400 || emlBucketStatus === 403 || emlBucketStatus === 404);
+        const passed = activeMatched && bucketUnexposed;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "eml-admin-upload-status");
+        return {
+          passed,
+          value: passed,
+          observed: `status="${updatedRowText}"; bucketsListingClean=${!/eml-plugin|eml-vm250/i.test(bucketsRootBody)}; emlBucketHTTP=${emlBucketStatus}`,
+          evidence,
+        };
+      });
+      if (!pluginReady) return;
+
+      // 1. Distributed NORM alarm -> EML RELEASE -> automatic Code 9999 EML Non-Threat adjudication & Dashboard suppression.
+      await this.emulator.replaceConfig(
+        this.config.testRpmId,
+        this.emulator.distributedNormAlarmConfig(this.originalRpmConfig),
+      );
+      await this.waitHealthRpmConnection(page, "online", 60_000);
+      // Allow at least one fresh GB + NB background cycle (~5s) so EMLService evaluates with fallback=false.
+      await sleep(7_500);
+
+      let releaseTrigger: AlarmTriggerIdentity | undefined;
+      let releaseEventId: string | undefined;
+      let releaseHasMarker = false;
+
+      for (let attempt = 1; attempt <= 2 && !releaseHasMarker; attempt++) {
+        releaseTrigger = await this.triggerAlarm("gamma", "eml-auto-adjudication");
+        if (!releaseTrigger) throw new Error("Distributed NORM gamma trigger returned no occupancy identity");
+        const releaseRow = await this.findAlarmRow(page, /Gamma/i, releaseTrigger);
+        releaseEventId = await this.resolveAlarmEventUuid(
+          page,
+          releaseRow,
+          "gamma",
+          releaseTrigger.occupancyCount,
+          "eml-auto-adjudication",
+        );
+        if (!releaseEventId) throw new Error("Failed to resolve occupancy UUID for distributed NORM gamma alarm");
+        await this.captureAlarmMedia(page, releaseEventId, "gamma", releaseTrigger.occupancyCount, "eml-auto-adjudication");
+
+        const obsRes = await page.context().request.get(
+          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(releaseEventId)}`),
+          {headers: {Accept: "application/om+json"}},
+        );
+        try {
+          if (obsRes.ok()) {
+            const obsJson = await obsRes.json() as {
+              result?: {adjudicatedIds?: unknown[]};
+              properties?: {result?: {adjudicatedIds?: unknown[]}};
+            };
+            const adjIds = obsJson.result?.adjudicatedIds ?? obsJson.properties?.result?.adjudicatedIds ?? [];
+            releaseHasMarker = Array.isArray(adjIds) && adjIds.includes("eml-non-threat");
+          }
+        } finally {
+          await obsRes.dispose();
+        }
+        if (!releaseHasMarker && attempt < 2) {
+          await sleep(6_000);
+        }
+      }
+
+      if (!releaseTrigger || !releaseEventId) {
+        throw new Error("Distributed NORM EML test did not produce an occupancy event");
+      }
+      const confirmedReleaseTrigger = releaseTrigger;
+      const confirmedReleaseEventId = releaseEventId;
+
+      await this.check({
+        scenario: "eml-auto-adjudication",
+        category: "eml",
+        action: "auto-adjudicate EML RELEASE alarm with Code 9999 metadata",
+        target: confirmedReleaseEventId,
+        expected: "occupancy carries adjudicatedIds=['eml-non-threat'], Event Details renders EML Analysis RELEASE + Auto: EML Non-Threat + Code 9999, and ConSys adjudication persists EML_METADATA JSON",
+      }, async () => {
+        await this.goto(page, `/event-details?eventId=${encodeURIComponent(confirmedReleaseEventId)}`);
+        const card = page.getByTestId("eml-analysis-card");
+        await card.waitFor({timeout: this.config.uiTimeoutMs});
+        const decisionText = (await page.getByTestId("eml-decision-chip").innerText()).trim();
+        const autoChipVisible = await page.getByTestId("eml-auto-adjudicated-chip").isVisible().catch(() => false);
+        const loggedText = await poll(
+          () => page.locator("body").innerText(),
+          text => /9999/.test(text) && /EML Non-Threat/i.test(text),
+          {timeoutMs: 20_000, intervalMs: 500, description: "Logged Adjudications to render Code 9999 EML Non-Threat"},
+        ).catch(() => page.locator("body").innerText());
+
+        // Inspect persisted adjudication observation via ConSys REST API for exact EML_METADATA JSON.
+        const adjFilterUrl = this.viewerUrl(
+          `/sensorhub/api/observations?observedProperty=${encodeURIComponent("http://sensorml.com/ont/swe/property/Adjudication")}&resultTime=latest&limit=100`,
+        );
+        let metadataValid = false;
+        let adjObserved = "unmatched";
+        const SystemsRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/api/datastreams?limit=500"),
+        );
+        try {
+          if (SystemsRes.ok()) {
+            const dsPayload = await SystemsRes.json() as {items?: Array<{id?: string; name?: string; outputName?: string}>};
+            const adjStreams = (dsPayload.items ?? []).filter(ds =>
+              /adjudication/i.test(`${ds.name ?? ""} ${ds.outputName ?? ""}`) && ds.id);
+            for (const ds of adjStreams) {
+              const obsRes = await page.context().request.get(
+                this.viewerUrl(`/sensorhub/api/datastreams/${encodeURIComponent(ds.id!)}/observations?limit=25`),
+                {headers: {Accept: "application/om+json"}},
+              );
+              try {
+                if (!obsRes.ok()) continue;
+                const obsPayload = await obsRes.json() as {items?: Array<Record<string, unknown>>};
+                for (const item of obsPayload.items ?? []) {
+                  const res = (item.result ?? (item.properties as Record<string, unknown> | undefined)?.result) as Record<string, unknown> | undefined;
+                  if (!res) continue;
+                  if (res.occupancyObsId === confirmedReleaseEventId || String(res.occupancyCount ?? "") === String(confirmedReleaseTrigger.occupancyCount)) {
+                    const code = Number(res.adjudicationCode);
+                    const feedback = String(res.feedback ?? "");
+                    const markerIdx = feedback.indexOf("EML_METADATA:");
+                    if (markerIdx >= 0) {
+                      const parsedMeta = JSON.parse(feedback.slice(markerIdx + "EML_METADATA:".length).trim()) as Record<string, unknown>;
+                      metadataValid = code === 9999 &&
+                        String(res.secondaryInspectionStatus ?? "") === "NONE" &&
+                        parsedMeta.result === "RELEASE" &&
+                        parsedMeta.dispositionCode === 9999;
+                      adjObserved = `code=${code}; secondary=${String(res.secondaryInspectionStatus)}; metaResult=${String(parsedMeta.result)}; model=${String(parsedMeta.modelId)}`;
+                      if (metadataValid) break;
+                    }
+                  }
+                }
+              } finally {
+                await obsRes.dispose();
+              }
+              if (metadataValid) break;
+            }
+          }
+        } finally {
+          await SystemsRes.dispose();
+          void adjFilterUrl;
+        }
+
+        const passed = releaseHasMarker && decisionText === "RELEASE" && autoChipVisible &&
+          /9999/.test(loggedText) && /EML Non-Threat/i.test(loggedText) && metadataValid;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "eml-release-event-details");
+        return {
+          passed,
+          observed: `hasMarker=${releaseHasMarker}; chip=${decisionText}; autoBadge=${autoChipVisible}; ` +
+            `loggedCode9999=${/9999/.test(loggedText)}; ${adjObserved}`,
+          evidence,
+        };
+      });
+
+      await this.check({
+        scenario: "eml-auto-adjudication",
+        category: "eml",
+        action: "suppress EML Non-Threat alarm from Dashboard unadjudicated queue",
+        target: `${this.config.testLaneLabel}:${confirmedReleaseTrigger.occupancyCount}`,
+        expected: "Dashboard unadjudicated alarm table excludes the auto-adjudicated EML Non-Threat occupancy",
+      }, async () => {
+        await this.openDashboard(page);
+        await page.waitForTimeout(2_000);
+        const rows = page.locator(".MuiDataGrid-row").filter({hasText: this.config.testLaneLabel});
+        const rowCount = await rows.count();
+        let leaked = false;
+        for (let i = 0; i < rowCount; i++) {
+          const occ = (await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim();
+          if (occ === String(confirmedReleaseTrigger.occupancyCount)) {
+            leaked = true;
+            break;
+          }
+        }
+        const evidence = !leaked ? "" : await this.screenshotOnFailure(page, "eml-dashboard-suppression-leak");
+        return {
+          passed: !leaked,
+          observed: `reservedLaneDashboardRows=${rowCount}; occupancy ${confirmedReleaseTrigger.occupancyCount} leaked=${leaked}`,
+          evidence,
+        };
+      });
+
+      await this.check({
+        scenario: "eml-auto-adjudication",
+        category: "eml",
+        action: "query EML Non-Threat alarms via Event Log Advanced Filters",
+        target: "Event Log (Adjudicated = EML Non-Threat)",
+        expected: "filtering Lane ID + Adjudicated = EML Non-Threat returns the auto-adjudicated occupancy",
+      }, async () => {
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
+        await page.getByRole("button", {name: /advanced filters/i}).first().click();
+        const dialog = page.getByRole("dialog", {name: /advanced filters/i});
+        await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+        await dialog.getByRole("button", {name: /clear all/i}).click();
+
+        // Condition 1: Lane ID = testLaneLabel
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        const boxes = dialog.getByRole("combobox");
+        await boxes.nth(1).click();
+        await page.getByRole("option", {name: "Lane ID", exact: true}).click();
+        await boxes.nth(3).click();
+        await page.getByRole("option", {name: this.config.testLaneLabel, exact: true}).click();
+
+        // Condition 2: Adjudicated = EML Non-Threat
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        await boxes.nth(4).click();
+        await page.getByRole("option", {name: "Adjudicated", exact: true}).click();
+        await boxes.nth(6).click();
+        await page.getByRole("option", {name: "EML Non-Threat", exact: true}).click();
+
+        await dialog.getByRole("button", {name: /apply filters/i}).click();
+        await dialog.waitFor({state: "hidden"});
+
+        const matchedOccupancies = await poll(async () => {
+          const rows = page.locator(".MuiDataGrid-row");
+          const count = await rows.count();
+          const occs: string[] = [];
+          for (let i = 0; i < count; i++) {
+            occs.push((await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim());
+          }
+          return occs;
+        }, occs => occs.includes(String(confirmedReleaseTrigger.occupancyCount)), {
+          timeoutMs: 30_000,
+          intervalMs: 500,
+          description: `Event Log EML Non-Threat filter to return occupancy ${confirmedReleaseTrigger.occupancyCount}`,
+        }).catch(() => [] as string[]);
+
+        const passed = matchedOccupancies.includes(String(confirmedReleaseTrigger.occupancyCount));
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "eml-event-log-filter-failed");
+        return {
+          passed,
+          observed: `matchedOccupancies=${matchedOccupancies.join(",") || "none"}`,
+          evidence,
+        };
+      });
+
+      // 2. Localized point-source Threat alarm -> EML INVESTIGATE -> remains unadjudicated and surfaces on Dashboard.
+      await this.emulator.replaceConfig(
+        this.config.testRpmId,
+        this.emulator.localizedThreatAlarmConfig(this.originalRpmConfig),
+      );
+      await this.waitHealthRpmConnection(page, "online", 60_000);
+      await sleep(7_500);
+
+      const investigateTrigger = await this.triggerAlarm("gamma", "eml-auto-adjudication");
+      if (!investigateTrigger) throw new Error("Localized threat gamma trigger returned no occupancy identity");
+      const investigateRow = await this.findAlarmRow(page, /Gamma/i, investigateTrigger);
+      const investigateEventId = await this.resolveAlarmEventUuid(
+        page,
+        investigateRow,
+        "gamma",
+        investigateTrigger.occupancyCount,
+        "eml-auto-adjudication",
+      );
+      if (!investigateEventId) throw new Error("Failed to resolve occupancy UUID for localized threat gamma alarm");
+      await this.captureAlarmMedia(page, investigateEventId, "gamma", investigateTrigger.occupancyCount, "eml-auto-adjudication");
+
+      await this.check({
+        scenario: "eml-auto-adjudication",
+        category: "eml",
+        action: "keep EML INVESTIGATE alarm unadjudicated and visible on Dashboard",
+        target: investigateEventId,
+        expected: "EML INVESTIGATE leaves adjudicatedIds empty, renders INVESTIGATE on Event Details without Auto badge, and appears on Dashboard",
+      }, async () => {
+        const obsRes = await page.context().request.get(
+          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(investigateEventId)}`),
+          {headers: {Accept: "application/om+json"}},
+        );
+        let unadjudicated = false;
+        try {
+          if (obsRes.ok()) {
+            const obsJson = await obsRes.json() as {
+              result?: {adjudicatedIds?: unknown[]};
+              properties?: {result?: {adjudicatedIds?: unknown[]}};
+            };
+            const adjIds = obsJson.result?.adjudicatedIds ?? obsJson.properties?.result?.adjudicatedIds ?? [];
+            unadjudicated = Array.isArray(adjIds) && adjIds.length === 0;
+          }
+        } finally {
+          await obsRes.dispose();
+        }
+
+        await this.goto(page, `/event-details?eventId=${encodeURIComponent(investigateEventId)}`);
+        const card = page.getByTestId("eml-analysis-card");
+        const cardVisible = await card.waitFor({timeout: this.config.uiTimeoutMs}).then(() => true).catch(() => false);
+        const decisionText = cardVisible
+          ? (await page.getByTestId("eml-decision-chip").innerText().catch(() => "")).trim()
+          : "";
+        const autoChipVisible = await page.getByTestId("eml-auto-adjudicated-chip").isVisible().catch(() => false);
+
+        await this.openDashboard(page);
+        const visibleOnDashboard = await poll(async () => {
+          const rows = page.locator(".MuiDataGrid-row").filter({hasText: this.config.testLaneLabel});
+          const count = await rows.count();
+          for (let i = 0; i < count; i++) {
+            const occ = (await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim();
+            if (occ === String(investigateTrigger.occupancyCount)) return true;
+          }
+          return false;
+        }, found => found, {
+          timeoutMs: 30_000,
+          intervalMs: 1_000,
+          description: `EML INVESTIGATE occupancy ${investigateTrigger.occupancyCount} to appear on Dashboard`,
+        }).catch(() => false);
+
+        const passed = unadjudicated && cardVisible && decisionText === "INVESTIGATE" && !autoChipVisible && visibleOnDashboard;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "eml-investigate-dashboard");
+        return {
+          passed,
+          observed: `unadjudicated=${unadjudicated}; cardVisible=${cardVisible}; chip=${decisionText}; autoBadge=${autoChipVisible}; onDashboard=${visibleOnDashboard}`,
+          evidence,
+        };
+      });
+    } finally {
+      await this.emulator.replaceConfig(this.config.testRpmId, quiet).catch(error =>
+        this.reporter.error("eml-auto-adjudication", "restore-quiet-config", error));
+      await page.close();
+    }
   }
 
   private async verifyGeneratedAlarmRetention(probe: StorageProbeClient): Promise<void> {

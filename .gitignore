@@ -23,3 +23,6 @@ id_ed25519.*
 *.ppk
 *.log
 .DS_Store
+EML-VM250-*
+eml-vm250-*
+*eml*.jar

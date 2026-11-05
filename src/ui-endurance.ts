@@ -420,6 +420,9 @@ class UiEnduranceRunner {
   private lastAlarmPollIso = new Date().toISOString();
   private currentCycle = 0;
   private stopRequested = false;
+  private wallboardAuthRefreshedAtMs = 0;
+  private operatorAuthRefreshedAtMs = 0;
+  private static readonly PROACTIVE_SESSION_REFRESH_MS = 4 * 3600_000;
 
   // Bounded O(1) telemetry counters & recent ring buffers so multi-week continuous
   // daemon runs never accumulate unbounded arrays or sets in Node.js heap.
@@ -646,21 +649,33 @@ class UiEnduranceRunner {
     }
   }
 
+  private async signInIfOnLoginPage(page: Page): Promise<boolean> {
+    let onLogin = false;
+    try {
+      onLogin = new URL(page.url()).pathname.startsWith("/login");
+    } catch {
+      onLogin = false;
+    }
+    const username = page.getByLabel("Username");
+    const visible = onLogin || (await username.isVisible().catch(() => false));
+    if (!visible) return false;
+    await username.waitFor({timeout: this.config.uiTimeoutMs});
+    await username.fill(this.config.oscarUsername);
+    await page.getByLabel("Password").fill(this.config.oscarPassword);
+    await Promise.all([
+      page.waitForURL((url) => !url.pathname.startsWith("/login"), {
+        timeout: this.config.uiTimeoutMs,
+      }),
+      page.getByRole("button", {name: "Sign in"}).click(),
+    ]);
+    return true;
+  }
+
   private async authenticateContext(context: BrowserContext): Promise<void> {
     const page = await context.newPage();
     try {
-      await page.goto(this.config.oscarBaseUrl, {waitUntil: "domcontentloaded"});
-      const username = page.getByLabel("Username");
-      if (await username.isVisible().catch(() => false)) {
-        await username.fill(this.config.oscarUsername);
-        await page.getByLabel("Password").fill(this.config.oscarPassword);
-        await Promise.all([
-          page.waitForURL((url) => !url.pathname.startsWith("/login"), {
-            timeout: this.config.uiTimeoutMs,
-          }),
-          page.getByRole("button", {name: "Sign in"}).click(),
-        ]);
-      }
+      await page.goto(this.viewerUrl("/login?lang=en"), {waitUntil: "domcontentloaded"});
+      await this.signInIfOnLoginPage(page);
       const sessionRes = await context.request.get(this.viewerUrl("/session"));
       if (!sessionRes.ok()) {
         throw new Error(`OSCAR /session returned HTTP ${sessionRes.status()}`);
@@ -671,6 +686,48 @@ class UiEnduranceRunner {
       }
     } finally {
       await page.close();
+    }
+  }
+
+  private async ensureContextSessionFresh(
+    context: BrowserContext | undefined,
+    kind: "wallboard" | "operator",
+  ): Promise<void> {
+    if (!context) return;
+    const lastRefreshed = kind === "wallboard"
+      ? this.wallboardAuthRefreshedAtMs
+      : this.operatorAuthRefreshedAtMs;
+    const ageMs = Date.now() - lastRefreshed;
+    let sessionValid = false;
+    if (ageMs < UiEnduranceRunner.PROACTIVE_SESSION_REFRESH_MS) {
+      try {
+        const res = await context.request.get(this.viewerUrl("/session"), {timeout: 10_000});
+        if (res.ok()) {
+          const body = (await res.json()) as {username?: string};
+          sessionValid = body.username === this.config.oscarUsername;
+        }
+      } catch {
+        sessionValid = false;
+      }
+    }
+    if (!sessionValid) {
+      await this.authenticateContext(context);
+      const now = Date.now();
+      if (kind === "wallboard") this.wallboardAuthRefreshedAtMs = now;
+      else this.operatorAuthRefreshedAtMs = now;
+    }
+  }
+
+  private async gotoOperator(page: Page, pathOrUrl: string): Promise<void> {
+    const fullUrl = pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")
+      ? pathOrUrl
+      : this.viewerUrl(pathOrUrl);
+    await page.goto(fullUrl, {waitUntil: "domcontentloaded"});
+    if (await this.signInIfOnLoginPage(page)) {
+      this.operatorAuthRefreshedAtMs = Date.now();
+      if (page.url() !== fullUrl) {
+        await page.goto(fullUrl, {waitUntil: "domcontentloaded"});
+      }
     }
   }
 
@@ -853,7 +910,7 @@ class UiEnduranceRunner {
         phenomenonTime: phenomenonRange,
         filter: `adjudicatedIdsCount=0 AND (${predicate})`,
         order: "desc",
-        limit: String(UI_ENDURANCE_PAGE_SIZE),
+        limit: String(UI_ENDURANCE_PAGE_SIZE * 2),
       });
       const url = this.viewerUrl(`/sensorhub/api/observations?${params}`);
       for (let attempt = 0; attempt < 2; attempt++) {
@@ -1230,6 +1287,12 @@ class UiEnduranceRunner {
     page.on("requestfailed", onDone);
     try {
       await page.goto(url, {waitUntil: "domcontentloaded"});
+      if (await this.signInIfOnLoginPage(page)) {
+        this.wallboardAuthRefreshedAtMs = Date.now();
+        if (page.url() !== url) {
+          await page.goto(url, {waitUntil: "domcontentloaded"});
+        }
+      }
       await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
       await poll(
         async () => {
@@ -1876,7 +1939,7 @@ class UiEnduranceRunner {
       ? new Set(this.config.laneConfigOracle?.lanesByView.get(plan.operatorViewKey) ?? [])
       : undefined;
 
-    await page.goto(this.viewerUrl(scopePath), {waitUntil: "domcontentloaded"});
+    await this.gotoOperator(page, scopePath);
     if (plan.operatorViewKey) {
       await page.getByText(`View: ${plan.operatorViewKey}`, {exact: true}).waitFor({
         timeout: this.config.uiTimeoutMs,
@@ -2067,9 +2130,7 @@ class UiEnduranceRunner {
     const viewKey = plan.operatorViewKey ?? REQUIRED_OPERATIONAL_VIEW_KEYS[0];
     const allowedLanes = new Set(this.config.laneConfigOracle?.lanesByView.get(viewKey) ?? []);
 
-    await page.goto(this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`), {
-      waitUntil: "domcontentloaded",
-    });
+    await this.gotoOperator(page, `/?view=${encodeURIComponent(viewKey)}`);
     await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
@@ -2241,7 +2302,7 @@ class UiEnduranceRunner {
     const eventLogPath = viewKey
       ? `/event-log?view=${encodeURIComponent(viewKey)}`
       : "/event-log";
-    await page.goto(this.viewerUrl(eventLogPath), {waitUntil: "domcontentloaded"});
+    await this.gotoOperator(page, eventLogPath);
     if (viewKey) {
       await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
         timeout: this.config.uiTimeoutMs,
@@ -2293,7 +2354,7 @@ class UiEnduranceRunner {
     const detailHref = viewKey
       ? `/event-details?eventId=${encodeURIComponent(target.observationId)}&view=${encodeURIComponent(viewKey)}`
       : `/event-details?eventId=${encodeURIComponent(target.observationId)}`;
-    await page.goto(this.viewerUrl(detailHref), {waitUntil: "domcontentloaded"});
+    await this.gotoOperator(page, detailHref);
 
     const detailOutcome = await this.exerciseFullAdjudicationDetailForm(
       page,
@@ -2303,7 +2364,7 @@ class UiEnduranceRunner {
 
     // Return to /event-log and filter to `Adjudicated = Yes` + `Lane ID = target.laneId` to prove
     // adjudicated status renders `Yes` in Event Log!
-    await page.goto(this.viewerUrl(eventLogPath), {waitUntil: "domcontentloaded"});
+    await this.gotoOperator(page, eventLogPath);
     await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
     await page.getByRole("button", {name: /advanced filters/i}).first().click();
     await filterDialog.waitFor({timeout: this.config.uiTimeoutMs});
@@ -2382,7 +2443,7 @@ class UiEnduranceRunner {
       ? new Set(this.config.laneConfigOracle?.lanesByView.get(viewKey) ?? [])
       : undefined;
 
-    await page.goto(this.viewerUrl(dashPath), {waitUntil: "domcontentloaded"});
+    await this.gotoOperator(page, dashPath);
     if (viewKey) {
       await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
         timeout: this.config.uiTimeoutMs,
@@ -2623,6 +2684,7 @@ class UiEnduranceRunner {
     this.wallboardContext.setDefaultTimeout(this.config.uiTimeoutMs);
     this.wallboardContext.setDefaultNavigationTimeout(this.config.uiTimeoutMs);
     await this.authenticateContext(this.wallboardContext);
+    this.wallboardAuthRefreshedAtMs = Date.now();
 
     this.catalog = await this.discoverOccupancyCatalog(this.wallboardContext.request);
 
@@ -2642,6 +2704,7 @@ class UiEnduranceRunner {
       this.operatorContext.setDefaultNavigationTimeout(this.config.uiTimeoutMs);
       await installDeterministicQrCamera(this.operatorContext, createSpectroscopicCameraFixture());
       await this.authenticateContext(this.operatorContext);
+      this.operatorAuthRefreshedAtMs = Date.now();
       this.operatorPage = await this.operatorContext.newPage();
       this.attachPageTelemetry(this.operatorPage, "operator");
     }
@@ -2666,6 +2729,12 @@ class UiEnduranceRunner {
         }
 
         this.currentCycle = cycleIndex;
+        if (cycleIndex > 0) {
+          await this.ensureContextSessionFresh(this.wallboardContext, "wallboard");
+          if (!this.options.readOnlyWallboard) {
+            await this.ensureContextSessionFresh(this.operatorContext, "operator");
+          }
+        }
         const plan = buildCycleExecutionPlan({
           cycleIndex,
           runTag: this.runId.slice(-6).toUpperCase(),

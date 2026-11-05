@@ -61,7 +61,9 @@ async function main(): Promise<number> {
   const config = loadConfig();
   assertMutationAllowed(config);
   const suiteGitCommit = resolveSuiteGitCommit(config.profile);
-  const restoreEvidence = config.profile === "3.9.2-release" &&
+  const isReleaseCertification =
+    config.profile === "3.9.2-release" || config.profile === "3.11.0-release";
+  const restoreEvidence = isReleaseCertification &&
       config.storageBackupMode === "single"
     ? validateRestoreEvidenceBundle(config.releaseRestoreEvidenceDirectory ?? "", {
       suiteGitCommit,
@@ -100,6 +102,8 @@ async function main(): Promise<number> {
     } : {}),
     eventUuidWorkflow: config.eventUuidWorkflow,
     alarmTransferCameraWorkflow: config.alarmTransferCameraWorkflow,
+    emlWorkflow: config.emlWorkflow,
+    emlPluginConfigured: Boolean(config.emlPluginPath),
     storageWorkflow: config.storageWorkflow,
     storageExpectedRelease: config.storageExpectedRelease,
     storageBackupWorkflow: config.storageBackupWorkflow,
@@ -127,7 +131,7 @@ async function main(): Promise<number> {
   const metrics = new MetricsSampler(config, reporter);
   const scenarios = new RegressionScenarios(config, reporter, browser, emulator, metrics);
   let interrupted = false;
-  const mutationRunLock = config.profile === "full" || config.profile === "3.9.2-release"
+  const mutationRunLock = config.profile === "full" || isReleaseCertification
     ? acquireFullRunLock(config.rpmEmulatorUrl, config.testRpmId)
     : config.profile === "restore-drill"
       ? acquireRestoreRunLock(config.targetHost, config.oscarReleaseDirectory ?? "missing")
@@ -157,7 +161,7 @@ async function main(): Promise<number> {
     } else {
       await browser.start();
       await scenarios.runReadOnly();
-      if ((config.profile === "full" || config.profile === "3.9.2-release") && !interrupted) {
+      if ((config.profile === "full" || isReleaseCertification) && !interrupted) {
         await scenarios.runFull();
       }
     }

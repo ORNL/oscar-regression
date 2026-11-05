@@ -23,6 +23,7 @@
     "test:smoke": "tsx src/cli.ts --profile smoke",
     "test:full": "tsx src/cli.ts --profile full",
     "test:3.9.2-release": "tsx src/cli.ts --profile 3.9.2-release",
+    "test:3.11.0-release": "tsx src/cli.ts --profile 3.11.0-release",
     "test:restore-drill": "tsx src/cli.ts --profile restore-drill",
     "test:ui-endurance": "tsx src/ui-endurance.ts",
     "install:browser": "playwright install chromium"

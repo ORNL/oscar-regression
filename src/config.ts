@@ -1,4 +1,4 @@
-import {mkdirSync, readFileSync} from "node:fs";
+import {existsSync, mkdirSync, readFileSync, statSync} from "node:fs";
 import {isAbsolute, posix, resolve} from "node:path";
 import {assertCanonicalOperationalViewOracle, loadLaneConfigOracle} from "./lane-config.js";
 import {publicObservationId} from "./public-observation-id.js";
@@ -182,8 +182,9 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   const parsedArguments = parseArguments(args);
   const profileRaw = parsedArguments.profile ?? "smoke";
   if (profileRaw !== "smoke" && profileRaw !== "full" &&
-      profileRaw !== "3.9.2-release" && profileRaw !== "restore-drill") {
-    throw new Error("--profile must be smoke, full, 3.9.2-release, or restore-drill");
+      profileRaw !== "3.9.2-release" && profileRaw !== "3.11.0-release" &&
+      profileRaw !== "restore-drill") {
+    throw new Error("--profile must be smoke, full, 3.9.2-release, 3.11.0-release, or restore-drill");
   }
   const profile: Profile = profileRaw;
   const {value: oscarBaseUrl, parsed} = serviceUrl("OSCAR_BASE_URL", true);
@@ -212,7 +213,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
-    "event-uuid", "adjudication", "extended-occupancy", "adjudication-report",
+    "event-uuid", "adjudication", "eml-auto-adjudication", "extended-occupancy", "adjudication-report",
     "storage-health", "storage-lifecycle",
     "storage-restore-drill",
   ]);
@@ -227,34 +228,57 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   if (profile !== "restore-drill" && scenarioValues.includes("storage-restore-drill")) {
     throw new Error("storage-restore-drill requires --profile restore-drill");
   }
-  if (profile === "3.9.2-release" && scenarioValues.length > 0) {
-    throw new Error("--profile 3.9.2-release must be an unfiltered full certification run");
+  const isReleaseCertification = profile === "3.9.2-release" || profile === "3.11.0-release";
+  if (isReleaseCertification && scenarioValues.length > 0) {
+    throw new Error(`--profile ${profile} must be an unfiltered full certification run`);
   }
   const oscarReleaseDirectory = canonicalReleasePath("OSCAR_RELEASE_DIR");
   const restoreArchiveDirectory = canonicalRestorePath("OSCAR_RESTORE_ARCHIVE_DIR");
   const restoreBackupDirectory = canonicalRestorePath("OSCAR_RESTORE_BACKUP_DIR");
   const eventUuidWorkflow = capabilityMode("EVENT_UUID_WORKFLOW", "auto");
   const alarmTransferCameraWorkflow = capabilityMode("ALARM_TRANSFER_CAMERA_WORKFLOW", "auto");
+  const emlWorkflow = capabilityMode("EML_WORKFLOW", "auto");
+  const emlPluginRaw = process.env.OSCAR_EML_PLUGIN_PATH?.trim();
+  let emlPluginPath: string | undefined;
+  if (emlPluginRaw) {
+    if (/[\0\r\n]/.test(emlPluginRaw)) {
+      throw new Error("OSCAR_EML_PLUGIN_PATH must not contain control characters");
+    }
+    const resolvedEml = resolve(emlPluginRaw);
+    if (!/\.(?:jar|tar\.gz|tgz|zip)$/i.test(resolvedEml)) {
+      throw new Error("OSCAR_EML_PLUGIN_PATH must end with .jar, .tar.gz, .tgz, or .zip");
+    }
+    if (!existsSync(resolvedEml) || !statSync(resolvedEml).isFile()) {
+      throw new Error(`OSCAR_EML_PLUGIN_PATH does not point to an existing regular file: ${resolvedEml}`);
+    }
+    emlPluginPath = resolvedEml;
+  }
+  if (emlWorkflow === "required" && !emlPluginPath) {
+    throw new Error("EML_WORKFLOW=required requires OSCAR_EML_PLUGIN_PATH");
+  }
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
   const storageBackupMode = backupMode("OSCAR_BACKUP_MODE", "disabled");
   const oscarBuildLabel = process.env.OSCAR_BUILD_LABEL?.trim();
-  const releaseRestoreEvidenceDirectory = process.env.OSCAR_3_9_2_RESTORE_EVIDENCE_DIR?.trim();
+  const releaseRestoreEvidenceDirectory =
+    process.env.OSCAR_3_11_0_RESTORE_EVIDENCE_DIR?.trim() ||
+    process.env.OSCAR_3_9_2_RESTORE_EVIDENCE_DIR?.trim();
   if (releaseRestoreEvidenceDirectory &&
       (!isAbsolute(releaseRestoreEvidenceDirectory) || /[\0\r\n]/.test(releaseRestoreEvidenceDirectory))) {
-    throw new Error("OSCAR_3_9_2_RESTORE_EVIDENCE_DIR must be an absolute local path without control characters");
+    throw new Error("OSCAR_3_11_0_RESTORE_EVIDENCE_DIR / OSCAR_3_9_2_RESTORE_EVIDENCE_DIR must be an absolute local path without control characters");
   }
-  if (profile === "3.9.2-release") {
+  if (isReleaseCertification) {
     if (operationalViewWorkflow !== "required" || eventUuidWorkflow !== "required" ||
         alarmTransferCameraWorkflow !== "required" || storageWorkflow !== "required" ||
-        storageBackupWorkflow !== "required") {
+        storageBackupWorkflow !== "required" ||
+        (profile === "3.11.0-release" && emlWorkflow !== "required")) {
       throw new Error(
-        "3.9.2-release requires operational-view, UUID, camera, storage, and backup workflows to be required",
+        `${profile} requires operational-view, UUID, camera, storage, backup${profile === "3.11.0-release" ? ", and EML" : ""} workflows to be required`,
       );
     }
-    if (!oscarBuildLabel) throw new Error("3.9.2-release requires OSCAR_BUILD_LABEL");
+    if (!oscarBuildLabel) throw new Error(`${profile} requires OSCAR_BUILD_LABEL`);
     if (storageBackupMode === "single" && !releaseRestoreEvidenceDirectory) {
-      throw new Error("3.9.2-release requires OSCAR_3_9_2_RESTORE_EVIDENCE_DIR");
+      throw new Error(`${profile} requires OSCAR_3_11_0_RESTORE_EVIDENCE_DIR or OSCAR_3_9_2_RESTORE_EVIDENCE_DIR`);
     }
   }
 
@@ -301,6 +325,8 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     ),
     eventUuidWorkflow,
     alarmTransferCameraWorkflow,
+    emlWorkflow,
+    ...(emlPluginPath ? {emlPluginPath} : {}),
     storageWorkflow,
     storageExpectedRelease: "3.11.0",
     storageBackupWorkflow,
@@ -426,7 +452,7 @@ export function assertMutationAllowed(config: SuiteConfig): void {
     }
   }
 
-  if (config.profile !== "full" && config.profile !== "3.9.2-release") return;
+  if (config.profile !== "full" && config.profile !== "3.9.2-release" && config.profile !== "3.11.0-release") return;
   if (["localhost", "127.0.0.1", "::1"].includes(config.targetHost)) {
     throw new Error("Full regression refused for a loopback target");
   }
@@ -468,9 +494,9 @@ export function assertMutationAllowed(config: SuiteConfig): void {
 
 /** Whether this invocation can mutate shared OSCAR or emulator state. */
 export function requiresRemoteSuiteLease(config: SuiteConfig): boolean {
-  if (["full", "3.9.2-release", "restore-drill"].includes(config.profile)) return true;
+  if (["full", "3.9.2-release", "3.11.0-release", "restore-drill"].includes(config.profile)) return true;
   if (config.scenarioFilter.size === 0) return true;
-  if (["map-national-servers", "lane-video", "reporting"].some(
+  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication"].some(
     name => config.scenarioFilter.has(name),
   )) {
     return true;
