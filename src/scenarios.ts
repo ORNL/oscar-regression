@@ -801,14 +801,14 @@ export class RegressionScenarios {
         expected: "every supported locale renders exact localized headings on /login, /, /event-log, and /health with zero horizontal document overflow at 1280x800 and 1920x1080",
       }, async () => {
         const failures: string[] = [];
-        const checkOverflow = async (label: string) => {
+        const checkOverflow = async (targetPage: typeof page, label: string) => {
           for (const viewport of [
             {width: 1280, height: 800},
             {width: 1920, height: 1080},
           ] as const) {
-            await page.setViewportSize(viewport);
-            await page.waitForTimeout(100);
-            const metrics = await page.evaluate(() => ({
+            await targetPage.setViewportSize(viewport);
+            await targetPage.waitForTimeout(100);
+            const metrics = await targetPage.evaluate(() => ({
               scrollWidth: document.documentElement.scrollWidth,
               innerWidth: window.innerWidth,
             }));
@@ -818,16 +818,20 @@ export class RegressionScenarios {
           }
         };
 
+        const browser = page.context().browser();
+        if (!browser) throw new Error("Playwright browser instance unavailable for unauthenticated /login check");
+        const loginCtx = await browser.newContext({ignoreHTTPSErrors: true});
+        const loginPage = await loginCtx.newPage();
         try {
           for (const spec of localeChecks) {
-            await page.goto(this.viewerUrl(`/login?lang=${spec.locale}`), {waitUntil: "domcontentloaded"});
-            const loginVisible = await page.getByRole("heading", {name: spec.loginHeading, exact: true})
+            await loginPage.goto(this.viewerUrl(`/login?lang=${spec.locale}`), {waitUntil: "domcontentloaded"});
+            const loginVisible = await loginPage.getByRole("heading", {name: spec.loginHeading, exact: true})
               .first()
               .waitFor({timeout: this.config.uiTimeoutMs})
               .then(() => true)
               .catch(() => false);
             if (!loginVisible) failures.push(`${spec.locale}:loginHeading`);
-            await checkOverflow(`${spec.locale}:/login`);
+            await checkOverflow(loginPage, `${spec.locale}:/login`);
 
             await page.evaluate((lang) => {
               window.localStorage.setItem("language", lang);
@@ -846,12 +850,12 @@ export class RegressionScenarios {
                 .then(() => true)
                 .catch(() => false);
               if (!headingVisible) failures.push(`${spec.locale}:${routePath}(${expectedHeading})`);
-              await checkOverflow(`${spec.locale}:${routePath}`);
+              await checkOverflow(page, `${spec.locale}:${routePath}`);
             }
           }
         } finally {
+          await loginCtx.close().catch(() => undefined);
           await page.setViewportSize({width: 1600, height: 1000}).catch(() => undefined);
-          await page.goto(this.viewerUrl("/login?lang=en"), {waitUntil: "domcontentloaded"}).catch(() => undefined);
           await page.evaluate(() => {
             window.localStorage.setItem("language", "en");
             document.cookie = "osh-language=en; path=/; SameSite=Lax";
@@ -4171,7 +4175,7 @@ export class RegressionScenarios {
       await this.ensureAlarmMediaBaseline("eml-auto-adjudication");
 
       await this.goto(page, "/sensorhub/admin");
-      const servicesHeader = page.locator(".v-accordion-item-caption").filter({hasText: /^Services$/i}).first();
+      const servicesHeader = page.locator(".v-accordion-item-caption").filter({hasText: /Services/i}).first();
       await servicesHeader.waitFor({timeout: this.config.uiTimeoutMs});
       await servicesHeader.click();
       const oscarServiceItem = page.locator(".v-table-cell-wrapper").filter({hasText: /OSCAR Service/i}).first();
@@ -4228,15 +4232,15 @@ export class RegressionScenarios {
           if (await notif.isVisible().catch(() => false)) {
             await notif.click().catch(() => undefined);
           }
-          const applyBtn = page.locator(".v-button").filter({hasText: /^Apply Changes$/i}).first();
+          const applyBtn = page.locator(".v-button").filter({hasText: /Apply Changes/i}).first();
           if (await applyBtn.isVisible().catch(() => false)) {
             await applyBtn.click();
             await sleep(500);
           }
-          const saveBtn = page.locator(".v-button").filter({hasText: /^Save$/i}).first();
+          const saveBtn = page.locator(".v-button").filter({hasText: /Save/i}).first();
           if (await saveBtn.isVisible().catch(() => false)) {
             await saveBtn.click();
-            const confirmYes = page.locator(".v-window .v-button").filter({hasText: /^Yes$/i}).first();
+            const confirmYes = page.locator(".v-window .v-button").filter({hasText: /Yes/i}).first();
             await confirmYes.waitFor({timeout: 10_000});
             await confirmYes.click();
             await sleep(500);
