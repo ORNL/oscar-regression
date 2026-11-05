@@ -98,6 +98,32 @@ test("dashboard connection oracle requires every exact expected chip to resolve 
   const duplicateAssessment = assessDashboardConnectionResolution([...online, online[0]!], expected);
   assert.equal(duplicateAssessment.passed, false);
   assert.deepEqual(duplicateAssessment.duplicates, ["lane-health-Lane01-rpm"]);
+
+  const multiCamExpectedRpms = expectedDashboardConnectionIds(["Lane01", "Lane02"], false);
+  const dualCamOnline = [
+    {testId: "lane-health-Lane01-rpm", componentId: "rpm-1", state: "online", label: "RPM Online"},
+    {testId: "lane-health-Lane01-camera", componentId: "cam-1a", state: "online", label: "Cam 0 Online"},
+    {testId: "lane-health-Lane01-camera", componentId: "cam-1b", state: "online", label: "Cam 1 Online"},
+    {testId: "lane-health-Lane02-rpm", componentId: "rpm-2", state: "online", label: "RPM Online"},
+    {testId: "lane-health-Lane02-camera", componentId: "cam-2a", state: "online", label: "Cam 0 Online"},
+  ];
+  assert.deepEqual(assessDashboardConnectionResolution(dualCamOnline, multiCamExpectedRpms, 3), {
+    passed: true,
+    online: 5,
+    missing: [],
+    unexpected: [],
+    duplicates: [],
+    unresolved: [],
+  });
+  const duplicateComponentAssessment = assessDashboardConnectionResolution([
+    dualCamOnline[0]!,
+    dualCamOnline[1]!,
+    {...dualCamOnline[2]!, componentId: "cam-1a"},
+    dualCamOnline[3]!,
+    dualCamOnline[4]!,
+  ], multiCamExpectedRpms, 3);
+  assert.equal(duplicateComponentAssessment.passed, false);
+  assert.deepEqual(duplicateComponentAssessment.duplicates, ["lane-health-Lane01-camera"]);
 });
 
 test("dashboard Tamper baseline requires every lane card and no fault indicator", () => {

@@ -37,6 +37,7 @@ export interface HealthBatchAssessment {
 
 export interface DashboardConnectionSnapshot {
   testId: string;
+  componentId?: string | null;
   state: string | null;
   label: string;
 }
@@ -176,7 +177,80 @@ export function expectedDashboardConnectionIds(
 export function assessDashboardConnectionResolution(
   snapshots: readonly DashboardConnectionSnapshot[],
   expectedIds: readonly string[],
+  expectedCameraCount?: number,
 ): DashboardConnectionAssessment {
+  const hasExplicitCameraIds = expectedIds.some((id) => id.endsWith("-camera"));
+  if (expectedCameraCount !== undefined && !hasExplicitCameraIds) {
+    const expectedRpms = new Set(expectedIds);
+    const allowedCameraIds = expectedCameraCount > 0
+      ? new Set(expectedIds.map((id) => id.replace(/-rpm$/, "-camera")))
+      : new Set<string>();
+    const seenRpms = new Set<string>();
+    const duplicates = new Set<string>();
+    const unexpectedSet = new Set<string>();
+    const seenCameraComponents = new Set<string>();
+    const cameraCountsByTestId = new Map<string, number>();
+    const missingComponentTestIds = new Set<string>();
+    let cameraCount = 0;
+
+    for (const snapshot of snapshots) {
+      if (snapshot.testId.endsWith("-camera")) {
+        cameraCount++;
+        cameraCountsByTestId.set(snapshot.testId, (cameraCountsByTestId.get(snapshot.testId) ?? 0) + 1);
+        if (!allowedCameraIds.has(snapshot.testId)) {
+          unexpectedSet.add(snapshot.testId);
+        }
+        const componentId = snapshot.componentId?.trim() ?? "";
+        if (componentId.length > 0) {
+          if (seenCameraComponents.has(componentId)) {
+            duplicates.add(snapshot.testId);
+          }
+          seenCameraComponents.add(componentId);
+        } else {
+          missingComponentTestIds.add(snapshot.testId);
+        }
+      } else {
+        if (seenRpms.has(snapshot.testId)) {
+          duplicates.add(snapshot.testId);
+        }
+        seenRpms.add(snapshot.testId);
+        if (!expectedRpms.has(snapshot.testId)) {
+          unexpectedSet.add(snapshot.testId);
+        }
+      }
+    }
+
+    for (const testId of missingComponentTestIds) {
+      if ((cameraCountsByTestId.get(testId) ?? 0) > 1) {
+        duplicates.add(testId);
+      }
+    }
+
+    const missing = [...expectedRpms].filter((testId) => !seenRpms.has(testId)).sort();
+    if (cameraCount < expectedCameraCount) {
+      missing.push(`camera-count:${cameraCount}/${expectedCameraCount}`);
+    } else if (cameraCount > expectedCameraCount) {
+      unexpectedSet.add(`camera-count:${cameraCount}/${expectedCameraCount}`);
+    }
+    const unexpected = [...unexpectedSet].sort();
+    const unresolved = snapshots
+      .filter(({state, label}) => state !== "online" || !/online/i.test(label))
+      .map(({testId, componentId, state}) =>
+        `${componentId ? `${testId}[${componentId}]` : testId}:${state ?? "missing-state"}`)
+      .sort();
+    const online = snapshots.length - unresolved.length;
+    const expectedTotal = expectedIds.length + expectedCameraCount;
+    return {
+      passed: snapshots.length === expectedTotal && missing.length === 0 && unexpected.length === 0 &&
+        duplicates.size === 0 && unresolved.length === 0,
+      online,
+      missing,
+      unexpected,
+      duplicates: [...duplicates].sort(),
+      unresolved,
+    };
+  }
+
   const expected = new Set(expectedIds);
   const seen = new Set<string>();
   const duplicates = new Set<string>();
