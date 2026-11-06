@@ -2102,6 +2102,52 @@ export class RegressionScenarios {
             `ne HTTP=${neRes.status} (items=${neItems.length}, exact=${neExact})`,
         };
       });
+
+      await this.check({
+        scenario: "event-filtering",
+        category: "events",
+        action: "verify CQL adjudication code filter semantics",
+        target: "Event Log authenticated observations API",
+        expected: "adjudicatedIdsCount>0 AND adjudicatedIds='code:9' and (adjudicatedIdsCount=0 OR adjudicatedIds!='code:9') both return HTTP 200 with partition-exact semantics",
+      }, async () => {
+        const sourcePromise = this.waitForEventObservationPage(page, "event-log");
+        await this.goto(page, "/event-log");
+        const sourceResponse = await sourcePromise;
+        const baseObsUrl = new URL(sourceResponse.url());
+        baseObsUrl.searchParams.delete("offset");
+        baseObsUrl.searchParams.set("limit", "25");
+
+        const eqUrl = new URL(baseObsUrl.toString());
+        eqUrl.searchParams.set("filter", "adjudicatedIdsCount>0 AND adjudicatedIds='code:9'");
+        const neUrl = new URL(baseObsUrl.toString());
+        neUrl.searchParams.set("filter", "(adjudicatedIdsCount=0 OR adjudicatedIds!='code:9')");
+
+        const [eqRes, neRes] = await Promise.all([
+          page.evaluate(boundedFetch, {url: eqUrl.toString(), maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES, decodeImage: false}),
+          page.evaluate(boundedFetch, {url: neUrl.toString(), maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES, decodeImage: false}),
+        ]);
+        const eqPayload = eqRes.ok ? (parseBoundedEventApiJson(eqRes, "CQL adjudicationCode equals") as {items?: unknown[]}) : null;
+        const nePayload = neRes.ok ? (parseBoundedEventApiJson(neRes, "CQL adjudicationCode notEquals") as {items?: unknown[]}) : null;
+        const eqItems = Array.isArray(eqPayload?.items) ? eqPayload.items : [];
+        const neItems = Array.isArray(nePayload?.items) ? nePayload.items : [];
+
+        const itemHasCode9 = (item: unknown): boolean => {
+          const rec = item as {result?: {adjudicatedIds?: unknown[]}; properties?: {result?: {adjudicatedIds?: unknown[]}}};
+          const ids = rec?.result?.adjudicatedIds ?? rec?.properties?.result?.adjudicatedIds;
+          return Array.isArray(ids) && ids.some(v => String(v ?? "").trim() === "code:9");
+        };
+
+        const eqExact = eqItems.every(itemHasCode9);
+        const neExact = neItems.every(item => !itemHasCode9(item));
+        const passed = eqRes.status === 200 && neRes.status === 200 &&
+          Array.isArray(eqPayload?.items) && Array.isArray(nePayload?.items) &&
+          eqExact && neExact;
+        return {
+          passed,
+          observed: `code:9 eq HTTP=${eqRes.status} (items=${eqItems.length}, exact=${eqExact}); ` +
+            `ne HTTP=${neRes.status} (items=${neItems.length}, exact=${neExact})`,
+        };
+      });
     } finally { await page.close(); }
   }
 
@@ -4164,6 +4210,59 @@ export class RegressionScenarios {
           observed: `confirmed submission succeeded; reloaded vehicle=${vehiclePersisted}; notes=${notesPersisted}; code9=${codePersisted}; inspection=${inspectionPersisted}`,
         };
       });
+
+      await this.check({
+        scenario: "adjudication",
+        category: "adjudication",
+        action: "filter adjudicated alarm by Adjudication Code on Event Log",
+        target: `${this.config.testLaneLabel}:${occupancyCount}`,
+        expected: "Event Log Advanced Filters (Lane ID + Adjudication Code = Code 9) returns the newly adjudicated occupancy",
+      }, async () => {
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
+        await page.getByRole("button", {name: /advanced filters/i}).first().click();
+        const dialog = page.getByRole("dialog", {name: /advanced filters/i});
+        await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+        await dialog.getByRole("button", {name: /clear all/i}).click();
+
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        const boxes = dialog.getByRole("combobox");
+        await boxes.nth(1).click();
+        await page.getByRole("option", {name: "Lane ID", exact: true}).click();
+        await boxes.nth(3).click();
+        await page.getByRole("option", {name: this.config.testLaneLabel, exact: true}).click();
+
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        await boxes.nth(4).click();
+        await page.getByRole("option", {name: "Adjudication Code", exact: true}).click();
+        await boxes.nth(6).click();
+        await page.getByRole("option", {name: "Code 9: Authorized Test, Maintenance, or Training Activity", exact: true}).click();
+
+        await dialog.getByRole("button", {name: /apply filters/i}).click();
+        await dialog.waitFor({state: "hidden"});
+
+        const matchedOccupancies = await poll(async () => {
+          const rows = page.locator(".MuiDataGrid-row");
+          const count = await rows.count();
+          const occs: string[] = [];
+          for (let i = 0; i < count; i++) {
+            occs.push((await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim());
+          }
+          return occs;
+        }, occs => occs.includes(String(occupancyCount)), {
+          timeoutMs: 30_000,
+          intervalMs: 500,
+          description: `Event Log Adjudication Code = Code 9 filter to return occupancy ${occupancyCount}`,
+        }).catch(() => [] as string[]);
+
+        const passed = matchedOccupancies.includes(String(occupancyCount));
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "adjudication-code-filter-failed");
+        return {
+          passed,
+          observed: `matchedOccupancies=${matchedOccupancies.join(",") || "none"}`,
+          evidence,
+        };
+      });
     } finally { await page.close(); }
   }
 
@@ -4333,6 +4432,9 @@ export class RegressionScenarios {
         );
         if (!releaseEventId) throw new Error("Failed to resolve occupancy UUID for distributed NORM gamma alarm");
 
+        const isSyntheticAdjudicationMarker = (id: string): boolean =>
+          id === "eml-non-threat" || id === "bulk-adjudicated" || id.startsWith("code:");
+
         const polledAdjIds = await poll(async () => {
           const obsRes = await page.context().request.get(
             this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(releaseEventId!)}`),
@@ -4349,10 +4451,13 @@ export class RegressionScenarios {
           } finally {
             await obsRes.dispose();
           }
-        }, ids => ids.includes("eml-non-threat") && ids.some(id => id !== "eml-non-threat" && id !== "bulk-adjudicated"), {
+        }, ids =>
+          ids.includes("eml-non-threat") &&
+          ids.includes("code:9999") &&
+          ids.some(id => !isSyntheticAdjudicationMarker(id)), {
           timeoutMs: 8_000,
           intervalMs: 500,
-          description: "EML Non-Threat marker and Code 9999 adjudication command ID on occupancy",
+          description: "EML Non-Threat marker, code:9999 marker, and Code 9999 adjudication command ID on occupancy",
         }).catch(async () => {
           const obsRes = await page.context().request.get(
             this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(releaseEventId!)}`),
@@ -4371,8 +4476,8 @@ export class RegressionScenarios {
           }
         });
 
-        releaseHasMarker = polledAdjIds.includes("eml-non-threat");
-        releaseAdjCommandId = polledAdjIds.find(id => id !== "eml-non-threat" && id !== "bulk-adjudicated") ?? "";
+        releaseHasMarker = polledAdjIds.includes("eml-non-threat") && polledAdjIds.includes("code:9999");
+        releaseAdjCommandId = polledAdjIds.find(id => !isSyntheticAdjudicationMarker(id)) ?? "";
         if (releaseHasMarker) {
           this.reporter.outcome(
             "eml-auto-adjudication",
@@ -4582,6 +4687,57 @@ export class RegressionScenarios {
 
         const passed = matchedOccupancies.includes(String(confirmedReleaseTrigger.occupancyCount));
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "eml-event-log-filter-failed");
+        return {
+          passed,
+          observed: `matchedOccupancies=${matchedOccupancies.join(",") || "none"}`,
+          evidence,
+        };
+      });
+
+      await this.check({
+        scenario: "eml-auto-adjudication",
+        category: "eml",
+        action: "query EML Non-Threat alarms via Event Log Adjudication Code = Code 9999",
+        target: "Event Log (Adjudication Code = Code 9999: EML Non-Threat)",
+        expected: "filtering Lane ID + Adjudication Code = Code 9999: EML Non-Threat returns the auto-adjudicated occupancy",
+      }, async () => {
+        await page.getByRole("button", {name: /advanced filters/i}).first().click();
+        const dialog = page.getByRole("dialog", {name: /advanced filters/i});
+        await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+        await dialog.getByRole("button", {name: /clear all/i}).click();
+
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        const boxes = dialog.getByRole("combobox");
+        await boxes.nth(1).click();
+        await page.getByRole("option", {name: "Lane ID", exact: true}).click();
+        await boxes.nth(3).click();
+        await page.getByRole("option", {name: this.config.testLaneLabel, exact: true}).click();
+
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        await boxes.nth(4).click();
+        await page.getByRole("option", {name: "Adjudication Code", exact: true}).click();
+        await boxes.nth(6).click();
+        await page.getByRole("option", {name: "Code 9999: EML Non-Threat", exact: true}).click();
+
+        await dialog.getByRole("button", {name: /apply filters/i}).click();
+        await dialog.waitFor({state: "hidden"});
+
+        const matchedOccupancies = await poll(async () => {
+          const rows = page.locator(".MuiDataGrid-row");
+          const count = await rows.count();
+          const occs: string[] = [];
+          for (let i = 0; i < count; i++) {
+            occs.push((await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim());
+          }
+          return occs;
+        }, occs => occs.includes(String(confirmedReleaseTrigger.occupancyCount)), {
+          timeoutMs: 30_000,
+          intervalMs: 500,
+          description: `Event Log Adjudication Code = Code 9999 filter to return occupancy ${confirmedReleaseTrigger.occupancyCount}`,
+        }).catch(() => [] as string[]);
+
+        const passed = matchedOccupancies.includes(String(confirmedReleaseTrigger.occupancyCount));
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "eml-adjudication-code-9999-filter-failed");
         return {
           passed,
           observed: `matchedOccupancies=${matchedOccupancies.join(",") || "none"}`,

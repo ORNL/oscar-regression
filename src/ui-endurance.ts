@@ -953,9 +953,13 @@ class UiEnduranceRunner {
     if (streamIds.length === 0) {
       throw new Error(`No occupancy datastream mapped for lane ${laneId}`);
     }
+    const numericCount = Number.parseInt(String(occupancyCount).trim(), 10);
+    const filter = Number.isFinite(numericCount)
+      ? `(gammaAlarm=true OR neutronAlarm=true) AND occupancyCount=${numericCount}`
+      : "(gammaAlarm=true OR neutronAlarm=true)";
     const params = new URLSearchParams({
       dataStream: streamIds.join(","),
-      filter: "(gammaAlarm=true OR neutronAlarm=true)",
+      filter,
       order: "desc",
       limit: "50",
     });
