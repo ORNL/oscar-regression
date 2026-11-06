@@ -2554,13 +2554,13 @@ COMMANDS
     lane_hash=$(printf '%s' "$lane_uid" | sha256sum | cut -c1-12)
     directory_id="$safe_lane-$lane_hash"
     [[ $directory_id =~ ^[A-Za-z0-9._-]+$ ]] || fail 'Could not derive the direct-journal lane directory.'
-    compose exec -T oscar sh -eu -c '
+    compose exec -T oscar sh -eu -s -- "$directory_id" "$lane_uid" <<'EOF'
       directory_id=$1; lane_uid=$2
       root=/var/lib/oscar/files/.dailyfile-journal/segments
       [ -d "$root" ] && [ ! -L "$root" ] || exit 20
       lane="$root/$directory_id"
       if [ ! -e "$lane" ] && [ ! -L "$lane" ]; then
-        printf "{\"directoryId\":\"%s\",\"present\":false,\"files\":0,\"bytes\":0,\"openSegments\":0,\"sealedSegments\":0,\"partialFiles\":0,\"unsafeEntries\":0,\"segments\":[]}\n" "$directory_id"
+        printf '{"directoryId":"%s","present":false,"files":0,"bytes":0,"openSegments":0,"sealedSegments":0,"partialFiles":0,"unsafeEntries":0,"segments":[]}\n' "$directory_id"
         exit 0
       fi
       [ -d "$lane" ] && [ ! -L "$lane" ] || exit 21
@@ -2577,31 +2577,88 @@ COMMANDS
       invalid_segments=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -printf "%f\n" |
         grep -Evc "^[0-9]{6}[.](open|seg)$" || true)
       nonfiles=$(find "$lane" -mindepth 2 -maxdepth 2 ! -type f -print | wc -l | tr -d "[:space:]")
-      files=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | wc -l | tr -d "[:space:]")
-      [ "$files" -le 10000 ] || exit 23
-      bytes=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -printf "%s\n" | awk "{sum+=\$1} END {print sum+0}")
-      open=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.open" -print | wc -l | tr -d "[:space:]")
-      sealed=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.seg" -print | wc -l | tr -d "[:space:]")
       partial=$(find "$lane" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print | wc -l | tr -d "[:space:]")
       links=$(find "$lane" -type l -print | wc -l | tr -d "[:space:]")
       unsafe=$((identity_bad+invalid_days+unexpected_root+unexpected_deep+invalid_segments+nonfiles+links))
-      printf "{\"directoryId\":\"%s\",\"present\":true,\"files\":%s,\"bytes\":%s,\"openSegments\":%s,\"sealedSegments\":%s,\"partialFiles\":%s,\"unsafeEntries\":%s,\"segments\":[" \
-        "$directory_id" "$files" "$bytes" "$open" "$sealed" "$partial" "$unsafe"
-      first=true
-      find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | LC_ALL=C sort |
-        while IFS= read -r segment; do
-          relative=${segment#"$lane/"}; day=${relative%%/*}; name=${relative##*/}
-          [ "$relative" = "$day/$name" ] &&
-            printf "%s" "$relative" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]{6}[.](open|seg)$" || exit 24
-          size=$(stat -c %s -- "$segment"); sha=$(sha256sum -- "$segment" | awk "{print \$1}")
-          kind=${name##*.}
-          $first || printf ","
-          first=false
-          printf "{\"path\":\"%s\",\"kind\":\"%s\",\"bytes\":%s,\"sha256\":\"%s\"}" \
-            "$relative" "$kind" "$size" "$sha"
+
+      tmp_dir=$(mktemp -d /tmp/journal-lane-state.XXXXXXXX)
+      trap 'rm -rf -- "$tmp_dir"' EXIT
+      captured=false
+      for attempt in 1 2 3 4 5; do
+        : >"$tmp_dir/seg.meta"
+        : >"$tmp_dir/seg.sha"
+        : >"$tmp_dir/rows.tsv"
+        if ! find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.seg" -printf "%P\t%s\n" 2>/dev/null | LC_ALL=C sort >"$tmp_dir/seg.meta"; then
+          continue
+        fi
+        if [ -s "$tmp_dir/seg.meta" ]; then
+          cut -f1 "$tmp_dir/seg.meta" | tr "\n" "\0" | (cd "$lane" && xargs -0 -r sha256sum --) >"$tmp_dir/seg.sha" 2>/dev/null || continue
+          if [ "$(wc -l <"$tmp_dir/seg.meta")" -ne "$(wc -l <"$tmp_dir/seg.sha")" ]; then
+            continue
+          fi
+          if ! awk -F "\t" '
+            NR==FNR {
+              line=$0;
+              sha=line; sub(/[ *].*$/, "", sha);
+              path=line; sub(/^[0-9a-f]+[ *]+/, "", path);
+              hashes[path]=sha; next
+            }
+            {
+              rel=$1; sz=$2;
+              if (!(rel in hashes)) exit 1;
+              printf "%s\tseg\t%s\t%s\n", rel, sz, hashes[rel];
+            }
+          ' "$tmp_dir/seg.sha" "$tmp_dir/seg.meta" >"$tmp_dir/rows.tsv"; then
+            continue
+          fi
+        fi
+        open_ok=true
+        for open_file in $(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.open" -print 2>/dev/null | LC_ALL=C sort); do
+          [ -f "$open_file" ] && [ ! -L "$open_file" ] || { open_ok=false; break; }
+          rel=${open_file#"$lane/"}
+          sz=$(stat -c %s -- "$open_file" 2>/dev/null) || { open_ok=false; break; }
+          sha=$(head -c "$sz" -- "$open_file" 2>/dev/null | sha256sum | awk '{print $1}') || { open_ok=false; break; }
+          after_sz=$(stat -c %s -- "$open_file" 2>/dev/null) || { open_ok=false; break; }
+          [ -f "$open_file" ] && [ ! -L "$open_file" ] && [ "$after_sz" -ge "$sz" ] || { open_ok=false; break; }
+          printf "%s\topen\t%s\t%s\n" "$rel" "$sz" "$sha" >>"$tmp_dir/rows.tsv"
         done
-      printf "]}\n"
-    ' journal-lane-state "$directory_id" "$lane_uid"
+        [ "$open_ok" = true ] || continue
+        LC_ALL=C sort -o "$tmp_dir/rows.tsv" "$tmp_dir/rows.tsv"
+        if awk -F "\t" '
+          {
+            stem=$1; sub(/[.](open|seg)$/, "", stem);
+            if (seen[stem]++) exit 1;
+          }
+        ' "$tmp_dir/rows.tsv"; then
+          captured=true
+          break
+        fi
+      done
+      [ "$captured" = true ] || exit 25
+      files=$(wc -l <"$tmp_dir/rows.tsv" | tr -d "[:space:]")
+      [ "$files" -le 10000 ] || exit 23
+      awk -F "\t" -v dir="$directory_id" -v partial="$partial" -v unsafe="$unsafe" '
+        BEGIN { files=0; bytes=0; open_c=0; seg_c=0 }
+        {
+          rel=$1; kind=$2; sz=$3+0; sha=$4;
+          if (rel !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}\/[0-9]{6}[.](open|seg)$/) exit 24;
+          if (sha !~ /^[0-9a-f]{64}$/) exit 24;
+          files++;
+          bytes += sz;
+          if (kind == "open") open_c++; else seg_c++;
+          items[files] = sprintf("{\"path\":\"%s\",\"kind\":\"%s\",\"bytes\":%.0f,\"sha256\":\"%s\"}", rel, kind, sz, sha);
+        }
+        END {
+          printf "{\"directoryId\":\"%s\",\"present\":true,\"files\":%d,\"bytes\":%.0f,\"openSegments\":%d,\"sealedSegments\":%d,\"partialFiles\":%d,\"unsafeEntries\":%d,\"segments\":[",
+            dir, files, bytes, open_c, seg_c, partial+0, unsafe+0;
+          for (i = 1; i <= files; i++) {
+            if (i > 1) printf ",";
+            printf "%s", items[i];
+          }
+          printf "]}\n";
+        }
+      ' "$tmp_dir/rows.tsv"
+EOF
     ;;
 
   journal-restart)
@@ -2616,21 +2673,69 @@ COMMANDS
     before_inventory=$restart_work/before.tsv
     cleanup_journal_restart() { rm -rf -- "$restart_work"; }
     trap cleanup_journal_restart EXIT
-    compose exec -T oscar sh -eu -c '
+    compose exec -T oscar sh -eu -s -- "$directory_id" <<'EOF' >"$before_inventory" ||
       lane="/var/lib/oscar/files/.dailyfile-journal/segments/$1"
       [ -d "$lane" ] && [ ! -L "$lane" ]
-      count=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | wc -l | tr -d "[:space:]")
-      [ "$count" -gt 0 ] && [ "$count" -le 10000 ]
-      find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | LC_ALL=C sort |
-        while IFS= read -r segment; do
-          [ -f "$segment" ] && [ ! -L "$segment" ]
-          relative=${segment#"$lane/"}
-          printf "%s" "$relative" | grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2}/[0-9]{6}[.](open|seg)$"
-          size=$(stat -c %s -- "$segment"); [ "$size" -gt 0 ]
-          sha=$(sha256sum -- "$segment" | awk "{print \$1}")
-          printf "%s|%s|%s\n" "$relative" "$size" "$sha"
+      tmp_dir=$(mktemp -d /tmp/journal-restart-before.XXXXXXXX)
+      trap 'rm -rf -- "$tmp_dir"' EXIT
+      captured=false
+      for attempt in 1 2 3 4 5; do
+        : >"$tmp_dir/seg.meta"
+        : >"$tmp_dir/seg.sha"
+        : >"$tmp_dir/rows.tsv"
+        if ! find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.seg" -printf "%P\t%s\n" 2>/dev/null | LC_ALL=C sort >"$tmp_dir/seg.meta"; then
+          continue
+        fi
+        if [ -s "$tmp_dir/seg.meta" ]; then
+          cut -f1 "$tmp_dir/seg.meta" | tr "\n" "\0" | (cd "$lane" && xargs -0 -r sha256sum --) >"$tmp_dir/seg.sha" 2>/dev/null || continue
+          if [ "$(wc -l <"$tmp_dir/seg.meta")" -ne "$(wc -l <"$tmp_dir/seg.sha")" ]; then
+            continue
+          fi
+          if ! awk -F "\t" '
+            NR==FNR {
+              line=$0;
+              sha=line; sub(/[ *].*$/, "", sha);
+              path=line; sub(/^[0-9a-f]+[ *]+/, "", path);
+              hashes[path]=sha; next
+            }
+            {
+              rel=$1; sz=$2+0;
+              if (sz <= 0 || !(rel in hashes)) exit 1;
+              printf "%s|%.0f|%s\n", rel, sz, hashes[rel];
+            }
+          ' "$tmp_dir/seg.sha" "$tmp_dir/seg.meta" >"$tmp_dir/rows.tsv"; then
+            continue
+          fi
+        fi
+        open_ok=true
+        for open_file in $(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.open" -print 2>/dev/null | LC_ALL=C sort); do
+          [ -f "$open_file" ] && [ ! -L "$open_file" ] || { open_ok=false; break; }
+          rel=${open_file#"$lane/"}
+          sz=$(stat -c %s -- "$open_file" 2>/dev/null) || { open_ok=false; break; }
+          [ "$sz" -gt 0 ] || { open_ok=false; sleep 1; break; }
+          sha=$(head -c "$sz" -- "$open_file" 2>/dev/null | sha256sum | awk '{print $1}') || { open_ok=false; break; }
+          after_sz=$(stat -c %s -- "$open_file" 2>/dev/null) || { open_ok=false; break; }
+          [ -f "$open_file" ] && [ ! -L "$open_file" ] && [ "$after_sz" -ge "$sz" ] || { open_ok=false; break; }
+          printf "%s|%s|%s\n" "$rel" "$sz" "$sha" >>"$tmp_dir/rows.tsv"
         done
-    ' journal-restart-before "$directory_id" >"$before_inventory" ||
+        [ "$open_ok" = true ] || continue
+        LC_ALL=C sort -o "$tmp_dir/rows.tsv" "$tmp_dir/rows.tsv"
+        if awk -F "|" '
+          {
+            if ($1 !~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}\/[0-9]{6}[.](open|seg)$/) exit 1;
+            stem=$1; sub(/[.](open|seg)$/, "", stem);
+            if (seen[stem]++) exit 1;
+          }
+        ' "$tmp_dir/rows.tsv"; then
+          captured=true
+          break
+        fi
+      done
+      [ "$captured" = true ]
+      count=$(wc -l <"$tmp_dir/rows.tsv" | tr -d "[:space:]")
+      [ "$count" -gt 0 ] && [ "$count" -le 10000 ]
+      cat "$tmp_dir/rows.tsv"
+EOF
       fail 'Could not capture the bounded pre-restart segment inventory.'
     segments_before=$(wc -l <"$before_inventory" | tr -d '[:space:]')
     [[ $segments_before =~ ^[1-9][0-9]*$ && $segments_before -le 10000 ]] ||
