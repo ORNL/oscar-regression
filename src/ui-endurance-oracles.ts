@@ -703,3 +703,71 @@ export function buildEventRowCssSelector(rowKey: string, observationId?: string)
   }
   return selectors.join(", ");
 }
+
+/**
+ * Extracts a safe relative `/sensorhub/api/...` path + query string from a ConSys
+ * collection `links` array (`rel === "next"`). Rewrites upstream container origins
+ * (for example `http://<host>:8282/sensorhub/api/...` behind Caddy) onto a pure
+ * relative path so requests stay on the configured HTTPS `OSCAR_BASE_URL`, and
+ * rejects any off-API path.
+ */
+export function extractConSysNextPath(links: unknown): string | null {
+  if (!Array.isArray(links)) return null;
+  for (const entry of links) {
+    if (!entry || typeof entry !== "object") continue;
+    const link = entry as {rel?: unknown; href?: unknown};
+    if (link.rel !== "next" || typeof link.href !== "string") continue;
+    const rawHref = link.href.trim();
+    if (!rawHref) continue;
+    try {
+      const parsed = new URL(rawHref, "https://oscar.invalid");
+      if (!parsed.pathname.startsWith("/sensorhub/api/")) {
+        return null;
+      }
+      return `${parsed.pathname}${parsed.search}`;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+export interface ConSysPaginatedResponse<T> {
+  readonly items?: readonly T[] | undefined;
+  readonly links?: unknown;
+}
+
+/**
+ * Follows ConSys `rel="next"` pagination links across all pages of a collection endpoint
+ * (such as `/sensorhub/api/datastreams?limit=1000` on 50-lane + multi-camera topologies
+ * with >1,000 datastreams), guarding against duplicate-link loops and unbounded page counts.
+ */
+export async function collectConSysPaginatedItems<T>(
+  initialPath: string,
+  fetchPage: (path: string) => Promise<ConSysPaginatedResponse<T>>,
+  maxPages = 50,
+): Promise<T[]> {
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1) {
+    throw new Error(`maxPages must be a positive integer (received ${maxPages})`);
+  }
+  const collected: T[] = [];
+  const visited = new Set<string>();
+  let nextPath: string | null = initialPath;
+
+  while (nextPath !== null) {
+    if (visited.has(nextPath)) {
+      break;
+    }
+    if (visited.size >= maxPages) {
+      throw new Error(`ConSys pagination exceeded maxPages=${maxPages} starting from ${initialPath}`);
+    }
+    visited.add(nextPath);
+    const page = await fetchPage(nextPath);
+    if (Array.isArray(page.items)) {
+      collected.push(...page.items);
+    }
+    nextPath = extractConSysNextPath(page.links);
+  }
+
+  return collected;
+}

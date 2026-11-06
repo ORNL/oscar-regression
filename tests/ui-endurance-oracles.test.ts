@@ -7,9 +7,11 @@ import {
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
   buildEventRowCssSelector,
+  collectConSysPaginatedItems,
   compareAlarmsByViewerPriority,
   DEFAULT_OPERATOR_RECYCLE_CYCLES,
   deriveAlarmStatusFromResult,
+  extractConSysNextPath,
   isAlarmGridHydrationSettled,
   isBenignViewerConsoleError,
   MAX_BULK_ADJUDICATION_ROWS,
@@ -419,5 +421,90 @@ test("buildEventRowCssSelector matches both upgraded durable observationId rowKe
   assert.equal(
     buildEventRowCssSelector("Local Node\u001f0jmb179t", "0jmb179t"),
     '.MuiDataGrid-row[data-id="Local Node\u001f0jmb179t"]',
+  );
+});
+
+test("extractConSysNextPath rewrites upstream proxy origins onto relative /sensorhub/api/ paths and rejects off-API links", () => {
+  assert.equal(
+    extractConSysNextPath([
+      {rel: "self", href: "http://192.0.2.57:8282/sensorhub/api/datastreams?limit=1000"},
+      {rel: "next", href: "http://192.0.2.57:8282/sensorhub/api/datastreams?limit=1000&offset=1000"},
+    ]),
+    "/sensorhub/api/datastreams?limit=1000&offset=1000",
+  );
+  assert.equal(
+    extractConSysNextPath([{rel: "next", href: "/sensorhub/api/systems?limit=500&offset=500"}]),
+    "/sensorhub/api/systems?limit=500&offset=500",
+  );
+  assert.equal(
+    extractConSysNextPath([{rel: "next", href: "https://example.invalid/other/path?offset=1000"}]),
+    null,
+  );
+  assert.equal(extractConSysNextPath([{rel: "prev", href: "/sensorhub/api/datastreams?offset=0"}]), null);
+  assert.equal(extractConSysNextPath(undefined), null);
+});
+
+test("collectConSysPaginatedItems gathers all datastream pages across >1000-stream 50-lane + multi-camera topologies", async () => {
+  const seenPaths: string[] = [];
+  const items = await collectConSysPaginatedItems<{id: string; lane: string}>(
+    "/sensorhub/api/datastreams?limit=1000",
+    async (path) => {
+      seenPaths.push(path);
+      if (path === "/sensorhub/api/datastreams?limit=1000") {
+        return {
+          items: [
+            {id: "ds-lane01", lane: "Lane01"},
+            {id: "ds-lane47", lane: "Lane47"},
+          ],
+          links: [{rel: "next", href: "http://192.0.2.57:8282/sensorhub/api/datastreams?limit=1000&offset=1000"}],
+        };
+      }
+      if (path === "/sensorhub/api/datastreams?limit=1000&offset=1000") {
+        return {
+          items: [
+            {id: "ds-lane13", lane: "Lane13"},
+            {id: "ds-lane18", lane: "Lane18"},
+            {id: "ds-lane28", lane: "Lane28"},
+          ],
+        };
+      }
+      throw new Error(`Unexpected path ${path}`);
+    },
+  );
+
+  assert.deepEqual(seenPaths, [
+    "/sensorhub/api/datastreams?limit=1000",
+    "/sensorhub/api/datastreams?limit=1000&offset=1000",
+  ]);
+  assert.deepEqual(
+    items.map((item) => item.lane),
+    ["Lane01", "Lane47", "Lane13", "Lane18", "Lane28"],
+  );
+});
+
+test("collectConSysPaginatedItems stops on duplicate next links and fails closed when maxPages is exceeded", async () => {
+  const loopItems = await collectConSysPaginatedItems<number>(
+    "/sensorhub/api/datastreams?limit=10",
+    async () => ({
+      items: [1],
+      links: [{rel: "next", href: "/sensorhub/api/datastreams?limit=10"}],
+    }),
+  );
+  assert.deepEqual(loopItems, [1]);
+
+  await assert.rejects(
+    () =>
+      collectConSysPaginatedItems<number>(
+        "/sensorhub/api/datastreams?limit=1&offset=0",
+        async (path) => {
+          const offset = Number(new URL(path, "https://oscar.invalid").searchParams.get("offset") ?? "0");
+          return {
+            items: [offset],
+            links: [{rel: "next", href: `/sensorhub/api/datastreams?limit=1&offset=${offset + 1}`}],
+          };
+        },
+        3,
+      ),
+    /exceeded maxPages=3/,
   );
 });
