@@ -2166,10 +2166,14 @@ export class RegressionScenarios {
     } finally { await page.close(); }
   }
 
-  private async applyLaneEventFilter(page: Page): Promise<void> {
+  private async applyLaneEventFilter(
+    page: Page,
+    statusOption?: "Gamma" | "Neutron" | "Gamma & Neutron",
+  ): Promise<void> {
     await page.getByRole("button", {name: /advanced filters/i}).first().click();
     const dialog = page.getByRole("dialog", {name: /advanced filters/i});
     await dialog.waitFor();
+    await dialog.getByRole("button", {name: /clear all/i}).click();
     await dialog.getByRole("button", {name: /add condition/i}).click();
     const boxes = dialog.getByRole("combobox");
     await boxes.nth(1).click();
@@ -2186,6 +2190,23 @@ export class RegressionScenarios {
       (value) => value.trim() === this.config.testLaneLabel,
       {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "lane filter value selection"},
     );
+    if (statusOption) {
+      await dialog.getByRole("button", {name: /add condition/i}).click();
+      await boxes.nth(4).click();
+      await page.getByRole("option", {name: "Status", exact: true}).click();
+      await poll(
+        () => boxes.nth(4).innerText(),
+        (value) => value.trim() === "Status",
+        {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "status filter field selection"},
+      );
+      await boxes.nth(6).click();
+      await page.getByRole("option", {name: statusOption, exact: true}).click();
+      await poll(
+        () => boxes.nth(6).innerText(),
+        (value) => value.trim() === statusOption,
+        {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "status filter value selection"},
+      );
+    }
     await dialog.getByRole("button", {name: /apply filters/i}).click();
     await dialog.waitFor({state: "hidden"});
   }
@@ -3432,7 +3453,13 @@ export class RegressionScenarios {
   ): Promise<Locator> {
     await this.goto(page, "/event-log");
     await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
-    await this.applyLaneEventFilter(page);
+    const normalizedStatus = statusText.source.trim().toLowerCase();
+    const statusOption = normalizedStatus === "gamma"
+      ? "Gamma"
+      : normalizedStatus === "neutron"
+        ? "Neutron"
+        : undefined;
+    await this.applyLaneEventFilter(page, statusOption);
     const row = await poll(async () => {
       const laneRows = page.locator(".MuiDataGrid-row").filter({hasText: this.config.testLaneLabel});
       const count = await laneRows.count();
@@ -4703,7 +4730,7 @@ export class RegressionScenarios {
         expected: "Dashboard unadjudicated alarm table excludes the auto-adjudicated EML Non-Threat occupancy",
       }, async () => {
         await this.openDashboard(page);
-        await this.applyLaneEventFilter(page);
+        await this.applyLaneEventFilter(page, "Gamma");
         await page.waitForTimeout(1_500);
         const rows = page.locator(".MuiDataGrid-row").filter({hasText: this.config.testLaneLabel});
         const rowCount = await rows.count();
@@ -4887,7 +4914,7 @@ export class RegressionScenarios {
         const autoChipVisible = await page.getByTestId("eml-auto-adjudicated-chip").isVisible().catch(() => false);
 
         await this.openDashboard(page);
-        await this.applyLaneEventFilter(page);
+        await this.applyLaneEventFilter(page, "Gamma");
         const visibleOnDashboard = await poll(async () => {
           const rows = page.locator(".MuiDataGrid-row").filter({hasText: this.config.testLaneLabel});
           const count = await rows.count();
