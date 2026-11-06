@@ -4467,9 +4467,17 @@ export class RegressionScenarios {
                       metadataValid = code === 9999 &&
                         username === "EML" &&
                         String(res.secondaryInspectionStatus ?? "") === "NONE" &&
+                        parsedMeta.disposition === "EML Non-Threat" &&
                         parsedMeta.result === "RELEASE" &&
-                        parsedMeta.dispositionCode === 9999;
-                      adjObserved = `cmdId=${releaseAdjCommandId}; user=${username}; code=${code}; secondary=${String(res.secondaryInspectionStatus)}; metaResult=${String(parsedMeta.result)}; model=${String(parsedMeta.modelId)}`;
+                        typeof parsedMeta.releaseProbability === "number" &&
+                        Number.isFinite(parsedMeta.releaseProbability) &&
+                        typeof parsedMeta.investigateProbability === "number" &&
+                        Number.isFinite(parsedMeta.investigateProbability) &&
+                        typeof parsedMeta.primaryThreshold === "number" &&
+                        Number.isFinite(parsedMeta.primaryThreshold) &&
+                        typeof parsedMeta.modelId === "string" &&
+                        parsedMeta.modelId.length > 0;
+                      adjObserved = `cmdId=${releaseAdjCommandId}; user=${username}; code=${code}; secondary=${String(res.secondaryInspectionStatus)}; metaDisposition=${String(parsedMeta.disposition)}; metaResult=${String(parsedMeta.result)}; model=${String(parsedMeta.modelId)}`;
                       if (metadataValid) break;
                     }
                   }
@@ -4490,7 +4498,7 @@ export class RegressionScenarios {
         return {
           passed,
           observed: `hasMarker=${releaseHasMarker}; chip=${decisionText}; autoBadge=${autoChipVisible}; ` +
-            `loggedCode9999=${/9999/.test(loggedText)}; ${adjObserved}`,
+            `loggedCode9999=${/9999/.test(loggedText)}; loggedNonThreat=${/EML Non-Threat/i.test(loggedText)}; ${adjObserved}`,
           evidence,
         };
       });
