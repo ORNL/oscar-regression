@@ -25,6 +25,7 @@ import {
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
   buildEventRowCssSelector,
+  collectConSysPaginatedItems,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
   isAlarmGridHydrationSettled,
@@ -36,6 +37,7 @@ import {
   shouldPurgePriorScopedNotification,
   UI_ENDURANCE_PAGE_SIZE,
   type AlarmEventSummary,
+  type ConSysPaginatedResponse,
   type CycleExecutionPlan,
   type RenderedEventRow,
   type UiEnduranceCliOptions,
@@ -731,22 +733,39 @@ class UiEnduranceRunner {
     }
   }
 
+  private async fetchConSysCollection<T>(
+    request: APIRequestContext,
+    initialPath: string,
+    label: string,
+    ignoreHttpError = false,
+  ): Promise<T[]> {
+    return collectConSysPaginatedItems<T>(initialPath, async (path) => {
+      const res = await request.get(this.viewerUrl(path));
+      try {
+        if (!res.ok()) {
+          if (ignoreHttpError) {
+            return {items: []};
+          }
+          throw new Error(`${label} failed with HTTP ${res.status()}`);
+        }
+        return (await res.json()) as ConSysPaginatedResponse<T>;
+      } finally {
+        await res.dispose();
+      }
+    });
+  }
+
   private async discoverOccupancyCatalog(request: APIRequestContext): Promise<OccupancyCatalog> {
-    const sysRes = await request.get(
-      this.viewerUrl("/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500"),
+    const items = await this.fetchConSysCollection<{
+      id?: string;
+      uid?: string;
+      name?: string;
+      properties?: {uid?: string; name?: string};
+    }>(
+      request,
+      "/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500",
+      "ConSys systems discovery",
     );
-    if (!sysRes.ok()) {
-      throw new Error(`ConSys systems discovery failed with HTTP ${sysRes.status()}`);
-    }
-    const sysBody = (await sysRes.json()) as {
-      items?: Array<{
-        id?: string;
-        uid?: string;
-        name?: string;
-        properties?: {uid?: string; name?: string};
-      }>;
-    };
-    const items = sysBody.items ?? [];
 
     const laneSystems: Array<{id: string; name: string; uniqueSuffix: string}> = [];
     const systemIdToLane = new Map<string, string>();
@@ -766,33 +785,32 @@ class UiEnduranceRunner {
     }
 
     await runWithConcurrency(laneSystems, 10, async (lane) => {
-      const memRes = await request.get(
-        this.viewerUrl(`/sensorhub/api/systems/${encodeURIComponent(lane.id)}/members?limit=100`),
+      const members = await this.fetchConSysCollection<{id?: string}>(
+        request,
+        `/sensorhub/api/systems/${encodeURIComponent(lane.id)}/members?limit=100`,
+        `ConSys members discovery (${lane.name})`,
+        true,
       );
-      if (!memRes.ok()) return;
-      const memBody = (await memRes.json()) as {items?: Array<{id?: string}>};
-      for (const member of memBody.items ?? []) {
+      for (const member of members) {
         if (member.id) systemIdToLane.set(member.id.trim(), lane.name);
       }
     });
 
-    const dsRes = await request.get(this.viewerUrl("/sensorhub/api/datastreams?limit=1000"));
-    if (!dsRes.ok()) {
-      throw new Error(`ConSys datastreams discovery failed with HTTP ${dsRes.status()}`);
-    }
-    const dsBody = (await dsRes.json()) as {
-      items?: Array<{
-        id?: string;
-        "system@id"?: string;
-        "system@link"?: {uid?: string};
-        observedProperties?: Array<{definition?: string}>;
-      }>;
-    };
+    const dsItems = await this.fetchConSysCollection<{
+      id?: string;
+      "system@id"?: string;
+      "system@link"?: {uid?: string};
+      observedProperties?: Array<{definition?: string}>;
+    }>(
+      request,
+      "/sensorhub/api/datastreams?limit=1000",
+      "ConSys datastreams discovery",
+    );
 
     const streamIdToLane = new Map<string, string>();
     const laneToStreamIds = new Map<string, string[]>();
 
-    for (const ds of dsBody.items ?? []) {
+    for (const ds of dsItems) {
       const id = (ds.id ?? "").trim();
       if (!id) continue;
       const defs = (ds.observedProperties ?? []).map((p) => p.definition ?? "");
@@ -949,7 +967,11 @@ class UiEnduranceRunner {
     laneId: string,
     occupancyCount: string,
   ): Promise<string> {
-    const streamIds = this.catalog?.laneToStreamIds.get(laneId) ?? [];
+    let streamIds = this.catalog?.laneToStreamIds.get(laneId) ?? [];
+    if (streamIds.length === 0) {
+      this.catalog = await this.discoverOccupancyCatalog(request);
+      streamIds = this.catalog.laneToStreamIds.get(laneId) ?? [];
+    }
     if (streamIds.length === 0) {
       throw new Error(`No occupancy datastream mapped for lane ${laneId}`);
     }
@@ -964,15 +986,19 @@ class UiEnduranceRunner {
       limit: "50",
     });
     const res = await request.get(this.viewerUrl(`/sensorhub/api/observations?${params}`));
-    if (!res.ok()) {
-      throw new Error(`Failed querying observations for ${laneId} (HTTP ${res.status()})`);
-    }
-    const body = (await res.json()) as {items?: unknown[]};
-    for (const raw of body.items ?? []) {
-      const parsed = this.parseObservationSummary(raw);
-      if (parsed && String(parsed.occupancyCount) === String(occupancyCount).trim()) {
-        return parsed.observationId;
+    try {
+      if (!res.ok()) {
+        throw new Error(`Failed querying observations for ${laneId} (HTTP ${res.status()})`);
       }
+      const body = (await res.json()) as {items?: unknown[]};
+      for (const raw of body.items ?? []) {
+        const parsed = this.parseObservationSummary(raw);
+        if (parsed && String(parsed.occupancyCount) === String(occupancyCount).trim()) {
+          return parsed.observationId;
+        }
+      }
+    } finally {
+      await res.dispose();
     }
     throw new Error(`Could not resolve observationId for ${laneId} Occupancy ID ${occupancyCount}`);
   }
