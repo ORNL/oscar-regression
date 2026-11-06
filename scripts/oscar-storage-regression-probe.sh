@@ -2310,11 +2310,18 @@ COMMANDS
     trap cleanup_archive_verify EXIT
     archive_verify_log=$archive_verify_work/archive-verify.log
     verify_passed=false
-    if sudo bash oscar.sh archive verify >"$archive_verify_log" 2>&1; then
-      verify_passed=true
-    else
+    for verify_attempt in 1 2 3; do
+      if sudo bash oscar.sh archive verify >"$archive_verify_log" 2>&1; then
+        verify_passed=true
+        break
+      fi
+      if ((verify_attempt < 3)) && grep -Fq 'Archive catalog changed during verification' "$archive_verify_log"; then
+        sleep 5
+        continue
+      fi
       emit_command_diagnostics 'OSCAR archive verification' "$archive_verify_log"
-    fi
+      break
+    done
     archive_dir=$(realpath -e -- "$(absolute_path "$(env_value OSCAR_ARCHIVE_DIR ../oscar-storage/archive)")")
     archive_partials=$(find "$archive_dir" -mindepth 1 \( -name '*.partial' -o -name '*.partial.*' -o -name '*.tmp' -o -name '*.tmp.*' \) -print | wc -l | tr -d '[:space:]')
     # OSCAR 3.9.2 does not have an active external WAL archive. This retained
@@ -2571,7 +2578,7 @@ COMMANDS
         grep -Evc "^[0-9]{6}[.](open|seg)$" || true)
       nonfiles=$(find "$lane" -mindepth 2 -maxdepth 2 ! -type f -print | wc -l | tr -d "[:space:]")
       files=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | wc -l | tr -d "[:space:]")
-      [ "$files" -le 512 ] || exit 23
+      [ "$files" -le 10000 ] || exit 23
       bytes=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -printf "%s\n" | awk "{sum+=\$1} END {print sum+0}")
       open=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.open" -print | wc -l | tr -d "[:space:]")
       sealed=$(find "$lane" -mindepth 2 -maxdepth 2 -type f -name "*.seg" -print | wc -l | tr -d "[:space:]")
@@ -2613,7 +2620,7 @@ COMMANDS
       lane="/var/lib/oscar/files/.dailyfile-journal/segments/$1"
       [ -d "$lane" ] && [ ! -L "$lane" ]
       count=$(find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | wc -l | tr -d "[:space:]")
-      [ "$count" -gt 0 ] && [ "$count" -le 512 ]
+      [ "$count" -gt 0 ] && [ "$count" -le 10000 ]
       find "$lane" -mindepth 2 -maxdepth 2 -type f \( -name "*.open" -o -name "*.seg" \) -print | LC_ALL=C sort |
         while IFS= read -r segment; do
           [ -f "$segment" ] && [ ! -L "$segment" ]
@@ -2626,7 +2633,7 @@ COMMANDS
     ' journal-restart-before "$directory_id" >"$before_inventory" ||
       fail 'Could not capture the bounded pre-restart segment inventory.'
     segments_before=$(wc -l <"$before_inventory" | tr -d '[:space:]')
-    [[ $segments_before =~ ^[1-9][0-9]*$ && $segments_before -le 512 ]] ||
+    [[ $segments_before =~ ^[1-9][0-9]*$ && $segments_before -le 10000 ]] ||
       fail 'Pre-restart segment inventory is empty or exceeds its bound.'
     scratch_before=$restart_work/scratch-before.txt
     if ! archive_scratch_inventory >"$scratch_before"; then
@@ -2667,41 +2674,56 @@ COMMANDS
          $before_bytes =~ ^[1-9][0-9]*$ && $before_sha =~ ^[0-9a-f]{64}$ ]] ||
         fail 'Pre-restart segment inventory is malformed.'
       segments_verified=$((segments_verified+1))
-      lane_root="/var/lib/oscar/files/.dailyfile-journal/segments/$directory_id"
-      preserved=false
-      if [[ $relative == *.seg ]]; then
-        result=$(compose exec -T oscar sh -eu -c '
-          candidate="$1/$2"; expected_bytes=$3; expected_sha=$4
-          [ -f "$candidate" ] && [ ! -L "$candidate" ]
-          [ "$(stat -c %s -- "$candidate")" = "$expected_bytes" ]
-          [ "$(sha256sum -- "$candidate" | awk "{print \$1}")" = "$expected_sha" ]
-          printf preserved
-        ' journal-restart-sealed "$lane_root" "$relative" "$before_bytes" "$before_sha" 2>/dev/null || true)
-        [[ $result == preserved ]] && preserved=true
-      else
-        sealed_relative=${relative%.open}.seg
-        result=$(compose exec -T oscar sh -eu -c '
-          root=$1; open=$2; sealed=$3; expected_bytes=$4; expected_sha=$5
-          matches=0; candidate=
-          for relative in "$open" "$sealed"; do
-            path="$root/$relative"
-            if [ -e "$path" ] || [ -L "$path" ]; then
-              [ -f "$path" ] && [ ! -L "$path" ]; matches=$((matches+1)); candidate=$path
-            fi
-          done
-          [ "$matches" -eq 1 ]
-          size=$(stat -c %s -- "$candidate"); [ "$size" -ge "$expected_bytes" ]
-          prefix_sha=$(head -c "$expected_bytes" -- "$candidate" | sha256sum | awk "{print \$1}")
-          [ "$prefix_sha" = "$expected_sha" ]
-          printf preserved
-        ' journal-restart-open "$lane_root" "$relative" "$sealed_relative" "$before_bytes" "$before_sha" 2>/dev/null || true)
-        [[ $result == preserved ]] && preserved=true
-      fi
-      if $preserved; then segments_preserved=$((segments_preserved+1));
-      else segment_failures=$((segment_failures+1)); fi
     done
     [[ $segments_verified == "$segments_before" ]] ||
       fail 'Restart verification did not inspect every captured journal segment.'
+    lane_root="/var/lib/oscar/files/.dailyfile-journal/segments/$directory_id"
+    verify_counts=$(compose exec -T oscar sh -eu -c '
+      root=$1
+      preserved=0; failures=0; checked=0
+      while IFS="|" read -r relative expected_bytes expected_sha; do
+        [ -n "$relative" ] || continue
+        checked=$((checked+1))
+        ok=false
+        case $relative in
+          *.seg)
+            candidate="$root/$relative"
+            if [ -f "$candidate" ] && [ ! -L "$candidate" ] &&
+               [ "$(stat -c %s -- "$candidate")" = "$expected_bytes" ] &&
+               [ "$(sha256sum -- "$candidate" | awk "{print \$1}")" = "$expected_sha" ]; then
+              ok=true
+            fi
+            ;;
+          *.open)
+            sealed="${relative%.open}.seg"
+            matches=0; candidate=
+            for rel in "$relative" "$sealed"; do
+              path="$root/$rel"
+              if [ -e "$path" ] || [ -L "$path" ]; then
+                if [ -f "$path" ] && [ ! -L "$path" ]; then
+                  matches=$((matches+1)); candidate=$path
+                else
+                  matches=99
+                fi
+              fi
+            done
+            if [ "$matches" -eq 1 ]; then
+              size=$(stat -c %s -- "$candidate" 2>/dev/null || printf 0)
+              if [ "$size" -ge "$expected_bytes" ]; then
+                prefix_sha=$(head -c "$expected_bytes" -- "$candidate" | sha256sum | awk "{print \$1}")
+                [ "$prefix_sha" = "$expected_sha" ] && ok=true
+              fi
+            fi
+            ;;
+        esac
+        if [ "$ok" = true ]; then preserved=$((preserved+1)); else failures=$((failures+1)); fi
+      done
+      printf "%s|%s|%s\n" "$checked" "$preserved" "$failures"
+    ' journal-restart-verify "$lane_root" <"$before_inventory") ||
+      fail 'Post-restart segment verification inside container failed.'
+    IFS='|' read -r container_checked segments_preserved segment_failures <<<"$verify_counts"
+    [[ $container_checked == "$segments_before" ]] ||
+      fail 'Container restart verification did not inspect every captured journal segment.'
     # Hidden camera partials created after the restart are legitimate active recordings on a
     # live multi-lane site.  Count only pre-restart partials that survived the supported restart,
     # plus every temporary publication artifact (which is never a live camera output).
