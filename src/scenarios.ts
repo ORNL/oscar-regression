@@ -765,28 +765,32 @@ export class RegressionScenarios {
       const localeChecks = [
         {
           locale: "en",
-          loginHeading: "OSCAR sign in",
+          loginTitle: "OSCAR sign in",
+          loginButton: "Sign in",
           laneStatus: "Lane Status",
           events: "Events",
           health: "Status of Health",
         },
         {
           locale: "es",
-          loginHeading: "Iniciar sesión en OSCAR",
+          loginTitle: "Iniciar sesión en OSCAR",
+          loginButton: "Iniciar sesión",
           laneStatus: "Estado del carril",
           events: "Eventos",
           health: "Estado de funcionamiento",
         },
         {
           locale: "fr",
-          loginHeading: "Connexion OSCAR",
+          loginTitle: "Connexion OSCAR",
+          loginButton: "Se connecter",
           laneStatus: "État de la voie",
           events: "Événements",
           health: "État de fonctionnement",
         },
         {
           locale: "el",
-          loginHeading: "Σύνδεση OSCAR",
+          loginTitle: "Σύνδεση OSCAR",
+          loginButton: "Σύνδεση",
           laneStatus: "Κατάσταση λωρίδας",
           events: "Συμβάντα",
           health: "Κατάσταση λειτουργίας",
@@ -798,7 +802,7 @@ export class RegressionScenarios {
         category: "i18n",
         action: "verify 4-locale login, Viewer localization, and container fit",
         target: "en, es, fr, el @ 1280x800 and 1920x1080",
-        expected: "every supported locale renders exact localized headings on /login, /, /event-log, and /health with zero horizontal document overflow at 1280x800 and 1920x1080",
+        expected: "every supported locale renders exact localized title/button on /login and headings on /, /event-log, and /health with zero horizontal document overflow at 1280x800 and 1920x1080",
       }, async () => {
         const failures: string[] = [];
         const checkOverflow = async (targetPage: typeof page, label: string) => {
@@ -825,12 +829,20 @@ export class RegressionScenarios {
         try {
           for (const spec of localeChecks) {
             await loginPage.goto(this.viewerUrl(`/login?lang=${spec.locale}`), {waitUntil: "domcontentloaded"});
-            const loginVisible = await loginPage.getByRole("heading", {name: spec.loginHeading, exact: true})
+            const headingVisible = await loginPage.getByRole("heading", {name: "OSCAR", exact: true})
               .first()
               .waitFor({timeout: this.config.uiTimeoutMs})
               .then(() => true)
               .catch(() => false);
-            if (!loginVisible) failures.push(`${spec.locale}:loginHeading`);
+            const buttonVisible = await loginPage.getByRole("button", {name: spec.loginButton, exact: true})
+              .first()
+              .waitFor({timeout: this.config.uiTimeoutMs})
+              .then(() => true)
+              .catch(() => false);
+            const actualTitle = await loginPage.title();
+            if (!headingVisible || !buttonVisible || actualTitle !== spec.loginTitle) {
+              failures.push(`${spec.locale}:login(title=${actualTitle},btn=${buttonVisible})`);
+            }
             await checkOverflow(loginPage, `${spec.locale}:/login`);
 
             await page.evaluate((lang) => {
