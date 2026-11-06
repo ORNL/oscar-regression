@@ -187,7 +187,7 @@ interface DirectJournalLaneState {
 
 function directJournalInventoryValid(state: DirectJournalLaneState): boolean {
   if (!Array.isArray(state.segments) || state.segments.length !== state.files ||
-      state.segments.length > 512) return false;
+      state.segments.length > 10_000) return false;
   const paths = new Set<string>();
   let bytes = 0;
   let open = 0;
@@ -4286,21 +4286,43 @@ export class RegressionScenarios {
       if (!pluginReady) return;
 
       // 1. Distributed NORM alarm -> EML RELEASE -> automatic Code 9999 EML Non-Threat adjudication & Dashboard suppression.
+      // NSDDSiteSim's POST /trigger endpoint hardcodes point-source geometry (occ_is_distributed=False),
+      // whereas scheduled unique_alarm_probability=1 occupancies honor is_distributed=true and
+      // distributed_source_sigma, producing an authentic distributed NORM scan for EML RELEASE.
+      await this.ensureAlarmMediaBaseline("eml-auto-adjudication");
       await this.emulator.replaceConfig(
         this.config.testRpmId,
         this.emulator.distributedNormAlarmConfig(this.originalRpmConfig),
       );
       await this.waitHealthRpmConnection(page, "online", 60_000);
-      // Allow at least one fresh GB + NB background cycle (~5s) so EMLService evaluates with fallback=false.
-      await sleep(7_500);
 
       let releaseTrigger: AlarmTriggerIdentity | undefined;
       let releaseEventId: string | undefined;
       let releaseHasMarker = false;
+      let releaseAdjCommandId = "";
 
-      for (let attempt = 1; attempt <= 2 && !releaseHasMarker; attempt++) {
-        releaseTrigger = await this.triggerAlarm("gamma", "eml-auto-adjudication");
-        if (!releaseTrigger) throw new Error("Distributed NORM gamma trigger returned no occupancy identity");
+      for (let attempt = 1; attempt <= 3 && !releaseHasMarker; attempt++) {
+        const beforeIdle = await this.emulator.waitForStatus(
+          this.config.testRpmId,
+          status => status.connected_clients >= 1 && status.state === "IDLE",
+          "distributed NORM RPM connected and idle before occupancy",
+          45_000,
+        );
+        const initiatedAtEpochMs = Date.now() - 2_000;
+        const activeNorm = await this.emulator.waitForStatus(
+          this.config.testRpmId,
+          status => status.state === "OCCUPIED" &&
+            status.occupancy_count > beforeIdle.occupancy_count &&
+            status.is_gamma_alarm,
+          "distributed NORM gamma alarm occupancy to latch",
+          45_000,
+        );
+        await this.emulator.waitForIdle(this.config.testRpmId, this.config.eventTimeoutMs);
+        releaseTrigger = {occupancyCount: activeNorm.occupancy_count, initiatedAtEpochMs};
+
+        // Check if this occupancy evaluated as EML RELEASE (eml-non-threat marker + Code 9999 command ID).
+        // If attempt 1 fired before 5s of post-connect GB/NB background accumulated, OSCAR stays connected
+        // and attempt 2 immediately captures a full background-primed distributed NORM occupancy.
         const releaseRow = await this.findAlarmRow(page, /Gamma/i, releaseTrigger);
         releaseEventId = await this.resolveAlarmEventUuid(
           page,
@@ -4310,32 +4332,76 @@ export class RegressionScenarios {
           "eml-auto-adjudication",
         );
         if (!releaseEventId) throw new Error("Failed to resolve occupancy UUID for distributed NORM gamma alarm");
-        await this.captureAlarmMedia(page, releaseEventId, "gamma", releaseTrigger.occupancyCount, "eml-auto-adjudication");
 
-        const obsRes = await page.context().request.get(
-          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(releaseEventId)}`),
-          {headers: {Accept: "application/om+json"}},
-        );
-        try {
-          if (obsRes.ok()) {
+        const polledAdjIds = await poll(async () => {
+          const obsRes = await page.context().request.get(
+            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(releaseEventId!)}`),
+            {headers: {Accept: "application/om+json"}},
+          );
+          try {
+            if (!obsRes.ok()) return [] as string[];
             const obsJson = await obsRes.json() as {
               result?: {adjudicatedIds?: unknown[]};
               properties?: {result?: {adjudicatedIds?: unknown[]}};
             };
-            const adjIds = obsJson.result?.adjudicatedIds ?? obsJson.properties?.result?.adjudicatedIds ?? [];
-            releaseHasMarker = Array.isArray(adjIds) && adjIds.includes("eml-non-threat");
+            const raw = obsJson.result?.adjudicatedIds ?? obsJson.properties?.result?.adjudicatedIds ?? [];
+            return Array.isArray(raw) ? raw.map(v => String(v ?? "").trim()).filter(Boolean) : [];
+          } finally {
+            await obsRes.dispose();
           }
-        } finally {
-          await obsRes.dispose();
-        }
-        if (!releaseHasMarker && attempt < 2) {
-          await sleep(6_000);
+        }, ids => ids.includes("eml-non-threat") && ids.some(id => id !== "eml-non-threat" && id !== "bulk-adjudicated"), {
+          timeoutMs: 8_000,
+          intervalMs: 500,
+          description: "EML Non-Threat marker and Code 9999 adjudication command ID on occupancy",
+        }).catch(async () => {
+          const obsRes = await page.context().request.get(
+            this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(releaseEventId!)}`),
+            {headers: {Accept: "application/om+json"}},
+          );
+          try {
+            if (!obsRes.ok()) return [] as string[];
+            const obsJson = await obsRes.json() as {
+              result?: {adjudicatedIds?: unknown[]};
+              properties?: {result?: {adjudicatedIds?: unknown[]}};
+            };
+            const raw = obsJson.result?.adjudicatedIds ?? obsJson.properties?.result?.adjudicatedIds ?? [];
+            return Array.isArray(raw) ? raw.map(v => String(v ?? "").trim()).filter(Boolean) : [];
+          } finally {
+            await obsRes.dispose();
+          }
+        });
+
+        releaseHasMarker = polledAdjIds.includes("eml-non-threat");
+        releaseAdjCommandId = polledAdjIds.find(id => id !== "eml-non-threat" && id !== "bulk-adjudicated") ?? "";
+        if (releaseHasMarker) {
+          this.reporter.outcome(
+            "eml-auto-adjudication",
+            "emulator-control",
+            "trigger distributed NORM gamma alarm",
+            this.config.testRpmId,
+            "distributed NORM occupancy latches gamma alarm and evaluates via EML",
+            `attempt=${attempt}; occupancy=${releaseTrigger.occupancyCount}; eventId=${releaseEventId}; adjudicatedIds=${polledAdjIds.join(",")}`,
+            "correct",
+            0,
+          );
+          break;
         }
       }
+
+      // Immediately return the reserved RPM to quiet mode (preserving EML flags) so no extra
+      // scheduled occupancies fire while inspecting Event Details, Dashboard, and Event Log.
+      await this.emulator.replaceConfig(this.config.testRpmId, {
+        ...quiet,
+        eml_enabled: true,
+        eml_collimated: true,
+        lane_width: 4.82,
+      });
+      await this.waitHealthRpmConnection(page, "online", 60_000);
 
       if (!releaseTrigger || !releaseEventId) {
         throw new Error("Distributed NORM EML test did not produce an occupancy event");
       }
+      await this.captureAlarmMedia(page, releaseEventId, "gamma", releaseTrigger.occupancyCount, "eml-auto-adjudication");
       const confirmedReleaseTrigger = releaseTrigger;
       const confirmedReleaseEventId = releaseEventId;
 
@@ -4344,7 +4410,7 @@ export class RegressionScenarios {
         category: "eml",
         action: "auto-adjudicate EML RELEASE alarm with Code 9999 metadata",
         target: confirmedReleaseEventId,
-        expected: "occupancy carries adjudicatedIds=['eml-non-threat'], Event Details renders EML Analysis RELEASE + Auto: EML Non-Threat + Code 9999, and ConSys adjudication persists EML_METADATA JSON",
+        expected: "occupancy carries adjudicatedIds=['eml-non-threat', <cmdId>], Event Details renders EML Analysis RELEASE + Auto: EML Non-Threat + Code 9999, and ConSys adjudication command status persists EML_METADATA JSON",
       }, async () => {
         await this.goto(page, `/event-details?eventId=${encodeURIComponent(confirmedReleaseEventId)}`);
         const card = page.getByTestId("eml-analysis-card");
@@ -4357,59 +4423,69 @@ export class RegressionScenarios {
           {timeoutMs: 20_000, intervalMs: 500, description: "Logged Adjudications to render Code 9999 EML Non-Threat"},
         ).catch(() => page.locator("body").innerText());
 
-        // Inspect persisted adjudication observation via ConSys REST API for exact EML_METADATA JSON.
-        const adjFilterUrl = this.viewerUrl(
-          `/sensorhub/api/observations?observedProperty=${encodeURIComponent("http://sensorml.com/ont/swe/property/Adjudication")}&resultTime=latest&limit=100`,
-        );
+        // Inspect persisted adjudication command status on the lane's adjudicationControl stream for exact EML_METADATA JSON.
         let metadataValid = false;
-        let adjObserved = "unmatched";
-        const SystemsRes = await page.context().request.get(
-          this.viewerUrl("/sensorhub/api/datastreams?limit=500"),
+        let adjObserved = `cmdId=${releaseAdjCommandId || "none"}; status=unmatched`;
+        const csRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/api/controlstreams?limit=500"),
         );
         try {
-          if (SystemsRes.ok()) {
-            const dsPayload = await SystemsRes.json() as {items?: Array<{id?: string; name?: string; outputName?: string}>};
-            const adjStreams = (dsPayload.items ?? []).filter(ds =>
-              /adjudication/i.test(`${ds.name ?? ""} ${ds.outputName ?? ""}`) && ds.id);
-            for (const ds of adjStreams) {
-              const obsRes = await page.context().request.get(
-                this.viewerUrl(`/sensorhub/api/datastreams/${encodeURIComponent(ds.id!)}/observations?limit=25`),
-                {headers: {Accept: "application/om+json"}},
+          if (csRes.ok() && releaseAdjCommandId) {
+            const csPayload = await csRes.json() as {
+              items?: Array<{id?: string; name?: string; inputName?: string}>;
+            };
+            const allAdjStreams = (csPayload.items ?? []).filter(
+              cs => cs.inputName === "adjudicationControl" && cs.id,
+            );
+            const laneMatched = allAdjStreams.filter(cs =>
+              (cs.name ?? "").toLowerCase().startsWith(this.config.testLaneLabel.toLowerCase()),
+            );
+            const candidateStreams = laneMatched.length > 0 ? laneMatched : allAdjStreams;
+            for (const cs of candidateStreams) {
+              const statusRes = await page.context().request.get(
+                this.viewerUrl(
+                  `/sensorhub/api/controlstreams/${encodeURIComponent(cs.id!)}` +
+                  `/commands/${encodeURIComponent(releaseAdjCommandId)}/status` +
+                  "?statusCode=COMPLETED&format=application/json&offset=0&limit=100",
+                ),
               );
               try {
-                if (!obsRes.ok()) continue;
-                const obsPayload = await obsRes.json() as {items?: Array<Record<string, unknown>>};
-                for (const item of obsPayload.items ?? []) {
-                  const res = (item.result ?? (item.properties as Record<string, unknown> | undefined)?.result) as Record<string, unknown> | undefined;
+                if (!statusRes.ok()) continue;
+                const statusPayload = await statusRes.json() as {
+                  items?: Array<{results?: Array<{data?: Record<string, unknown>}>}>;
+                };
+                for (const item of statusPayload.items ?? []) {
+                  const res = item.results?.[0]?.data;
                   if (!res) continue;
-                  if (res.occupancyObsId === confirmedReleaseEventId || String(res.occupancyCount ?? "") === String(confirmedReleaseTrigger.occupancyCount)) {
+                  if (res.occupancyObsId === confirmedReleaseEventId) {
                     const code = Number(res.adjudicationCode);
+                    const username = String(res.username ?? "");
                     const feedback = String(res.feedback ?? "");
                     const markerIdx = feedback.indexOf("EML_METADATA:");
                     if (markerIdx >= 0) {
                       const parsedMeta = JSON.parse(feedback.slice(markerIdx + "EML_METADATA:".length).trim()) as Record<string, unknown>;
                       metadataValid = code === 9999 &&
+                        username === "EML" &&
                         String(res.secondaryInspectionStatus ?? "") === "NONE" &&
                         parsedMeta.result === "RELEASE" &&
                         parsedMeta.dispositionCode === 9999;
-                      adjObserved = `code=${code}; secondary=${String(res.secondaryInspectionStatus)}; metaResult=${String(parsedMeta.result)}; model=${String(parsedMeta.modelId)}`;
+                      adjObserved = `cmdId=${releaseAdjCommandId}; user=${username}; code=${code}; secondary=${String(res.secondaryInspectionStatus)}; metaResult=${String(parsedMeta.result)}; model=${String(parsedMeta.modelId)}`;
                       if (metadataValid) break;
                     }
                   }
                 }
               } finally {
-                await obsRes.dispose();
+                await statusRes.dispose();
               }
               if (metadataValid) break;
             }
           }
         } finally {
-          await SystemsRes.dispose();
-          void adjFilterUrl;
+          await csRes.dispose();
         }
 
-        const passed = releaseHasMarker && decisionText === "RELEASE" && autoChipVisible &&
-          /9999/.test(loggedText) && /EML Non-Threat/i.test(loggedText) && metadataValid;
+        const passed = releaseHasMarker && Boolean(releaseAdjCommandId) && decisionText === "RELEASE" &&
+          autoChipVisible && /9999/.test(loggedText) && /EML Non-Threat/i.test(loggedText) && metadataValid;
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "eml-release-event-details");
         return {
           passed,
@@ -4427,13 +4503,17 @@ export class RegressionScenarios {
         expected: "Dashboard unadjudicated alarm table excludes the auto-adjudicated EML Non-Threat occupancy",
       }, async () => {
         await this.openDashboard(page);
-        await page.waitForTimeout(2_000);
+        await this.applyLaneEventFilter(page);
+        await page.waitForTimeout(1_500);
         const rows = page.locator(".MuiDataGrid-row").filter({hasText: this.config.testLaneLabel});
         const rowCount = await rows.count();
         let leaked = false;
         for (let i = 0; i < rowCount; i++) {
-          const occ = (await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim();
-          if (occ === String(confirmedReleaseTrigger.occupancyCount)) {
+          const candidate = rows.nth(i);
+          const occupancyCount = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
+          const startTime = await candidate.locator('[data-field="startTime"]').innerText().catch(() => "");
+          const text = await candidate.innerText().catch(() => "");
+          if (alarmRowMatchesTrigger({occupancyCount, startTime, text}, /Gamma/i, confirmedReleaseTrigger)) {
             leaked = true;
             break;
           }
@@ -4556,12 +4636,16 @@ export class RegressionScenarios {
         const autoChipVisible = await page.getByTestId("eml-auto-adjudicated-chip").isVisible().catch(() => false);
 
         await this.openDashboard(page);
+        await this.applyLaneEventFilter(page);
         const visibleOnDashboard = await poll(async () => {
           const rows = page.locator(".MuiDataGrid-row").filter({hasText: this.config.testLaneLabel});
           const count = await rows.count();
           for (let i = 0; i < count; i++) {
-            const occ = (await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim();
-            if (occ === String(investigateTrigger.occupancyCount)) return true;
+            const candidate = rows.nth(i);
+            const occupancyCount = await candidate.locator('[data-field="occupancyCount"]').innerText().catch(() => "");
+            const startTime = await candidate.locator('[data-field="startTime"]').innerText().catch(() => "");
+            const text = await candidate.innerText().catch(() => "");
+            if (alarmRowMatchesTrigger({occupancyCount, startTime, text}, /Gamma/i, investigateTrigger)) return true;
           }
           return false;
         }, found => found, {

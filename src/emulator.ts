@@ -218,9 +218,13 @@ export class RpmEmulatorClient {
     };
   }
 
-  distributedNormAlarmConfig(original: RpmConfig, durationSeconds = 8): RpmConfig {
+  distributedNormAlarmConfig(original: RpmConfig, durationSeconds = 12): RpmConfig {
     return {
       ...this.quietConfig(original),
+      occupancy_frequency: 1,
+      gamma_alarm_probability: 1,
+      neutron_alarm_probability: 0,
+      unique_alarm_probability: 1,
       occupancy_duration_range: [durationSeconds, durationSeconds],
       is_distributed: true,
       distributed_source_sigma: 0.85,
