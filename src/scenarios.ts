@@ -2201,6 +2201,11 @@ export class RegressionScenarios {
       );
       await boxes.nth(6).click();
       await page.getByRole("option", {name: statusOption, exact: true}).click();
+      // Status defaults to the multi-select "is any of" operator, whose listbox stays open
+      // (keeping the underlying dialog aria-hidden) until Escape closes the menu popover.
+      if (await page.getByRole("listbox").isVisible().catch(() => false)) {
+        await page.keyboard.press("Escape");
+      }
       await poll(
         () => boxes.nth(6).innerText(),
         (value) => value.trim() === statusOption,
