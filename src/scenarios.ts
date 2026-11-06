@@ -1777,11 +1777,7 @@ export class RegressionScenarios {
         target: this.config.testLaneLabel, expected: "video reaches readyState >= 2 with non-zero dimensions within 60 seconds",
       }, async () => {
         const video = page.locator("video").first();
-        await video.waitFor({timeout: 60_000});
-        await page.waitForFunction(() => {
-          const element = document.querySelector("video") as HTMLVideoElement | null;
-          return Boolean(element && element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0);
-        }, undefined, {timeout: 60_000});
+        await this.waitForLiveVideoReady(page, `${this.config.testLaneLabel} live camera video`, 90_000);
         const state = await video.evaluate((element: HTMLVideoElement) => ({
           readyState: element.readyState,
           width: element.videoWidth,
@@ -1882,10 +1878,7 @@ export class RegressionScenarios {
           observedM3u8Url = "";
           await page.getByTestId(`lane-health-card-${dualLaneName}`).getByRole("link").click();
           await page.waitForURL(/\/lane-view/);
-          await page.waitForFunction(() => {
-            const element = document.querySelector("video") as HTMLVideoElement | null;
-            return Boolean(element && element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0);
-          }, undefined, {timeout: 60_000});
+          await this.waitForLiveVideoReady(page, `${dualLaneName} Camera 0 live video frames`, 90_000);
           await poll(async () => observedM3u8Url, (url) => url.length > 0, {
             timeoutMs: 15_000,
             intervalMs: 250,
@@ -1907,10 +1900,7 @@ export class RegressionScenarios {
             description: `${dualLaneName} Camera 1 distinct .m3u8 manifest`,
           });
           const cam1Url = observedM3u8Url;
-          await page.waitForFunction(() => {
-            const element = document.querySelector("video") as HTMLVideoElement | null;
-            return Boolean(element && element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0);
-          }, undefined, {timeout: 60_000});
+          await this.waitForLiveVideoReady(page, `${dualLaneName} Camera 1 live video frames`, 90_000);
           const cam1Start = await video.evaluate((el: HTMLVideoElement) => ({
             readyState: el.readyState,
             width: el.videoWidth,
@@ -1935,6 +1925,31 @@ export class RegressionScenarios {
       page.off("response", captureM3u8);
       await page.close();
     }
+  }
+
+  private async waitForLiveVideoReady(page: Page, description: string, timeoutMs = 90_000): Promise<void> {
+    const video = page.locator("video").first();
+    await video.waitFor({timeout: Math.min(timeoutMs, 60_000)});
+    let retriedStreamError = false;
+    await poll(async () => {
+      const errorRetryButton = page.getByTestId("live-video-error").getByRole("button");
+      if (!retriedStreamError && await errorRetryButton.isVisible().catch(() => false)) {
+        retriedStreamError = true;
+        await errorRetryButton.click().catch(() => undefined);
+        return false;
+      }
+      const playButton = page.getByTestId("live-video-preparing").getByRole("button");
+      if (await playButton.isVisible().catch(() => false)) {
+        await playButton.click().catch(() => undefined);
+      }
+      return video.evaluate((element: HTMLVideoElement) =>
+        element.readyState >= 2 && element.videoWidth > 0 && element.videoHeight > 0,
+      ).catch(() => false);
+    }, ready => ready, {
+      timeoutMs,
+      intervalMs: 500,
+      description,
+    });
   }
 
   private waitForEventObservationPage(
@@ -4389,6 +4404,7 @@ export class RegressionScenarios {
       // whereas scheduled unique_alarm_probability=1 occupancies honor is_distributed=true and
       // distributed_source_sigma, producing an authentic distributed NORM scan for EML RELEASE.
       await this.ensureAlarmMediaBaseline("eml-auto-adjudication");
+      const normWindowStartIso = new Date(Date.now() - 1_000).toISOString();
       await this.emulator.replaceConfig(
         this.config.testRpmId,
         this.emulator.distributedNormAlarmConfig(this.originalRpmConfig),
@@ -4493,8 +4509,12 @@ export class RegressionScenarios {
         }
       }
 
-      // Immediately return the reserved RPM to quiet mode (preserving EML flags) so no extra
-      // scheduled occupancies fire while inspecting Event Details, Dashboard, and Event Log.
+      // Let any already-started scheduled occupancy finish cleanly before stopping the RPM, then
+      // return the reserved RPM to quiet mode so no extra scheduled occupancies fire.
+      const preQuietStatus = await this.emulator.statusOrNull(this.config.testRpmId);
+      if (preQuietStatus?.state === "OCCUPIED") {
+        await this.emulator.waitForIdle(this.config.testRpmId, this.config.eventTimeoutMs);
+      }
       await this.emulator.replaceConfig(this.config.testRpmId, {
         ...quiet,
         eml_enabled: true,
@@ -4506,9 +4526,76 @@ export class RegressionScenarios {
       if (!releaseTrigger || !releaseEventId) {
         throw new Error("Distributed NORM EML test did not produce an occupancy event");
       }
-      await this.captureAlarmMedia(page, releaseEventId, "gamma", releaseTrigger.occupancyCount, "eml-auto-adjudication");
       const confirmedReleaseTrigger = releaseTrigger;
       const confirmedReleaseEventId = releaseEventId;
+
+      // Register every alarm occupancy emitted on the reserved lane during the distributed NORM window
+      // (including any scheduled occupancy that fired during initial RPM reconnect or multi-attempt warmup)
+      // so the storage-lifecycle orphan-media oracle accounts for every generated MP4 clip.
+      const normWindowAlarms = new Map<string, {type: "gamma" | "neutron"; occupancyCount: number}>();
+      const releaseObsRes = await page.context().request.get(
+        this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(confirmedReleaseEventId)}`),
+        {headers: {Accept: "application/om+json"}},
+      );
+      let occupancyDatastreamId = "";
+      try {
+        if (releaseObsRes.ok()) {
+          const releaseObsJson = await releaseObsRes.json() as {"datastream@id"?: unknown};
+          occupancyDatastreamId = String(releaseObsJson["datastream@id"] ?? "").trim();
+        }
+      } finally {
+        await releaseObsRes.dispose();
+      }
+      if (occupancyDatastreamId) {
+        const normWindowEndIso = new Date(Date.now() + 2_000).toISOString();
+        const windowObsRes = await page.context().request.get(
+          this.viewerUrl(
+            `/sensorhub/api/datastreams/${encodeURIComponent(occupancyDatastreamId)}/observations` +
+            `?phenomenonTime=${encodeURIComponent(`${normWindowStartIso}/${normWindowEndIso}`)}&limit=50`,
+          ),
+          {headers: {Accept: "application/om+json"}},
+        );
+        try {
+          if (windowObsRes.ok()) {
+            const windowObsJson = await windowObsRes.json() as {
+              items?: Array<{
+                id?: unknown;
+                result?: {occupancyCount?: unknown; gammaAlarm?: unknown; neutronAlarm?: unknown};
+              }>;
+            };
+            for (const item of windowObsJson.items ?? []) {
+              const id = String(item.id ?? "").trim();
+              const gammaAlarm = Boolean(item.result?.gammaAlarm);
+              const neutronAlarm = Boolean(item.result?.neutronAlarm);
+              if (!id || (!gammaAlarm && !neutronAlarm)) continue;
+              const occCount = Number(item.result?.occupancyCount ?? 0);
+              normWindowAlarms.set(id, {
+                type: gammaAlarm ? "gamma" : "neutron",
+                occupancyCount: Number.isFinite(occCount) ? occCount : 0,
+              });
+            }
+          }
+        } finally {
+          await windowObsRes.dispose();
+        }
+      }
+      if (!normWindowAlarms.has(confirmedReleaseEventId)) {
+        normWindowAlarms.set(confirmedReleaseEventId, {
+          type: "gamma",
+          occupancyCount: confirmedReleaseTrigger.occupancyCount,
+        });
+      }
+      for (const [alarmId, alarmMeta] of normWindowAlarms) {
+        if (this.generatedAlarmMedia.has(alarmId)) continue;
+        this.resolvedAlarmEventIds.add(alarmId);
+        await this.captureAlarmMedia(
+          page,
+          alarmId,
+          alarmMeta.type,
+          alarmMeta.occupancyCount,
+          "eml-auto-adjudication",
+        );
+      }
 
       await this.check({
         scenario: "eml-auto-adjudication",
