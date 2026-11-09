@@ -269,6 +269,13 @@ const PARQUET_PRIMARY_OUTPUT_NAMES = [
   "neutronCounts",
   "setupGamma",
   "setupNeutron",
+  "speed",
+  "backgroundReport",
+  "foregroundReport",
+  "status",
+  "emlContextual",
+  "emlScanContextual",
+  "emlAnalysis",
 ] as const;
 
 const REGRESSION_ARCHIVE_POLICY = {
@@ -5535,7 +5542,7 @@ export class RegressionScenarios {
           JSON.stringify(value.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
           JSON.stringify(value.packagedDefaults.outputNames) ===
             JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
-          indexes.genericPayloadGinAbsent && indexes.requiredCount === 13 &&
+          indexes.genericPayloadGinAbsent && indexes.requiredCount === 15 &&
           indexes.requiredPresent === indexes.requiredCount && indexes.missingNames.length === 0 &&
           indexes.eventPathGinExact && indexes.numericEventIndexesExact &&
           resources.memoryLimitMegabytes === REGRESSION_ARCHIVE_RESOURCES.memoryLimitMegabytes &&
