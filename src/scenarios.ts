@@ -39,14 +39,21 @@ import {
   isEventObservationPageUrl,
 } from "./event-filter-oracle.js";
 import {
+  assessDashboardWidgetCustomization,
+  assessLaneViewStatusTableFaults,
+  assessLiveVideoStartupAndAdvance,
+  assessMultiCameraFeedCycle,
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
   importedAlarmChartsRendered,
+  LIVE_VIDEO_MAX_STARTUP_MS,
+  liveLaneTelemetryChartsAdvancing,
   liveLaneTelemetryChartsRendered,
   operationalViewScopePair,
   scopedUuidOperationalViewChecksEnabled,
   type AlarmChartCanvasSnapshot,
   type AlarmChartSeries,
+  type MultiCameraFeedObservation,
 } from "./coverage-oracles.js";
 import {assessKnownClearTamperBaseline, RpmEmulatorClient} from "./emulator.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
@@ -524,15 +531,17 @@ export class RegressionScenarios {
       const context = chart.getContext("2d");
       let gammaPlotPixels = 0;
       let neutronPlotPixels = 0;
+      let digestHash = 2166136261;
       if (context && chart.width > 0 && chart.height > 0) {
         const pixels = context.getImageData(0, 0, chart.width, chart.height).data;
         // Exclude the title and bottom legend so a colored legend swatch cannot
         // make an empty dataset look live. The remaining band is Chart.js's plot.
         const firstPlotRow = Math.floor(chart.height * 0.15);
         const lastPlotRow = Math.ceil(chart.height * 0.82);
+        const lastDigestRow = Math.ceil(chart.height * 0.92);
         const firstPlotColumn = Math.floor(chart.width * 0.05);
         const lastPlotColumn = Math.ceil(chart.width * 0.95);
-        for (let y = firstPlotRow; y < lastPlotRow; y++) {
+        for (let y = firstPlotRow; y < lastDigestRow; y++) {
           for (let x = firstPlotColumn; x < lastPlotColumn; x++) {
             const index = (y * chart.width + x) * 4;
             const red = pixels[index] ?? 0;
@@ -540,10 +549,15 @@ export class RegressionScenarios {
             const blue = pixels[index + 2] ?? 0;
             const alpha = pixels[index + 3] ?? 0;
             if (alpha === 0) continue;
-            if (Math.abs(red - 244) <= 24 && Math.abs(green - 67) <= 24 &&
-              Math.abs(blue - 54) <= 24) gammaPlotPixels++;
-            if (Math.abs(red - 41) <= 24 && Math.abs(green - 182) <= 24 &&
-              Math.abs(blue - 246) <= 24) neutronPlotPixels++;
+            digestHash = Math.imul(digestHash ^ red, 16777619) >>> 0;
+            digestHash = Math.imul(digestHash ^ green, 16777619) >>> 0;
+            digestHash = Math.imul(digestHash ^ blue, 16777619) >>> 0;
+            if (y < lastPlotRow) {
+              if (Math.abs(red - 244) <= 24 && Math.abs(green - 67) <= 24 &&
+                Math.abs(blue - 54) <= 24) gammaPlotPixels++;
+              if (Math.abs(red - 41) <= 24 && Math.abs(green - 182) <= 24 &&
+                Math.abs(blue - 246) <= 24) neutronPlotPixels++;
+            }
           }
         }
       }
@@ -555,6 +569,7 @@ export class RegressionScenarios {
         clientHeight: bounds.height,
         gammaPlotPixels,
         neutronPlotPixels,
+        canvasDigest: digestHash.toString(16).padStart(8, "0"),
       };
     });
   }
@@ -761,6 +776,75 @@ export class RegressionScenarios {
           return {passed, observed: `HTTP ${status}; marker visible=${markerVisible}`, evidence};
         });
       }
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "viewer",
+        action: "customize and reset Dashboard widgets",
+        target: "/",
+        expected: "toggling Lane Status, Events, and Map Preview updates DOM visibility and localStorage, shows the empty reset state when all are hidden, and restores all widgets on Reset",
+      }, async () => {
+        await this.goto(page, "/");
+        const bar = page.getByTestId("dashboard-widget-customization-bar");
+        await bar.waitFor({timeout: this.config.uiTimeoutMs});
+        const laneWidget = page.getByTestId("dashboard-widget-laneStatus");
+        const eventWidget = page.getByTestId("dashboard-widget-eventTable");
+        const quickViewWidget = page.getByTestId("dashboard-widget-quickView");
+        const initialAllVisible = (await laneWidget.count()) === 1 &&
+          (await eventWidget.count()) === 1 &&
+          (await quickViewWidget.count()) === 1;
+
+        await page.getByTestId("dashboard-widget-toggle-laneStatus").click();
+        await poll(async () => laneWidget.count(), (count) => count === 0, {
+          timeoutMs: 5_000,
+          intervalMs: 100,
+          description: "Lane Status widget to hide after toggle",
+        });
+        const laneStatusHiddenInDom = (await laneWidget.count()) === 0;
+        const storedWhenLaneStatusHidden = await page.evaluate(() => {
+          const raw = window.localStorage.getItem("oscar.dashboardWidgets.v1");
+          return raw ? JSON.parse(raw) as {laneStatus?: boolean; eventTable?: boolean; quickView?: boolean} : null;
+        });
+
+        await page.getByTestId("dashboard-widget-toggle-eventTable").click();
+        await page.getByTestId("dashboard-widget-toggle-quickView").click();
+        const emptyReset = page.getByTestId("dashboard-empty-reset");
+        const allHiddenResetPromptVisible = await emptyReset.waitFor({timeout: 5_000})
+          .then(() => true)
+          .catch(() => false);
+
+        await emptyReset.click();
+        await poll(
+          async () => (await laneWidget.count()) === 1 &&
+            (await eventWidget.count()) === 1 &&
+            (await quickViewWidget.count()) === 1,
+          (restored) => restored,
+          {timeoutMs: 5_000, intervalMs: 100, description: "Dashboard widgets to restore after Reset"},
+        );
+        const restoredAfterResetInDom = (await laneWidget.count()) === 1 &&
+          (await eventWidget.count()) === 1 &&
+          (await quickViewWidget.count()) === 1;
+        const storedAfterReset = await page.evaluate(() => {
+          const raw = window.localStorage.getItem("oscar.dashboardWidgets.v1");
+          return raw ? JSON.parse(raw) as {laneStatus?: boolean; eventTable?: boolean; quickView?: boolean} : null;
+        });
+
+        const passed = assessDashboardWidgetCustomization({
+          initialAllVisible,
+          laneStatusHiddenInDom,
+          storedWhenLaneStatusHidden,
+          allHiddenResetPromptVisible,
+          restoredAfterResetInDom,
+          storedAfterReset,
+        });
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "dashboard-widget-customization-failed");
+        return {
+          passed,
+          observed: `initialAllVisible=${initialAllVisible}; laneStatusHidden=${laneStatusHiddenInDom}; ` +
+            `allHiddenResetPrompt=${allHiddenResetPromptVisible}; restored=${restoredAfterResetInDom}`,
+          evidence,
+        };
+      });
 
       const localeChecks = [
         {
@@ -1712,7 +1796,7 @@ export class RegressionScenarios {
     page.on("response", captureM3u8);
     try {
       await this.goto(page, "/");
-      const laneSection = page.getByText("Lane Status", {exact: true}).locator("xpath=ancestor::*[contains(@class,'MuiStack-root')][1]");
+      const laneSection = page.getByTestId("dashboard-widget-laneStatus");
       const laneLabel = laneSection.getByText(this.config.testLaneLabel, {exact: true});
       await laneLabel.first().waitFor({timeout: this.config.uiTimeoutMs});
       if (await laneLabel.count() !== 1) {
@@ -1773,11 +1857,48 @@ export class RegressionScenarios {
         };
       });
       await this.check({
+        scenario: "lane-video",
+        category: "telemetry",
+        action: "advance live gamma and neutron telemetry charts in real time",
+        target: this.config.testLaneLabel,
+        expected: "both Gamma and Neutron Chart.js canvases actively redraw across 1 Hz telemetry ticks without freezing",
+      }, async () => {
+        const gammaCanvas = page.locator("#chart-view-gamma canvas").first();
+        const neutronCanvas = page.locator("#chart-view-neutron canvas").first();
+        const readCharts = async () => ({
+          gamma: await this.chartCanvasSnapshot(gammaCanvas),
+          neutron: await this.chartCanvasSnapshot(neutronCanvas),
+        });
+        const initial = await readCharts();
+        const subsequent = await poll(
+          readCharts,
+          (candidate) => liveLaneTelemetryChartsAdvancing(initial, candidate),
+          {
+            timeoutMs: 15_000,
+            intervalMs: 500,
+            description: "live Gamma and Neutron charts to advance across 1 Hz telemetry ticks",
+          },
+        ).catch(() => readCharts());
+        const passed = liveLaneTelemetryChartsAdvancing(initial, subsequent);
+        const evidence = passed
+          ? ""
+          : await this.screenshotOnFailure(page, "lane-detail-live-telemetry-frozen");
+        return {
+          passed,
+          observed: `gamma digest=${initial.gamma.canvasDigest}->${subsequent.gamma.canvasDigest}; ` +
+            `neutron digest=${initial.neutron.canvasDigest}->${subsequent.neutron.canvasDigest}`,
+          evidence,
+        };
+      });
+      await this.check({
         scenario: "lane-video", category: "video", action: "play live camera video",
-        target: this.config.testLaneLabel, expected: "video reaches readyState >= 2 with non-zero dimensions within 60 seconds",
+        target: this.config.testLaneLabel,
+        expected: `video reaches readyState >= 2 with non-zero dimensions within ${LIVE_VIDEO_MAX_STARTUP_MS / 1000} seconds and advances playback`,
       }, async () => {
         const video = page.locator("video").first();
-        await this.waitForLiveVideoReady(page, `${this.config.testLaneLabel} live camera video`, 90_000);
+        const waitStartedAt = Date.now();
+        await this.waitForLiveVideoReady(page, `${this.config.testLaneLabel} live camera video`, LIVE_VIDEO_MAX_STARTUP_MS);
+        const startupMs = Date.now() - waitStartedAt;
         const state = await video.evaluate((element: HTMLVideoElement) => ({
           readyState: element.readyState,
           width: element.videoWidth,
@@ -1788,9 +1909,17 @@ export class RegressionScenarios {
         await page.waitForTimeout(2_000);
         const laterTime = await video.evaluate((element: HTMLVideoElement) => element.currentTime);
         const advanced = laterTime > state.currentTime;
+        const passed = assessLiveVideoStartupAndAdvance({
+          readyState: state.readyState,
+          width: state.width,
+          height: state.height,
+          paused: state.paused,
+          advanced,
+          startupMs,
+        });
         return {
-          passed: state.readyState >= 2 && state.width > 0 && state.height > 0 && advanced,
-          observed: `readyState=${state.readyState}; ${state.width}x${state.height}; paused=${state.paused}; advanced=${advanced}`,
+          passed,
+          observed: `startupMs=${startupMs}; readyState=${state.readyState}; ${state.width}x${state.height}; paused=${state.paused}; advanced=${advanced}`,
         };
       });
       await this.check({
@@ -1859,64 +1988,77 @@ export class RegressionScenarios {
           category: "video",
           action: "switch live camera feeds on multi-camera lane",
           target: "multi-camera lane",
-          expected: "both Camera 0 and Camera 1 serve distinct live .m3u8 manifests and decode advancing video frames",
+          expected: "all configured cameras on the multi-camera lane serve distinct live .m3u8 manifests and decode advancing video frames",
         }, async () => {
           await this.goto(page, "/");
           const cards = page.locator('[data-testid^="lane-health-card-"]');
           await cards.first().waitFor({timeout: this.config.uiTimeoutMs});
-          const dualLaneName = await cards.evaluateAll((nodes) => {
+          const multiLane = await cards.evaluateAll((nodes) => {
+            const candidates: Array<{name: string; cameraCount: number}> = [];
             for (const node of nodes) {
-              if (node.querySelectorAll('[data-testid$="-camera"]').length >= 2) {
-                return (node.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, "");
+              const cameraCount = node.querySelectorAll('[data-testid$="-camera"]').length;
+              if (cameraCount >= 2) {
+                candidates.push({
+                  name: (node.getAttribute("data-testid") ?? "").replace(/^lane-health-card-/, ""),
+                  cameraCount,
+                });
               }
             }
-            return "";
+            return candidates.find((c) => c.name === "Lane03") ?? candidates[0] ?? {name: "", cameraCount: 0};
           });
-          if (!dualLaneName) {
+          if (!multiLane.name || multiLane.cameraCount < 2) {
             return {passed: false, observed: "no lane card with >=2 camera indicators found on Dashboard"};
           }
           observedM3u8Url = "";
-          await page.getByTestId(`lane-health-card-${dualLaneName}`).getByRole("link").click();
+          await page.getByTestId(`lane-health-card-${multiLane.name}`).getByRole("link").click();
           await page.waitForURL(/\/lane-view/);
-          await this.waitForLiveVideoReady(page, `${dualLaneName} Camera 0 live video frames`, 90_000);
-          await poll(async () => observedM3u8Url, (url) => url.length > 0, {
-            timeoutMs: 15_000,
-            intervalMs: 250,
-            description: `${dualLaneName} Camera 0 .m3u8 manifest`,
-          });
-          const cam0Url = observedM3u8Url;
           const video = page.locator("video").first();
-          const cam0 = await video.evaluate((el: HTMLVideoElement) => ({
-            width: el.videoWidth,
-            height: el.videoHeight,
-          }));
-
-          observedM3u8Url = "";
           const nextCameraButton = page.locator("button:has([data-testid='NavigateNextIcon'])").first();
-          await nextCameraButton.click();
-          await poll(async () => observedM3u8Url, (url) => url.length > 0 && url !== cam0Url, {
-            timeoutMs: 30_000,
-            intervalMs: 250,
-            description: `${dualLaneName} Camera 1 distinct .m3u8 manifest`,
-          });
-          const cam1Url = observedM3u8Url;
-          await this.waitForLiveVideoReady(page, `${dualLaneName} Camera 1 live video frames`, 90_000);
-          const cam1Start = await video.evaluate((el: HTMLVideoElement) => ({
-            readyState: el.readyState,
-            width: el.videoWidth,
-            height: el.videoHeight,
-            currentTime: el.currentTime,
-          }));
-          await page.waitForTimeout(2_000);
-          const cam1Later = await video.evaluate((el: HTMLVideoElement) => el.currentTime);
-          const cam1Advanced = cam1Later > cam1Start.currentTime;
-          const passed = cam0.width > 0 && cam0.height > 0 &&
-            cam1Url !== cam0Url &&
-            cam1Start.readyState >= 2 && cam1Start.width > 0 && cam1Start.height > 0 && cam1Advanced;
-          const evidence = passed ? "" : await this.screenshotOnFailure(page, `lane-video-dual-camera-${dualLaneName}`);
+          const seenUrls = new Set<string>();
+          const feeds: MultiCameraFeedObservation[] = [];
+
+          for (let index = 0; index < multiLane.cameraCount; index++) {
+            if (index > 0) {
+              observedM3u8Url = "";
+              await nextCameraButton.click();
+            }
+            await poll(async () => observedM3u8Url, (url) => url.length > 0 && !seenUrls.has(url), {
+              timeoutMs: 30_000,
+              intervalMs: 250,
+              description: `${multiLane.name} Camera ${index} distinct .m3u8 manifest`,
+            });
+            const m3u8Url = observedM3u8Url;
+            seenUrls.add(m3u8Url);
+            await this.waitForLiveVideoReady(
+              page,
+              `${multiLane.name} Camera ${index} live video frames`,
+              LIVE_VIDEO_MAX_STARTUP_MS,
+            );
+            const start = await video.evaluate((el: HTMLVideoElement) => ({
+              readyState: el.readyState,
+              width: el.videoWidth,
+              height: el.videoHeight,
+              currentTime: el.currentTime,
+            }));
+            await page.waitForTimeout(2_000);
+            const later = await video.evaluate((el: HTMLVideoElement) => el.currentTime);
+            feeds.push({
+              index,
+              m3u8Url,
+              readyState: start.readyState,
+              width: start.width,
+              height: start.height,
+              advanced: later > start.currentTime,
+            });
+          }
+
+          const passed = assessMultiCameraFeedCycle(multiLane.cameraCount, feeds);
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, `lane-video-multi-camera-${multiLane.name}`);
           return {
             passed,
-            observed: `lane=${dualLaneName}; cam0=${cam0.width}x${cam0.height}; cam1=${cam1Start.width}x${cam1Start.height}; distinctM3u8=${cam1Url !== cam0Url}; advanced=${cam1Advanced}`,
+            observed: `lane=${multiLane.name}; cameras=${multiLane.cameraCount}; ` +
+              feeds.map((f) => `cam${f.index}=${f.width}x${f.height}(adv=${f.advanced})`).join("; ") +
+              `; distinctM3u8=${seenUrls.size === multiLane.cameraCount}`,
             evidence,
           };
         });
@@ -3161,6 +3303,55 @@ export class RegressionScenarios {
       await this.faultViaApi(page, "gl", "Gamma low", "gamma-low");
       await this.faultViaApi(page, "nh", "Neutron high", "neutron-high");
       await this.tamperViaEmulatorGui(page);
+      await this.check({
+        scenario: "rpm-faults",
+        category: "fault-detection",
+        action: "render rolling 24-hour and live fault history in Lane View StatusTable",
+        target: this.config.testLaneLabel,
+        expected: "Lane View Fault Table lists Fault - Gamma High, Fault - Gamma Low, Fault - Neutron High, and Tamper with valid timestamps",
+      }, async () => {
+        await this.goto(page, "/");
+        await page.getByTestId(`lane-health-card-${this.config.testLaneLabel}`).getByRole("link").click();
+        await page.waitForURL(/\/lane-view/, {timeout: this.config.uiTimeoutMs});
+        const faultToggle = page.getByRole("button", {name: /fault table/i});
+        await faultToggle.waitFor({timeout: this.config.uiTimeoutMs});
+        await faultToggle.click();
+
+        const expectedStatuses = [
+          "Fault - Gamma High",
+          "Fault - Gamma Low",
+          "Fault - Neutron High",
+          "Tamper",
+        ] as const;
+
+        const readFaultRows = async () => {
+          const grids = page.locator(".MuiDataGrid-root:visible");
+          const grid = grids.last();
+          const rows = grid.locator(".MuiDataGrid-row");
+          return rows.evaluateAll((elements) => elements.map((row) => ({
+            status: (row.querySelector('[data-field="status"]')?.textContent ?? "").trim(),
+            timestamp: (row.querySelector('[data-field="timestamp"]')?.textContent ?? "").trim(),
+          })).filter((entry) => entry.status.length > 0));
+        };
+
+        const rows = await poll(
+          readFaultRows,
+          (candidate) => assessLaneViewStatusTableFaults(candidate, expectedStatuses),
+          {
+            timeoutMs: 30_000,
+            intervalMs: 500,
+            description: `${this.config.testLaneLabel} Lane View Fault Table to render all four fault types with valid timestamps`,
+          },
+        ).catch(readFaultRows);
+
+        const passed = assessLaneViewStatusTableFaults(rows, expectedStatuses);
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "lane-view-status-table-faults");
+        return {
+          passed,
+          observed: `rows=${rows.length}; statuses=${[...new Set(rows.map((r) => r.status))].join("|") || "none"}`,
+          evidence,
+        };
+      });
     } finally {
       await this.emulator.clearFaults(this.config.testRpmId).catch((error) => this.reporter.error("rpm-faults", "final-clear", error));
       await page.close();

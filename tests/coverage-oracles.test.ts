@@ -2,9 +2,15 @@ import assert from "node:assert/strict";
 import {resolve} from "node:path";
 import test from "node:test";
 import {
+  assessDashboardWidgetCustomization,
+  assessLaneViewStatusTableFaults,
+  assessLiveVideoStartupAndAdvance,
+  assessMultiCameraFeedCycle,
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
   importedAlarmChartsRendered,
+  LIVE_VIDEO_MAX_STARTUP_MS,
+  liveLaneTelemetryChartsAdvancing,
   liveLaneTelemetryChartsRendered,
   operationalViewScopePair,
   scopedUuidOperationalViewChecksEnabled,
@@ -132,5 +138,152 @@ test("canonical alarm document comparison ignores export-only QR metadata", () =
   assert.throws(
     () => canonicalAlarmTransferDocumentJson({payload: canonical.payload}),
     /missing payload, integrity, or transport/,
+  );
+});
+
+test("liveLaneTelemetryChartsAdvancing requires both Gamma and Neutron canvas digests to advance over time", () => {
+  const initialGamma = {
+    width: 640, height: 320, clientWidth: 640, clientHeight: 320,
+    gammaPlotPixels: 40, neutronPlotPixels: 0, canvasDigest: "a1b2c3d4",
+  };
+  const initialNeutron = {
+    width: 640, height: 320, clientWidth: 640, clientHeight: 320,
+    gammaPlotPixels: 0, neutronPlotPixels: 30, canvasDigest: "11223344",
+  };
+  const nextGamma = {...initialGamma, gammaPlotPixels: 44, canvasDigest: "a1b2c3ff"};
+  const nextNeutron = {...initialNeutron, neutronPlotPixels: 33, canvasDigest: "11223399"};
+
+  assert.equal(
+    liveLaneTelemetryChartsAdvancing(
+      {gamma: initialGamma, neutron: initialNeutron},
+      {gamma: nextGamma, neutron: nextNeutron},
+    ),
+    true,
+  );
+  // Frozen Gamma chart (same digest) fails
+  assert.equal(
+    liveLaneTelemetryChartsAdvancing(
+      {gamma: initialGamma, neutron: initialNeutron},
+      {gamma: initialGamma, neutron: nextNeutron},
+    ),
+    false,
+  );
+  // Frozen Neutron chart (same digest) fails
+  assert.equal(
+    liveLaneTelemetryChartsAdvancing(
+      {gamma: initialGamma, neutron: initialNeutron},
+      {gamma: nextGamma, neutron: initialNeutron},
+    ),
+    false,
+  );
+});
+
+test("assessLiveVideoStartupAndAdvance enforces bounded cold startup latency and active playback", () => {
+  assert.equal(
+    assessLiveVideoStartupAndAdvance({
+      readyState: 4,
+      width: 640,
+      height: 480,
+      paused: false,
+      advanced: true,
+      startupMs: 850,
+    }),
+    true,
+  );
+  // Legacy >30s cold-start delay fails against LIVE_VIDEO_MAX_STARTUP_MS
+  assert.equal(
+    assessLiveVideoStartupAndAdvance({
+      readyState: 4,
+      width: 640,
+      height: 480,
+      paused: false,
+      advanced: true,
+      startupMs: LIVE_VIDEO_MAX_STARTUP_MS + 1,
+    }),
+    false,
+  );
+  assert.equal(
+    assessLiveVideoStartupAndAdvance({
+      readyState: 4,
+      width: 640,
+      height: 480,
+      paused: true,
+      advanced: true,
+      startupMs: 500,
+    }),
+    false,
+  );
+});
+
+test("assessMultiCameraFeedCycle validates 3-camera lanes (emulator + 2 Axis streams) with distinct manifests", () => {
+  const feeds = [
+    {index: 0, m3u8Url: "https://host/live/cam0/index.m3u8", readyState: 4, width: 1280, height: 720, advanced: true},
+    {index: 1, m3u8Url: "https://host/live/cam1/index.m3u8", readyState: 4, width: 640, height: 480, advanced: true},
+    {index: 2, m3u8Url: "https://host/live/cam2/index.m3u8", readyState: 4, width: 1920, height: 1080, advanced: true},
+  ];
+  assert.equal(assessMultiCameraFeedCycle(3, feeds), true);
+  // Duplicate manifest URL fails
+  assert.equal(
+    assessMultiCameraFeedCycle(3, [
+      feeds[0]!,
+      {...feeds[1]!, m3u8Url: feeds[0]!.m3u8Url},
+      feeds[2]!,
+    ]),
+    false,
+  );
+  // Stalled camera fails
+  assert.equal(
+    assessMultiCameraFeedCycle(3, [
+      feeds[0]!,
+      feeds[1]!,
+      {...feeds[2]!, advanced: false},
+    ]),
+    false,
+  );
+});
+
+test("assessDashboardWidgetCustomization and assessLaneViewStatusTableFaults validate widget state and fault rows", () => {
+  assert.equal(
+    assessDashboardWidgetCustomization({
+      initialAllVisible: true,
+      laneStatusHiddenInDom: true,
+      storedWhenLaneStatusHidden: {laneStatus: false, eventTable: true, quickView: true},
+      allHiddenResetPromptVisible: true,
+      restoredAfterResetInDom: true,
+      storedAfterReset: {laneStatus: true, eventTable: true, quickView: true},
+    }),
+    true,
+  );
+  assert.equal(
+    assessDashboardWidgetCustomization({
+      initialAllVisible: true,
+      laneStatusHiddenInDom: true,
+      storedWhenLaneStatusHidden: {laneStatus: true, eventTable: true, quickView: true},
+      allHiddenResetPromptVisible: true,
+      restoredAfterResetInDom: true,
+      storedAfterReset: {laneStatus: true, eventTable: true, quickView: true},
+    }),
+    false,
+  );
+
+  const expectedFaults = [
+    "Fault - Gamma High",
+    "Fault - Gamma Low",
+    "Fault - Neutron High",
+    "Tamper",
+  ];
+  const validRows = [
+    {status: "Fault — Gamma High", timestamp: "11/8/2026, 11:30:01 PM"},
+    {status: "Fault - Gamma Low", timestamp: "11/8/2026, 11:30:15 PM"},
+    {status: "Fault — Neutron High", timestamp: "11/8/2026, 11:30:30 PM"},
+    {status: "Tamper", timestamp: "11/8/2026, 11:30:45 PM"},
+  ];
+  assert.equal(assessLaneViewStatusTableFaults(validRows, expectedFaults), true);
+  assert.equal(
+    assessLaneViewStatusTableFaults(
+      [{status: "Tamper", timestamp: "Invalid Date"}, ...validRows.slice(0, 3)],
+      expectedFaults,
+    ),
+    false,
   );
 });

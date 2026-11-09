@@ -4,6 +4,8 @@ import test from "node:test";
 import {loadLaneConfigOracle, REQUIRED_OPERATIONAL_VIEW_KEYS} from "../src/lane-config.js";
 import {
   assessPageZeroAlarmVisibility,
+  assessPageZeroRefillAfterAdjudication,
+  assessPageZeroReturnCutoffPreservation,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
   buildEventRowCssSelector,
@@ -507,4 +509,64 @@ test("collectConSysPaginatedItems stops on duplicate next links and fails closed
       ),
     /exceeded maxPages=3/,
   );
+});
+
+test("assessPageZeroRefillAfterAdjudication requires Page 0 to refill from Page 1+ when totalCount > pageSize", () => {
+  // 40 total alarms, 2 bulk-adjudicated -> Page 0 must refill back to 15 rows (not shrink to 13)
+  const refilled = assessPageZeroRefillAfterAdjudication({
+    totalCountBefore: 40,
+    adjudicatedCount: 2,
+    visibleRowsAfter: 15,
+  });
+  assert.equal(refilled.passed, true);
+  assert.equal(refilled.expectedVisibleOnPageZero, 15);
+
+  const drained = assessPageZeroRefillAfterAdjudication({
+    totalCountBefore: 40,
+    adjudicatedCount: 2,
+    visibleRowsAfter: 13,
+  });
+  assert.equal(drained.passed, false);
+
+  // When only 8 total alarms exist and 1 is adjudicated, 7 visible rows is expected
+  const smallTable = assessPageZeroRefillAfterAdjudication({
+    totalCountBefore: 8,
+    adjudicatedCount: 1,
+    visibleRowsAfter: 7,
+  });
+  assert.equal(smallTable.passed, true);
+  assert.equal(smallTable.expectedVisibleOnPageZero, 7);
+});
+
+test("assessPageZeroReturnCutoffPreservation verifies cutoff advancement and new alarm visibility after Page 1 -> Page 0 return", () => {
+  const initialCutoff = "2026-11-08T12:00:00.000Z";
+  const arrivalTime = "2026-11-08T12:05:00.000Z";
+  const advancedCutoff = "2026-11-08T12:05:02.000Z";
+
+  const preserved = assessPageZeroReturnCutoffPreservation({
+    initialCutoffIso: initialCutoff,
+    liveArrivalTimeIso: arrivalTime,
+    returnedPageZeroQueryUrls: [
+      `https://oscar.invalid/sensorhub/api/observations?resultTime=..%2F${encodeURIComponent(advancedCutoff)}&offset=0&limit=15`,
+    ],
+    renderedRowsOnReturn: [makeRow("Lane03", "777", "Neutron"), makeRow("Lane01", "100", "Gamma")],
+    expectedArrival: {laneId: "Lane03", occupancyCount: "777"},
+  });
+  assert.equal(preserved.passed, true);
+  assert.equal(preserved.cutoffAdvanced, true);
+  assert.equal(preserved.arrivalVisibleOnPageZero, true);
+
+  // Stale mount-time cutoff fails
+  const stale = assessPageZeroReturnCutoffPreservation({
+    initialCutoffIso: initialCutoff,
+    liveArrivalTimeIso: arrivalTime,
+    returnedPageZeroQueryUrls: [
+      `https://oscar.invalid/sensorhub/api/observations?resultTime=..%2F${encodeURIComponent(initialCutoff)}&offset=0&limit=15`,
+    ],
+    renderedRowsOnReturn: [makeRow("Lane01", "100", "Gamma")],
+    expectedArrival: {laneId: "Lane03", occupancyCount: "777"},
+  });
+  assert.equal(stale.passed, false);
+  assert.equal(stale.cutoffAdvanced, false);
+  assert.equal(stale.arrivalVisibleOnPageZero, false);
 });

@@ -40,7 +40,7 @@ certification.
   non-symlink directory containing a regular non-symlink `oscar.sh`; revalidate
   that binding for every action.
 - Treat `storage-lifecycle` as a second controlled boundary: require a fresh
-  3.9.2 test database. Its Parquet-primary stage/retirement/retrieval probes are
+  3.11.0 test database. Its Parquet-primary stage/retirement/retrieval probes are
   read-only and observe naturally ingested emulator data; portable export and
   the supported restart still mutate service state. Never run it on
   production/physical lanes and never add a restore step to the ordinary run.
@@ -49,7 +49,7 @@ certification.
   restore-specific path binding documented in `docs/STORAGE_REGRESSION.md`.
   Require both `STORAGE_WORKFLOW=required` and
   `STORAGE_BACKUP_WORKFLOW=required`. Run it and the matching
-  `3.9.2-release` only from the same available, committed, clean canonical
+  `3.11.0-release` only from the same available, committed, clean canonical
   40-hex suite HEAD; ignored `.env` and `results/` remain permitted.
   Require the two canonical archive/backup paths and exact path
   acknowledgement, and run it only on an isolated disposable deployment whose
@@ -66,8 +66,8 @@ Read references/TARGET_CHECKLIST.md before deploying to a new runner or target.
 ## Locate or deploy the suite
 
 Prefer an existing checkout. The canonical Linux runner checkout is
-/home/tyrone/projects/oscar-regression. The source repository is
-https://github.com/ORNL/oscar-regression.git.
+/home/tyrone/projects/oscar-regression-suite. The source repository is
+git@github.com:ORNL/oscar-regression.git (https://github.com/ORNL/oscar-regression.git).
 
 On a new runner:
 
@@ -102,10 +102,14 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    explicit `tamper_fault=false` source state, no Dashboard Tamper Unknown,
    live Online resolution, accessible browser-fixture Offline/Unknown states,
    keyboard lane navigation, every exact expected connection chip to resolve
-   Online with an accessible label within 45 seconds, and shared
+   online with an accessible label within 45 seconds, and shared
    latest-observation batches bounded to 10 streams and two in flight. Also
-   require `lane-video` to paint live Gamma
-   and Neutron data after the real Dashboard-to-Lane Details transition.
+   require `viewer-navigation` to verify customizable Dashboard widget visibility
+   (`oscar.dashboardWidgetVisibility`), and require `lane-video` to paint live Gamma
+   and Neutron data after the real Dashboard-to-Lane Details transition, prove live
+   chart canvas advancement over time, verify on-demand HLS startup within 15 seconds,
+   and cycle all configured camera feeds (`Camera X of N`) when the inspected lane has
+   multiple cameras (e.g., `Lane03` with 3 cameras / `EXPECTED_CAMERA_COUNT=52`).
 4. Inspect summary.md, errors.csv, failed functional rows, and screenshots. Do not
    proceed to mutation if login, target identity, emulator inventory, mapping, or
    connectivity is uncertain.
@@ -113,7 +117,10 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    Require its two one-second alarm occupancies to be triggered back-to-back,
    retain distinct generation-qualified camera paths, and leave the exact OSCAR
    log window free of camera timeout, quarantine, rejection, result-timeout,
-   stale-generation, and command-failure symptoms.
+   stale-generation, and command-failure symptoms. Also require `rpm-faults` to
+   verify Lane Details `StatusTable` fault rows with valid ISO timestamps, and
+   `ui-endurance` to verify Page 0 unadjudicated refill after adjudication and
+   Page 1+ cutoff preservation on return to Page 0.
 6. Preserve the entire latest result directory. Confirm reserved-lane-cleanup is
    correct before accepting the run.
 7. If a selector/oracle is wrong, repair the suite, validate it, repeat the
@@ -122,7 +129,7 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    repository, rebuild/redeploy, and repeat from smoke. Never weaken an assertion
    merely to obtain a pass.
 
-For an OSCAR 3.9.2 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
+For an OSCAR 3.11.0 storage release gate, read `docs/STORAGE_REGRESSION.md`, set
 `STORAGE_WORKFLOW=required`, run `storage-health` after an overnight daily-file
 rotation and a configured retained-media fixture for smoke/non-lifecycle coverage,
 then run the full `storage-lifecycle` only on its separately acknowledged
@@ -281,13 +288,13 @@ linked, or incorrectly permissioned control state as nonterminal and retain the
 remote lease for investigation.
 Never reinterpret a smoke/full request as restore authorization.
 
-For final 3.9.2 certification, set all five operational-view/UUID/camera/storage/
+For final 3.11.0 certification, set all six operational-view/UUID/camera/EML/storage/
 backup workflows to `required`, set the exact `OSCAR_BUILD_LABEL`, and run
-`npm run test:3.9.2-release` with no scenario filter. In shipped
+`npm run test:3.11.0-release` with no scenario filter. In shipped
 `OSCAR_BACKUP_MODE=disabled`, require the complete disabled-mode refusal and
 unchanged-state oracle; restore evidence is not applicable. In optional
 `OSCAR_BACKUP_MODE=single`, first preserve a complete unfiltered `restore-drill`
-PASS and point `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at that matching result
+PASS and point `OSCAR_3_11_0_RESTORE_EVIDENCE_DIR` at that matching result
 directory. Do not accept mismatched identity, missing mode-required evidence,
 any skip/failure, or an incomplete restore attestation.
 
