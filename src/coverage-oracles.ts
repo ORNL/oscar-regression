@@ -116,6 +116,7 @@ export interface AlarmChartCanvasSnapshot {
   clientHeight: number;
   gammaPlotPixels: number;
   neutronPlotPixels: number;
+  canvasDigest?: string;
 }
 
 export type AlarmChartSeries = "gamma" | "neutron";
@@ -147,6 +148,145 @@ export function liveLaneTelemetryChartsRendered(
     snapshot.clientWidth > 0 && snapshot.clientHeight > 0;
   return visible(gamma) && visible(neutron) &&
     gamma.gammaPlotPixels > 0 && neutron.neutronPlotPixels > 0;
+}
+
+/**
+ * Require both live Lane Details charts to actively redraw across 1 Hz ticks
+ * rather than freezing after painting only their initial point.
+ */
+export function liveLaneTelemetryChartsAdvancing(
+  initial: {gamma: AlarmChartCanvasSnapshot; neutron: AlarmChartCanvasSnapshot},
+  subsequent: {gamma: AlarmChartCanvasSnapshot; neutron: AlarmChartCanvasSnapshot},
+): boolean {
+  if (!liveLaneTelemetryChartsRendered(initial.gamma, initial.neutron) ||
+      !liveLaneTelemetryChartsRendered(subsequent.gamma, subsequent.neutron)) {
+    return false;
+  }
+  const gammaAdvanced = Boolean(
+    initial.gamma.canvasDigest &&
+    subsequent.gamma.canvasDigest &&
+    initial.gamma.canvasDigest !== subsequent.gamma.canvasDigest,
+  );
+  const neutronAdvanced = Boolean(
+    initial.neutron.canvasDigest &&
+    subsequent.neutron.canvasDigest &&
+    initial.neutron.canvasDigest !== subsequent.neutron.canvasDigest,
+  );
+  return gammaAdvanced && neutronAdvanced;
+}
+
+export const LIVE_VIDEO_MAX_STARTUP_MS = 15_000;
+
+export interface LiveVideoStartupObservation {
+  readyState: number;
+  width: number;
+  height: number;
+  paused: boolean;
+  advanced: boolean;
+  startupMs: number;
+}
+
+export function assessLiveVideoStartupAndAdvance(
+  observation: LiveVideoStartupObservation,
+  maxStartupMs = LIVE_VIDEO_MAX_STARTUP_MS,
+): boolean {
+  return observation.readyState >= 2 &&
+    observation.width > 0 &&
+    observation.height > 0 &&
+    !observation.paused &&
+    observation.advanced &&
+    Number.isFinite(observation.startupMs) &&
+    observation.startupMs >= 0 &&
+    observation.startupMs <= maxStartupMs;
+}
+
+export interface MultiCameraFeedObservation {
+  index: number;
+  m3u8Url: string;
+  readyState: number;
+  width: number;
+  height: number;
+  advanced: boolean;
+}
+
+export function assessMultiCameraFeedCycle(
+  expectedLaneCameras: number,
+  feeds: readonly MultiCameraFeedObservation[],
+): boolean {
+  if (expectedLaneCameras < 2 || feeds.length !== expectedLaneCameras) {
+    return false;
+  }
+  const urls = new Set<string>();
+  for (let idx = 0; idx < feeds.length; idx++) {
+    const feed = feeds[idx];
+    if (!feed || feed.index !== idx) return false;
+    const url = feed.m3u8Url.trim();
+    if (!url || !/\.m3u8(?:\?|$)/i.test(url)) return false;
+    if (urls.has(url)) return false;
+    urls.add(url);
+    if (feed.readyState < 2 || feed.width <= 0 || feed.height <= 0 || !feed.advanced) {
+      return false;
+    }
+  }
+  return urls.size === expectedLaneCameras;
+}
+
+export interface DashboardWidgetCustomizationObservation {
+  initialAllVisible: boolean;
+  laneStatusHiddenInDom: boolean;
+  storedWhenLaneStatusHidden: {
+    laneStatus?: boolean;
+    eventTable?: boolean;
+    quickView?: boolean;
+  } | null;
+  allHiddenResetPromptVisible: boolean;
+  restoredAfterResetInDom: boolean;
+  storedAfterReset: {
+    laneStatus?: boolean;
+    eventTable?: boolean;
+    quickView?: boolean;
+  } | null;
+}
+
+export function assessDashboardWidgetCustomization(
+  obs: DashboardWidgetCustomizationObservation,
+): boolean {
+  const hiddenStoredValid = obs.storedWhenLaneStatusHidden?.laneStatus === false &&
+    obs.storedWhenLaneStatusHidden?.eventTable === true &&
+    obs.storedWhenLaneStatusHidden?.quickView === true;
+  const resetStoredValid = obs.storedAfterReset?.laneStatus === true &&
+    obs.storedAfterReset?.eventTable === true &&
+    obs.storedAfterReset?.quickView === true;
+  return obs.initialAllVisible &&
+    obs.laneStatusHiddenInDom &&
+    hiddenStoredValid &&
+    obs.allHiddenResetPromptVisible &&
+    obs.restoredAfterResetInDom &&
+    resetStoredValid;
+}
+
+export interface LaneStatusTableFaultRow {
+  status: string;
+  timestamp: string;
+}
+
+export function assessLaneViewStatusTableFaults(
+  rows: readonly LaneStatusTableFaultRow[],
+  expectedStatuses: readonly string[],
+): boolean {
+  if (!expectedStatuses.length || !rows.length) return false;
+  const normalizeStatus = (value: string) =>
+    value.trim().replace(/[\u2010-\u2015]/g, "-").replace(/\s+/g, " ").toLowerCase();
+  const validRows = rows.filter((row) => {
+    const status = row.status.trim();
+    const ts = row.timestamp.trim();
+    if (!status || !ts || /invalid date/i.test(ts)) return false;
+    return Number.isFinite(Date.parse(ts));
+  });
+  if (validRows.length !== rows.length) return false;
+  return expectedStatuses.every((expected) =>
+    validRows.some((row) => normalizeStatus(row.status) === normalizeStatus(expected)),
+  );
 }
 
 export function canonicalAlarmTransferDocumentJson(value: unknown): string {

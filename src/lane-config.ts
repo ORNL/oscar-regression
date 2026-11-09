@@ -1,12 +1,32 @@
 import {readFileSync} from "node:fs";
 import {createHash} from "node:crypto";
 
-export const OSCAR_LANE_CONFIG_HEADERS = [
+export const OSCAR_LANE_CONFIG_BASE_HEADERS = [
   "Name", "UniqueID", "AutoStart", "Latitude", "Longitude", "OperationalViews",
   "RPMConfigType", "RPMHost", "RPMPort", "AspectAddressStart", "AspectAddressEnd",
-  "EMLEnabled", "EMLCollimated", "LaneWidth", "CameraType0", "CameraHost0",
-  "CameraPath0", "Codec0", "Username0", "Password0",
+  "EMLEnabled", "EMLCollimated", "LaneWidth",
 ] as const;
+
+export const OSCAR_LANE_CONFIG_HEADERS = [
+  ...OSCAR_LANE_CONFIG_BASE_HEADERS,
+  "CameraType0", "CameraHost0", "CameraPath0", "Codec0", "Username0", "Password0",
+] as const;
+
+export function expectedLaneConfigHeaders(cameraGroupCount = 1): string[] {
+  const count = Math.max(1, Math.trunc(cameraGroupCount));
+  const headers: string[] = [...OSCAR_LANE_CONFIG_BASE_HEADERS];
+  for (let index = 0; index < count; index++) {
+    headers.push(
+      `CameraType${index}`,
+      `CameraHost${index}`,
+      `CameraPath${index}`,
+      `Codec${index}`,
+      `Username${index}`,
+      `Password${index}`,
+    );
+  }
+  return headers;
+}
 
 export const REQUIRED_OPERATIONAL_VIEW_KEYS = [
   "east-gate", "west-gate", "north-gate", "south-gate", "pedestrian", "entrance", "exit",
@@ -20,6 +40,7 @@ export interface LaneConfigMembership {
   name: string;
   uniqueId: string;
   operationalViews: readonly string[];
+  cameraCount?: number;
 }
 
 export interface LaneConfigOracle {
@@ -27,6 +48,7 @@ export interface LaneConfigOracle {
   sha256: string;
   lanes: readonly LaneConfigMembership[];
   lanesByView: ReadonlyMap<string, readonly string[]>;
+  configuredCameraCount?: number;
 }
 
 function parseCsv(contents: string): string[][] {
@@ -91,9 +113,15 @@ export function loadLaneConfigOracle(path: string): LaneConfigOracle {
 
   const rows = parseCsv(contents);
   const header = rows.shift();
-  if (!header || !sameValues(header, OSCAR_LANE_CONFIG_HEADERS)) {
+  const baseCount = OSCAR_LANE_CONFIG_BASE_HEADERS.length;
+  const cameraGroupCount = header && header.length >= OSCAR_LANE_CONFIG_HEADERS.length &&
+      (header.length - baseCount) % 6 === 0
+    ? (header.length - baseCount) / 6
+    : 0;
+  if (!header || cameraGroupCount < 1 || !sameValues(header, expectedLaneConfigHeaders(cameraGroupCount))) {
     throw new Error(
-      `OSCAR_LANE_CONFIG_PATH must use the exact ${OSCAR_LANE_CONFIG_HEADERS.length}-column header: ` +
+      `OSCAR_LANE_CONFIG_PATH must use the exact ${OSCAR_LANE_CONFIG_HEADERS.length}-column header ` +
+      `(or ${baseCount}+6*N multi-camera header): ` +
       OSCAR_LANE_CONFIG_HEADERS.join(","),
     );
   }
@@ -102,11 +130,12 @@ export function loadLaneConfigOracle(path: string): LaneConfigOracle {
   const names = new Set<string>();
   const uniqueIds = new Set<string>();
   const mutableByView = new Map<string, string[]>();
+  let configuredCameraCount = 0;
   const lanes = rows.map((fields, rowIndex): LaneConfigMembership => {
     const rowNumber = rowIndex + 2;
-    if (fields.length !== OSCAR_LANE_CONFIG_HEADERS.length) {
+    if (fields.length !== header.length) {
       throw new Error(
-        `OSCAR_LANE_CONFIG_PATH row ${rowNumber} has ${fields.length} columns; expected ${OSCAR_LANE_CONFIG_HEADERS.length}`,
+        `OSCAR_LANE_CONFIG_PATH row ${rowNumber} has ${fields.length} columns; expected ${header.length}`,
       );
     }
 
@@ -129,7 +158,16 @@ export function loadLaneConfigOracle(path: string): LaneConfigOracle {
     for (const view of operationalViews) {
       mutableByView.set(view, [...(mutableByView.get(view) ?? []), name]);
     }
-    return {name, uniqueId, operationalViews};
+    let cameraCount = 0;
+    for (let groupIndex = 0; groupIndex < cameraGroupCount; groupIndex++) {
+      const cameraType = fields[baseCount + groupIndex * 6]?.trim() ?? "";
+      const cameraHost = fields[baseCount + groupIndex * 6 + 1]?.trim() ?? "";
+      if (cameraType && cameraHost) {
+        cameraCount++;
+      }
+    }
+    configuredCameraCount += cameraCount;
+    return {name, uniqueId, operationalViews, cameraCount};
   });
 
   return {
@@ -137,6 +175,7 @@ export function loadLaneConfigOracle(path: string): LaneConfigOracle {
     sha256: createHash("sha256").update(rawContents).digest("hex"),
     lanes,
     lanesByView: new Map([...mutableByView].map(([key, laneNames]) => [key, [...laneNames].sort()])),
+    configuredCameraCount,
   };
 }
 

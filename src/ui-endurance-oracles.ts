@@ -771,3 +771,85 @@ export async function collectConSysPaginatedItems<T>(
 
   return collected;
 }
+
+export interface PageZeroRefillAssessment {
+  readonly expectedRemainingTotal: number;
+  readonly expectedVisibleOnPageZero: number;
+  readonly visibleRowsAfter: number;
+  readonly passed: boolean;
+}
+
+/**
+ * Verifies that adjudicating `adjudicatedCount` row(s) on Page 0 (`tableMode="alarmtable"`)
+ * automatically refills Page 0 from Page 1+ whenever `totalCountBefore - adjudicatedCount`
+ * still has rows beyond the remaining Page 0 items, preventing Page 0 from draining to 0 rows
+ * during 24/7/365 operation.
+ */
+export function assessPageZeroRefillAfterAdjudication(params: {
+  readonly totalCountBefore: number;
+  readonly adjudicatedCount: number;
+  readonly visibleRowsAfter: number;
+  readonly pageSize?: number;
+}): PageZeroRefillAssessment {
+  const pageSize = params.pageSize ?? UI_ENDURANCE_PAGE_SIZE;
+  const expectedRemainingTotal = Math.max(0, params.totalCountBefore - params.adjudicatedCount);
+  const expectedVisibleOnPageZero = Math.min(pageSize, expectedRemainingTotal);
+  return {
+    expectedRemainingTotal,
+    expectedVisibleOnPageZero,
+    visibleRowsAfter: params.visibleRowsAfter,
+    passed: params.visibleRowsAfter >= expectedVisibleOnPageZero,
+  };
+}
+
+export interface PageZeroReturnCutoffAssessment {
+  readonly cutoffAdvanced: boolean;
+  readonly observedCutoffs: readonly string[];
+  readonly arrivalVisibleOnPageZero: boolean;
+  readonly passed: boolean;
+}
+
+/**
+ * Verifies that navigating Page 0 -> Page 1 -> Page 0 after a live alarm arrives advances
+ * the `resultTime=../<cutoff>` query parameter (`latestCutoffRef` + `previousPageRef`) and
+ * preserves the newly arrived alarm on Page 0 rather than reverting to the mount-time snapshot.
+ */
+export function assessPageZeroReturnCutoffPreservation(params: {
+  readonly initialCutoffIso: string;
+  readonly liveArrivalTimeIso: string;
+  readonly returnedPageZeroQueryUrls: readonly string[];
+  readonly renderedRowsOnReturn: readonly RenderedEventRow[];
+  readonly expectedArrival: {readonly laneId: string; readonly occupancyCount: string};
+}): PageZeroReturnCutoffAssessment {
+  const initialMs = Date.parse(params.initialCutoffIso);
+  const arrivalMs = Date.parse(params.liveArrivalTimeIso);
+  const observedCutoffs: string[] = [];
+  for (const rawUrl of params.returnedPageZeroQueryUrls) {
+    try {
+      const parsed = new URL(rawUrl, "https://oscar.invalid");
+      if (parsed.searchParams.get("offset") !== "0") continue;
+      const resultTime = parsed.searchParams.get("resultTime") ?? "";
+      const cutoff = resultTime.startsWith("../") ? resultTime.slice(3).trim() : "";
+      if (cutoff) observedCutoffs.push(cutoff);
+    } catch {
+      // ignore malformed URLs
+    }
+  }
+  const cutoffAdvanced = Number.isFinite(initialMs) &&
+    Number.isFinite(arrivalMs) &&
+    observedCutoffs.some((cutoff) => {
+      const cutoffMs = Date.parse(cutoff);
+      return Number.isFinite(cutoffMs) && cutoffMs > initialMs && cutoffMs >= arrivalMs;
+    });
+  const arrivalVisibleOnPageZero = params.renderedRowsOnReturn.some(
+    (row) =>
+      row.laneId === params.expectedArrival.laneId &&
+      String(row.occupancyCount).trim() === String(params.expectedArrival.occupancyCount).trim(),
+  );
+  return {
+    cutoffAdvanced,
+    observedCutoffs,
+    arrivalVisibleOnPageZero,
+    passed: cutoffAdvanced && arrivalVisibleOnPageZero,
+  };
+}

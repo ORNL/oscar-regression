@@ -6,6 +6,7 @@ import {join, resolve} from "node:path";
 import test from "node:test";
 import {
   assertCanonicalOperationalViewOracle,
+  expectedLaneConfigHeaders,
   loadLaneConfigOracle,
   OSCAR_LANE_CONFIG_HEADERS,
   REQUIRED_OPERATIONAL_VIEW_KEYS,
@@ -121,5 +122,29 @@ test("lane configuration checksum fingerprints the exact file bytes", () => {
   writeFileSync(path, bytes);
   const oracle = loadLaneConfigOracle(path);
   assert.equal(oracle.lanes.length, 50);
+  assert.equal(oracle.configuredCameraCount, 50);
   assert.equal(oracle.sha256, createHash("sha256").update(bytes).digest("hex"));
+});
+
+test("lane configuration parser supports multi-camera CSV headers (e.g. 3 cameras on Lane03) and counts configured cameras", () => {
+  const root = mkdtempSync(join(tmpdir(), "oscar-lane-config-multicam-"));
+  const multiPath = join(root, "lanes-52-cameras.csv");
+  const [_origHeader, ...origRows] = readFileSync(canonicalPath, "utf8").trimEnd().split(/\r?\n/);
+  const header3 = expectedLaneConfigHeaders(3).join(",");
+  const rows3 = origRows.map((row, idx) => {
+    if (idx === 2) {
+      // Lane03 with Camera0 (emulator) + Camera1 (Axis default) + Camera2 (Axis RTSP)
+      return `${row},Axis,192.168.0.188,,H264,user,pass,Custom,192.168.0.188:554,/axis-media/media.amp?videocodec=h264,H264,user,pass`;
+    }
+    return `${row},,,,,,,,,,,,`;
+  });
+  writeFileSync(multiPath, `${[header3, ...rows3].join("\n")}\n`);
+
+  const oracle = loadLaneConfigOracle(multiPath);
+  assert.equal(oracle.lanes.length, 50);
+  assert.equal(oracle.configuredCameraCount, 52);
+  assert.equal(oracle.lanes[0]?.cameraCount, 1);
+  assert.equal(oracle.lanes[2]?.name, "Lane03");
+  assert.equal(oracle.lanes[2]?.cameraCount, 3);
+  assert.doesNotThrow(() => assertCanonicalOperationalViewOracle(oracle, 50));
 });

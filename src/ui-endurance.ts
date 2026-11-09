@@ -22,6 +22,7 @@ import type {SuiteConfig} from "./types.js";
 import {
   alarmPriorityRank,
   assessPageZeroAlarmVisibility,
+  assessPageZeroRefillAfterAdjudication,
   assessScopedViewIsolation,
   buildCycleExecutionPlan,
   buildEventRowCssSelector,
@@ -2257,6 +2258,8 @@ class UiEnduranceRunner {
       throw new Error("QuickView Reset did not clear Vehicle ID and disable Submit");
     }
 
+    const totalCountBefore = await this.readTotalRowCount(page);
+
     // Re-fill and Submit
     await vehicleInput.fill(plan.vehicleId);
     await this.selectMui(page, "Adjudicate", CODE_9_LABEL);
@@ -2264,16 +2267,23 @@ class UiEnduranceRunner {
     await page.getByLabel("Notes").fill(plan.notes);
     await submitBtn.click();
 
-    // Verify live row removal from scoped alarmtable without reload!
+    // Verify live row removal and Page 0 auto-refill from scoped alarmtable without reload!
     const uiRemovedLive = await poll(
       async () => {
         const currentRows = await this.readRenderedRows(page);
-        return !currentRows.some(
+        const removed = !currentRows.some(
           (r) => r.laneId === target.laneId && r.occupancyCount === target.occupancyCount,
         );
+        if (!removed) return false;
+        const refill = assessPageZeroRefillAfterAdjudication({
+          totalCountBefore,
+          adjudicatedCount: 1,
+          visibleRowsAfter: currentRows.length,
+        });
+        return refill.passed;
       },
       Boolean,
-      {timeoutMs: 20_000, intervalMs: 300, description: "live QuickView row removal from alarmtable"},
+      {timeoutMs: 20_000, intervalMs: 300, description: "live QuickView row removal and Page 0 auto-refill"},
     ).then(() => true, () => false);
 
     const consysVerified = await this.verifyObservationAdjudicatedInConSys(
@@ -2480,6 +2490,26 @@ class UiEnduranceRunner {
       });
     }
 
+    const totalCountBefore = await this.readTotalRowCount(page);
+    if (totalCountBefore > UI_ENDURANCE_PAGE_SIZE) {
+      const nextPageBtn = page.getByRole("button", {name: /go to next page/i}).first();
+      const prevPageBtn = page.getByRole("button", {name: /go to previous page/i}).first();
+      if (await nextPageBtn.isEnabled().catch(() => false)) {
+        await nextPageBtn.click();
+        await poll(
+          () => page.locator(".MuiTablePagination-displayedRows").first().innerText().catch(() => ""),
+          (txt) => /^16[–-]/.test(txt.trim()),
+          {timeoutMs: 15_000, intervalMs: 250, description: "EventTable navigate to Page 1 (rows 16+)"},
+        );
+        await prevPageBtn.click();
+        await poll(
+          () => page.locator(".MuiTablePagination-displayedRows").first().innerText().catch(() => ""),
+          (txt) => /^1[–-]/.test(txt.trim()),
+          {timeoutMs: 15_000, intervalMs: 250, description: "EventTable return from Page 1 to Page 0"},
+        );
+      }
+    }
+
     const candidates = await poll(
       async () => {
         const rows = await this.readRenderedRows(page);
@@ -2559,6 +2589,7 @@ class UiEnduranceRunner {
     await dialog.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(plan.vehicleId);
     await dialog.getByLabel("Notes").fill(plan.notes);
 
+    const totalBeforeBulkSubmit = await this.readTotalRowCount(page);
     await submitBulkBtn.click();
     await dialog.getByText("2 succeeded; 0 failed.", {exact: true}).waitFor({timeout: 30_000});
     await dialog.getByRole("button", {name: "Close", exact: true}).click();
@@ -2567,14 +2598,21 @@ class UiEnduranceRunner {
     const uiRemovedLive = await poll(
       async () => {
         const rows = await this.readRenderedRows(page);
-        return !rows.some(
+        const removed = !rows.some(
           (r) =>
             (r.laneId === first.laneId && r.occupancyCount === first.occupancyCount) ||
             (r.laneId === second.laneId && r.occupancyCount === second.occupancyCount),
         );
+        if (!removed) return false;
+        const refill = assessPageZeroRefillAfterAdjudication({
+          totalCountBefore: totalBeforeBulkSubmit,
+          adjudicatedCount: 2,
+          visibleRowsAfter: rows.length,
+        });
+        return refill.passed;
       },
       Boolean,
-      {timeoutMs: 20_000, intervalMs: 300, description: "live removal of both bulk-adjudicated rows"},
+      {timeoutMs: 20_000, intervalMs: 300, description: "live removal of both bulk-adjudicated rows and Page 0 auto-refill"},
     ).then(() => true, () => false);
 
     const [ok1, ok2] = await Promise.all([

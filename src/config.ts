@@ -301,7 +301,11 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     testRpmId: process.env.TEST_RPM_ID?.trim() || "rpm-50",
     testLaneLabel: process.env.TEST_LANE_LABEL?.trim() || "Lane50",
     expectedLaneCount,
-    expectedCameraCount: integer("EXPECTED_CAMERA_COUNT", 50, 0),
+    expectedCameraCount: integer(
+      "EXPECTED_CAMERA_COUNT",
+      laneConfigOracle?.configuredCameraCount ?? expectedLaneCount,
+      0,
+    ),
     operationalViewWorkflow,
     oscarLaneConfigPath,
     ...(laneConfigOracle ? {laneConfigOracle} : {}),

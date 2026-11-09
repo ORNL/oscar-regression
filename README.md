@@ -20,20 +20,31 @@ source review before the suite can certify that version.
 
 ## What it validates
 
-- authenticated Viewer access, navigation, map, national statistics, and servers
+- authenticated Viewer access, navigation, map, national statistics, servers, and
+  customizable Dashboard widget visibility (`Lane Status`, `Event Table`, `Quick View`)
+  with `localStorage` (`oscar.dashboardWidgetVisibility`) persistence
 - browser-cache policy for private immutable hashed Viewer bundles, revalidated
   service-worker code, and non-cacheable anonymous authentication errors
 - SensorHub Admin visibility
-- every configured lane and camera on Status of Health
+- every configured lane and camera on Status of Health, supporting both single-camera
+  (20-column) and multi-camera (`14 + 6*N` column, e.g., 52 cameras across 50 lanes
+  with 3 cameras on `Lane03`) lane configuration CSVs
 - compact Dashboard health indicators for every lane, with independent RPM and
   per-camera connectivity; gamma-high/low, neutron-high, tamper, and extended-
   occupancy states; an explicit known-clear Tamper baseline for every emulated
   RPM/lane; operational-view membership; keyboard navigation; and bounded
   shared health requests
 - RPM disconnect/reconnect, gamma-high, gamma-low, neutron-high, tamper, and
-  extended-occupancy detection and recovery
+  extended-occupancy detection and recovery, plus Lane Details `StatusTable`
+  live fault row rendering with valid ISO timestamps (no `Invalid Date`)
 - live Gamma and Neutron plot data after Dashboard-to-Lane Details navigation,
-  plus HLS camera playback, decoded dimensions, and advancing playback time
+  verifying both initial non-blank rendering and continuous real-time canvas
+  advancement across time, plus on-demand HLS camera playback startup latency
+  (`<= 15 s`), decoded dimensions, advancing playback time, and multi-camera
+  `Next`/`Previous` feed cycling (`Camera X of N`) on multi-camera lanes
+- continuous 24/7/365 `EventTable` unadjudicated Page 0 refill after inline or
+  bulk adjudication (`rowCount >= min(15, totalCount)`) and snapshot cutoff
+  preservation when paging to Page 1+ and returning to Page 0
 - back-to-back one-second gamma/neutron alarm occupancies that exercise a short
   CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
   rejecting camera-command timeout, quarantine, result-timeout, rejection, and
