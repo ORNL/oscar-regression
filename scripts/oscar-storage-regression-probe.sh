@@ -1882,12 +1882,16 @@ case $action in
     if [[ $batch_calls -gt 0 && $batch_rows -gt $batch_calls ]]; then batch=true; fi
     observation_indexes=$(json_query "
       WITH required(indexname) AS (VALUES
-        ('obs_pkey'),('obs_unique_constraint_v2'),('obs_datastream_idx'),
-        ('obs_phenomenon_time_idx'),('obs_datastream_id_phenomenon_time_idx'),
-        ('obs_result_time_idx'),('obs_datastream_id_result_time_idx'),('obs_foi_idx'),
-        ('obs_unarchived_time_idx'),
+        ('obs_pkey'),('obs_unique_constraint_v2'),('obs_result_time_idx'),
+        ('obs_datastream_result_time_id_idx'),
+        ('obs_phenomenon_time_id_nulls_first_idx'),
+        ('obs_phenomenon_time_desc_id_nulls_first_idx'),
+        ('obs_datastream_phenomenon_time_id_nulls_first_idx'),
+        ('obs_datastream_phenomenon_time_desc_id_nulls_first_idx'),
+        ('obs_foi_idx'),('obs_unadjudicated_alarm_idx'),
         ('obs_result_path_ops_idx'),('obs_result_occupancy_count_idx'),
-        ('obs_result_max_gamma_idx'),('obs_result_max_neutron_idx')
+        ('obs_result_max_gamma_idx'),('obs_result_max_neutron_idx'),
+        ('obs_non_alarm_ptime_desc_idx')
       ), actual AS (
         SELECT indexname,lower(indexdef) indexdef FROM pg_indexes
         WHERE schemaname=current_schema() AND tablename='obs'
@@ -2111,17 +2115,21 @@ COMMANDS
         AND query ~* '^[[:space:]]*insert[[:space:]]+into[[:space:]]+((oscar|public)[.])?obs([[:space:]]|[(])'),
     statement_io AS (SELECT coalesce(sum(temp_blks_written),0) temp_blocks,
         coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
-          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'),0) delete_calls,
+          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
+          AND query !~* 'delete[[:space:]]+from[[:space:]]+only[[:space:]]+((oscar|public)[.])?obs[[:space:]]+where[[:space:]]+id[[:space:]]*=[[:space:]]*any[[:space:]]*[(].*archivegenerationid[[:space:]]+is[[:space:]]+null'),0) delete_calls,
         coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
-          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'),0) delete_rows,
+          AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
+          AND query !~* 'delete[[:space:]]+from[[:space:]]+only[[:space:]]+((oscar|public)[.])?obs[[:space:]]+where[[:space:]]+id[[:space:]]*=[[:space:]]*any[[:space:]]*[(].*archivegenerationid[[:space:]]+is[[:space:]]+null'),0) delete_rows,
         coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
           AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
           AND query ~* 'id[[:space:]]*=[[:space:]]*[$][0-9]+' AND query !~* 'any[[:space:]]*[(]'),0) singleton_delete_calls,
         coalesce(sum(calls) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
           AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
+          AND query !~* 'delete[[:space:]]+from[[:space:]]+only[[:space:]]+((oscar|public)[.])?obs[[:space:]]+where[[:space:]]+id[[:space:]]*=[[:space:]]*any[[:space:]]*[(].*archivegenerationid[[:space:]]+is[[:space:]]+null'
           AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_calls,
         coalesce(sum(rows) FILTER (WHERE query ~* '^[[:space:]]*delete[[:space:]]+from[[:space:]]+(only[[:space:]]+)?((oscar|public)[.])?(obs([[:space:]]|$)|oscar_obs_stage_[a-z0-9_]+([[:space:]]|$))'
           AND query !~* 'oscar_obs_stage_(owner|partition)([[:space:]]|$)'
+          AND query !~* 'delete[[:space:]]+from[[:space:]]+only[[:space:]]+((oscar|public)[.])?obs[[:space:]]+where[[:space:]]+id[[:space:]]*=[[:space:]]*any[[:space:]]*[(].*archivegenerationid[[:space:]]+is[[:space:]]+null'
           AND query ~* 'id[[:space:]]*=[[:space:]]*any[[:space:]]*[(]'),0) batch_delete_rows
       FROM pg_stat_statements,current_db WHERE dbid=current_db.oid),
     catalog AS (SELECT count(*) FILTER(WHERE state='ACTIVE') active,count(*) FILTER(WHERE state='SEALED') sealed,coalesce(sum(row_count),0) rows FROM oscar_archive_generation),

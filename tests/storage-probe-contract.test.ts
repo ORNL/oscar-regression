@@ -546,6 +546,8 @@ test("storage gates require the shipped Parquet-primary policy and fresh index c
     "maximumVerificationsPerCycle: 2",
     "maximumDeletionsPerCycle: 2",
     '"gammaCounts"', '"gammaThreshold"', '"neutronCounts"', '"setupGamma"', '"setupNeutron"',
+    '"speed"', '"backgroundReport"', '"foregroundReport"', '"status"',
+    '"emlContextual"', '"emlScanContextual"', '"emlAnalysis"',
     "REGRESSION_ARCHIVE_POLICY", "PARQUET_PRIMARY_OUTPUT_NAMES",
     "genericPayloadGinAbsent", "requiredPresent === indexes.requiredCount",
     "eventPathGinExact", "numericEventIndexesExact", "assessImmutableStageHealth",
