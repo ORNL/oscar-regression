@@ -338,12 +338,6 @@ archive_scratch_json() {
       chmod 700 "$work"
       cleanup() { rm -rf -- "$work"; }
       trap cleanup EXIT HUP INT TERM
-      find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
-      LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
-      find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
-      LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
-      inventory_stable=true
-      cmp -s "$work/first.sorted" "$work/second.sorted" || inventory_stable=false
       classifier="$work/classifier.sh"
       cat >"$classifier" <<\OSCAR_SCRATCH_CLASSIFIER
 root=$1
@@ -363,24 +357,57 @@ for child do
     *"$newline"*|*"$carriage_return"*) printf "unexpected\n"; continue ;;
   esac
   if printf "%s\n" "$name" |
-       grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" &&
-     [ -d "$child" ] && [ ! -L "$child" ]; then
-    real_child=$(realpath -e -- "$child" 2>/dev/null || true)
-    if [ -n "$real_child" ] && [ "$(dirname -- "$real_child")" = "$root" ]; then
-      printf "operation\n"
-      continue
+       grep -Eq "^[a-z][a-z0-9-]{0,31}-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"; then
+    [ -e "$child" ] || [ -L "$child" ] || exit 25
+    if [ -d "$child" ] && [ ! -L "$child" ]; then
+      real_child=$(realpath -e -- "$child" 2>/dev/null) || exit 25
+      if [ -n "$real_child" ] && [ "$(dirname -- "$real_child")" = "$root" ]; then
+        printf "operation\n"
+        continue
+      fi
     fi
   fi
   printf "unexpected\n"
 done
 OSCAR_SCRATCH_CLASSIFIER
       chmod 600 "$classifier"
-      if [ -s "$work/second.sorted" ]; then
-        xargs -0 -r sh -eu "$classifier" "$scratch" "$lease" \
-          <"$work/second.sorted" >"$work/classes"
-      else
-        : >"$work/classes"
-      fi
+      attempt=0
+      inventory_stable=false
+      while :; do
+        attempt=$((attempt+1))
+        find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/first.raw"
+        LC_ALL=C sort -zu "$work/first.raw" >"$work/first.sorted"
+        find "$scratch" -xdev -mindepth 1 -maxdepth 1 -print0 >"$work/second.raw"
+        LC_ALL=C sort -zu "$work/second.raw" >"$work/second.sorted"
+        if ! cmp -s "$work/first.sorted" "$work/second.sorted"; then
+          if [ "$attempt" -lt 50 ]; then
+            sleep 0.1
+            continue
+          fi
+          inventory_stable=false
+          : >"$work/classes"
+          break
+        fi
+        if [ -s "$work/second.sorted" ]; then
+          if xargs -0 -r sh -eu "$classifier" "$scratch" "$lease" \
+               <"$work/second.sorted" >"$work/classes"; then
+            inventory_stable=true
+            break
+          else
+            if [ "$attempt" -lt 50 ]; then
+              sleep 0.1
+              continue
+            fi
+            inventory_stable=false
+            : >"$work/classes"
+            break
+          fi
+        else
+          : >"$work/classes"
+          inventory_stable=true
+          break
+        fi
+      done
       entries=$(grep -c "^operation$" "$work/classes" || true)
       unexpected=$(grep -c "^unexpected$" "$work/classes" || true)
       [ "$inventory_stable" = true ] || unexpected=$((unexpected+1))

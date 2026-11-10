@@ -276,6 +276,15 @@ const PARQUET_PRIMARY_OUTPUT_NAMES = [
   "emlContextual",
   "emlScanContextual",
   "emlAnalysis",
+  "dailyFile",
+  "connectionStatus",
+  "occupancyStatus",
+  "tamper",
+  "occupancy",
+  "adjudication",
+  "report",
+  "siteStatistics",
+  "nationalSummary",
 ] as const;
 
 const REGRESSION_ARCHIVE_POLICY = {
@@ -4422,16 +4431,17 @@ export class RegressionScenarios {
         });
       }
 
+      const firstVehicleId = `REG-${this.reporter.runId.slice(-12)}`;
+      const firstNotes = `Regression ${this.reporter.runId.slice(-12)}`;
+
       await this.check({
         scenario: "adjudication", category: "adjudication", action: "adjudicate alarm",
         target: this.config.testLaneLabel, expected: "full Code 9 adjudication with vehicle ID, inspection, notes, confirmation, and audit log succeeds",
       }, async () => {
-        const vehicleId = `REG-${this.reporter.runId.slice(-12)}`;
-        const notes = `Regression ${this.reporter.runId.slice(-12)}`;
-        await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(vehicleId);
+        await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(firstVehicleId);
         await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
         await this.selectMui(page, "Secondary Inspection", "NONE");
-        await page.getByLabel("Notes").fill(notes);
+        await page.getByLabel("Notes").fill(firstNotes);
         await page.getByRole("button", {name: "Submit", exact: true}).click();
         const confirm = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
         await confirm.waitFor();
@@ -4442,11 +4452,11 @@ export class RegressionScenarios {
         await page.getByText("Logged Adjudications", {exact: true}).waitFor();
         const body = await poll(
           () => page.locator("body").innerText(),
-          (value) => value.includes(vehicleId) && value.includes(notes),
+          (value) => value.includes(firstVehicleId) && value.includes(firstNotes),
           {timeoutMs: 30_000, intervalMs: 500, description: "submitted adjudication values after reload"},
         ).catch(() => page.locator("body").innerText());
-        const vehiclePersisted = body.includes(vehicleId);
-        const notesPersisted = body.includes(notes);
+        const vehiclePersisted = body.includes(firstVehicleId);
+        const notesPersisted = body.includes(firstNotes);
         const codePersisted = /Code 9/i.test(body);
         const inspectionPersisted = /\bNone\b/i.test(body);
         const persisted = vehiclePersisted && notesPersisted && codePersisted && inspectionPersisted;
@@ -4505,6 +4515,353 @@ export class RegressionScenarios {
         return {
           passed,
           observed: `matchedOccupancies=${matchedOccupancies.join(",") || "none"}`,
+          evidence,
+        };
+      });
+
+      const readObservationAdjudicatedIds = async (obsId: string): Promise<{count: number; ids: string[]}> => {
+        const res = await page.context().request.get(
+          this.viewerUrl(`/sensorhub/api/observations/${encodeURIComponent(obsId)}`),
+          {headers: {Accept: "application/om+json"}},
+        );
+        try {
+          if (!res.ok()) return {count: 0, ids: []};
+          const json = await res.json() as {
+            result?: {adjudicatedIdsCount?: unknown; adjudicatedIds?: unknown[]};
+            properties?: {result?: {adjudicatedIdsCount?: unknown; adjudicatedIds?: unknown[]}};
+          };
+          const rawIds = json.result?.adjudicatedIds ?? json.properties?.result?.adjudicatedIds ?? [];
+          const ids = Array.isArray(rawIds) ? rawIds.map(v => String(v ?? "").trim()).filter(Boolean) : [];
+          const rawCount = Number(json.result?.adjudicatedIdsCount ?? json.properties?.result?.adjudicatedIdsCount ?? ids.length);
+          return {count: Number.isFinite(rawCount) ? rawCount : ids.length, ids};
+        } finally {
+          await res.dispose();
+        }
+      };
+
+      const reAdjObsId = alarmArtifacts?.observationId ?? "";
+      const reAdjVehicleId = `REG-READJ-${this.reporter.runId.slice(-12)}`;
+      const reAdjNotes = `Re-adjudicated ${this.reporter.runId.slice(-12)}`;
+
+      await this.check({
+        scenario: "adjudication",
+        category: "adjudication",
+        action: "re-adjudicate already-adjudicated alarm",
+        target: `${this.config.testLaneLabel}:${occupancyCount}`,
+        expected: "submitting a second adjudication (Code 4, Completed) on an already-adjudicated alarm preserves both audit log entries and updates the active code marker to code:4",
+      }, async () => {
+        if (!reAdjObsId) {
+          return {passed: false, observed: "missing alarm observationId from export step"};
+        }
+        await this.goto(page, `/event-details?eventId=${encodeURIComponent(reAdjObsId)}`);
+        await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+        await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+        await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(reAdjVehicleId);
+        await this.selectMui(page, "Adjudicate", "Code 4: NORM Found");
+        await this.selectMui(page, "Secondary Inspection", "COMPLETED");
+        await page.getByLabel("Notes").fill(reAdjNotes);
+        await page.getByRole("button", {name: "Submit", exact: true}).click();
+        const confirm = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+        await confirm.waitFor();
+        await confirm.getByRole("button", {name: /Confirm & Submit/i}).click();
+        await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+        await page.getByText("Logged Adjudications", {exact: true}).waitFor();
+
+        await page.reload({waitUntil: "domcontentloaded"});
+        await page.getByText("Logged Adjudications", {exact: true}).waitFor();
+        const body = await poll(
+          () => page.locator("body").innerText(),
+          (value) =>
+            value.includes(firstVehicleId) &&
+            value.includes(firstNotes) &&
+            value.includes(reAdjVehicleId) &&
+            value.includes(reAdjNotes),
+          {timeoutMs: 30_000, intervalMs: 500, description: "both initial and re-adjudicated entries after reload"},
+        ).catch(() => page.locator("body").innerText());
+
+        const obsState = await poll(
+          () => readObservationAdjudicatedIds(reAdjObsId),
+          (state) => state.count >= 2 && state.ids.includes("code:4") && !state.ids.includes("code:9"),
+          {timeoutMs: 15_000, intervalMs: 500, description: "updated code:4 marker on re-adjudicated occupancy"},
+        ).catch(() => readObservationAdjudicatedIds(reAdjObsId));
+
+        const firstPersisted = body.includes(firstVehicleId) && body.includes(firstNotes) && /Code 9/i.test(body);
+        const secondPersisted = body.includes(reAdjVehicleId) && body.includes(reAdjNotes) &&
+          /Code 4/i.test(body) && /\bCompleted\b/i.test(body);
+        const markerUpdated = obsState.count >= 2 && obsState.ids.includes("code:4") && !obsState.ids.includes("code:9");
+        const passed = firstPersisted && secondPersisted && markerUpdated;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "re-adjudicate-alarm-failed");
+        return {
+          passed,
+          observed: `firstPersisted=${firstPersisted}; secondPersisted=${secondPersisted}; ` +
+            `adjudicatedIdsCount=${obsState.count}; adjudicatedIds=${obsState.ids.join(",")}`,
+          evidence,
+        };
+      });
+
+      await this.check({
+        scenario: "adjudication",
+        category: "adjudication",
+        action: "filter re-adjudicated alarm by updated Adjudication Code on Event Log",
+        target: `${this.config.testLaneLabel}:${occupancyCount}`,
+        expected: "Event Log Advanced Filters (Lane ID + Adjudication Code = Code 4) returns the re-adjudicated occupancy",
+      }, async () => {
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
+        await page.getByRole("button", {name: /advanced filters/i}).first().click();
+        const dialog = page.getByRole("dialog", {name: /advanced filters/i});
+        await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+        await dialog.getByRole("button", {name: /clear all/i}).click();
+
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        const boxes = dialog.getByRole("combobox");
+        await boxes.nth(1).click();
+        await page.getByRole("option", {name: "Lane ID", exact: true}).click();
+        await boxes.nth(3).click();
+        await page.getByRole("option", {name: this.config.testLaneLabel, exact: true}).click();
+
+        await dialog.getByRole("button", {name: /add condition/i}).click();
+        await boxes.nth(4).click();
+        await page.getByRole("option", {name: "Adjudication Code", exact: true}).click();
+        await boxes.nth(6).click();
+        await page.getByRole("option", {name: "Code 4: NORM Found", exact: true}).click();
+
+        await dialog.getByRole("button", {name: /apply filters/i}).click();
+        await dialog.waitFor({state: "hidden"});
+
+        const matchedOccupancies = await poll(async () => {
+          const rows = page.locator(".MuiDataGrid-row");
+          const count = await rows.count();
+          const occs: string[] = [];
+          for (let i = 0; i < count; i++) {
+            occs.push((await rows.nth(i).locator('[data-field="occupancyCount"]').innerText().catch(() => "")).trim());
+          }
+          return occs;
+        }, occs => occs.includes(String(occupancyCount)), {
+          timeoutMs: 30_000,
+          intervalMs: 500,
+          description: `Event Log Adjudication Code = Code 4 filter to return occupancy ${occupancyCount}`,
+        }).catch(() => [] as string[]);
+
+        const passed = matchedOccupancies.includes(String(occupancyCount));
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "re-adjudication-code-filter-failed");
+        return {
+          passed,
+          observed: `matchedOccupancies=${matchedOccupancies.join(",") || "none"}`,
+          evidence,
+        };
+      });
+
+      await this.check({
+        scenario: "adjudication",
+        category: "adjudication",
+        action: "adjudicate and re-adjudicate an old unadjudicated alarm",
+        target: "oldest unadjudicated alarm",
+        expected: "oldest unadjudicated alarm (including cold Parquet history) adjudicates (Code 6 -> removed from unadjudicated filter) and re-adjudicates (Code 3 -> both log entries persist and code:3 replaces code:6)",
+      }, async () => {
+        const dsRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/api/datastreams?limit=1000"),
+          {headers: {Accept: "application/json"}},
+        );
+        const occupancyStreamIds: string[] = [];
+        try {
+          if (dsRes.ok()) {
+            const dsJson = await dsRes.json() as {items?: Array<{id?: unknown; outputName?: unknown}>};
+            for (const item of dsJson.items ?? []) {
+              if (String(item.outputName ?? "").trim() === "occupancy" && item.id) {
+                occupancyStreamIds.push(String(item.id).trim());
+              }
+            }
+          }
+        } finally {
+          await dsRes.dispose();
+        }
+        if (occupancyStreamIds.length === 0) {
+          return {passed: false, observed: "no occupancy datastreams found"};
+        }
+
+        const findOldestUnadjudicated = async (): Promise<{
+          obsId: string;
+          datastreamId: string;
+          phenomenonTime: string;
+          occupancyCount: string;
+        } | null> => {
+          const params = new URLSearchParams({
+            dataStream: occupancyStreamIds.join(","),
+            filter: "(gammaAlarm=true OR neutronAlarm=true) AND adjudicatedIdsCount=0",
+            order: "asc",
+            limit: "10",
+          });
+          const res = await page.context().request.get(
+            this.viewerUrl(`/sensorhub/api/observations?${params}`),
+            {headers: {Accept: "application/om+json"}},
+          );
+          try {
+            if (!res.ok()) return null;
+            const json = await res.json() as {
+              items?: Array<{
+                id?: unknown;
+                "datastream@id"?: unknown;
+                phenomenonTime?: unknown;
+                result?: {occupancyCount?: unknown; adjudicatedIdsCount?: unknown; adjudicatedIds?: unknown[]};
+              }>;
+            };
+            for (const item of json.items ?? []) {
+              const id = String(item.id ?? "").trim();
+              const dsId = String(item["datastream@id"] ?? "").trim();
+              const pTime = String(item.phenomenonTime ?? "").trim();
+              const occCount = String(item.result?.occupancyCount ?? "").trim();
+              const adjCount = Number(item.result?.adjudicatedIdsCount ?? 0);
+              const adjIds = Array.isArray(item.result?.adjudicatedIds) ? item.result.adjudicatedIds : [];
+              if (id && dsId && pTime && id !== reAdjObsId && adjCount === 0 && adjIds.length === 0) {
+                return {obsId: id, datastreamId: dsId, phenomenonTime: pTime, occupancyCount: occCount};
+              }
+            }
+            return null;
+          } finally {
+            await res.dispose();
+          }
+        };
+
+        let oldAlarm = await findOldestUnadjudicated();
+        if (!oldAlarm) {
+          const fallbackTrigger = await this.triggerAlarm("gamma");
+          oldAlarm = await findOldestUnadjudicated();
+          if (oldAlarm && fallbackTrigger) {
+            await this.captureAlarmMedia(
+              page,
+              oldAlarm.obsId,
+              "gamma",
+              fallbackTrigger.occupancyCount,
+              "adjudication",
+            );
+          }
+        }
+        if (!oldAlarm) {
+          return {passed: false, observed: "could not locate an unadjudicated alarm to adjudicate"};
+        }
+
+        const oldVehicleId = `REG-OLD-${this.reporter.runId.slice(-12)}`;
+        const oldNotes = `Old alarm ${this.reporter.runId.slice(-12)}`;
+        const oldReAdjVehicleId = `REG-OLD2-${this.reporter.runId.slice(-12)}`;
+        const oldReAdjNotes = `Old alarm re-adj ${this.reporter.runId.slice(-12)}`;
+
+        await this.goto(page, `/event-details?eventId=${encodeURIComponent(oldAlarm.obsId)}`);
+        await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+
+        await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(oldVehicleId);
+        await this.selectMui(page, "Adjudicate", "Code 6: Physical Inspection Negative");
+        await this.selectMui(page, "Secondary Inspection", "NONE");
+        await page.getByLabel("Notes").fill(oldNotes);
+        await page.getByRole("button", {name: "Submit", exact: true}).click();
+        const confirm1 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+        await confirm1.waitFor();
+        await confirm1.getByRole("button", {name: /Confirm & Submit/i}).click();
+        await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+        await page.getByText("Logged Adjudications", {exact: true}).waitFor();
+
+        const queryDatastreamFilter = async (cql: string): Promise<string[]> => {
+          const params = new URLSearchParams({
+            phenomenonTime: `${oldAlarm.phenomenonTime}/${oldAlarm.phenomenonTime}`,
+            filter: cql,
+            limit: "50",
+          });
+          const res = await page.context().request.get(
+            this.viewerUrl(
+              `/sensorhub/api/datastreams/${encodeURIComponent(oldAlarm.datastreamId)}/observations?${params}`,
+            ),
+            {headers: {Accept: "application/om+json"}},
+          );
+          try {
+            if (!res.ok()) return [];
+            const json = await res.json() as {items?: Array<{id?: unknown}>};
+            return (json.items ?? []).map(i => String(i.id ?? "").trim()).filter(Boolean);
+          } finally {
+            await res.dispose();
+          }
+        };
+
+        const afterFirstObsState = await poll(
+          () => readObservationAdjudicatedIds(oldAlarm.obsId),
+          (state) => state.count >= 1 && state.ids.includes("code:6"),
+          {timeoutMs: 15_000, intervalMs: 500, description: "old alarm code:6 overlay"},
+        ).catch(() => readObservationAdjudicatedIds(oldAlarm.obsId));
+
+        const unadjIdsAfterFirst = await queryDatastreamFilter(
+          "(gammaAlarm=true OR neutronAlarm=true) AND adjudicatedIdsCount=0",
+        );
+        const code6IdsAfterFirst = await queryDatastreamFilter(
+          "adjudicatedIdsCount>0 AND adjudicatedIds='code:6'",
+        );
+        const firstStepPassed =
+          afterFirstObsState.count >= 1 &&
+          afterFirstObsState.ids.includes("code:6") &&
+          !unadjIdsAfterFirst.includes(oldAlarm.obsId) &&
+          code6IdsAfterFirst.includes(oldAlarm.obsId);
+
+        // Now re-adjudicate that same old alarm with Code 3 and Secondary Inspection = COMPLETED
+        await page.reload({waitUntil: "domcontentloaded"});
+        await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+        await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(oldReAdjVehicleId);
+        await this.selectMui(page, "Adjudicate", "Code 3: Medical Isotope Found");
+        await this.selectMui(page, "Secondary Inspection", "COMPLETED");
+        await page.getByLabel("Notes").fill(oldReAdjNotes);
+        await page.getByRole("button", {name: "Submit", exact: true}).click();
+        const confirm2 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+        await confirm2.waitFor();
+        await confirm2.getByRole("button", {name: /Confirm & Submit/i}).click();
+        await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+        await page.getByText("Logged Adjudications", {exact: true}).waitFor();
+
+        await page.reload({waitUntil: "domcontentloaded"});
+        await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+        const body = await poll(
+          () => page.locator("body").innerText(),
+          (value) =>
+            value.includes(oldVehicleId) &&
+            value.includes(oldNotes) &&
+            value.includes(oldReAdjVehicleId) &&
+            value.includes(oldReAdjNotes),
+          {timeoutMs: 30_000, intervalMs: 500, description: "old alarm initial and re-adjudication entries"},
+        ).catch(() => page.locator("body").innerText());
+
+        const afterSecondObsState = await poll(
+          () => readObservationAdjudicatedIds(oldAlarm.obsId),
+          (state) => state.count >= 2 && state.ids.includes("code:3") && !state.ids.includes("code:6"),
+          {timeoutMs: 15_000, intervalMs: 500, description: "old alarm code:3 replacement overlay"},
+        ).catch(() => readObservationAdjudicatedIds(oldAlarm.obsId));
+
+        const code3IdsAfterSecond = await queryDatastreamFilter(
+          "adjudicatedIdsCount>0 AND adjudicatedIds='code:3'",
+        );
+        const code6IdsAfterSecond = await queryDatastreamFilter(
+          "adjudicatedIdsCount>0 AND adjudicatedIds='code:6'",
+        );
+
+        const uiBothPersisted =
+          body.includes(oldVehicleId) &&
+          body.includes(oldNotes) &&
+          /Code 6/i.test(body) &&
+          body.includes(oldReAdjVehicleId) &&
+          body.includes(oldReAdjNotes) &&
+          /Code 3/i.test(body) &&
+          /\bCompleted\b/i.test(body);
+        const secondStepPassed =
+          uiBothPersisted &&
+          afterSecondObsState.count >= 2 &&
+          afterSecondObsState.ids.includes("code:3") &&
+          !afterSecondObsState.ids.includes("code:6") &&
+          code3IdsAfterSecond.includes(oldAlarm.obsId) &&
+          !code6IdsAfterSecond.includes(oldAlarm.obsId);
+
+        const passed = firstStepPassed && secondStepPassed;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "old-alarm-adjudication-failed");
+        return {
+          passed,
+          observed: `oldObsId=${oldAlarm.obsId}; pTime=${oldAlarm.phenomenonTime}; ` +
+            `firstStepPassed=${firstStepPassed}; secondStepPassed=${secondStepPassed}; ` +
+            `finalIds=${afterSecondObsState.ids.join(",")}`,
           evidence,
         };
       });

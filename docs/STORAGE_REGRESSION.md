@@ -143,9 +143,14 @@ The target must use a fresh database and the 3.9.2 Parquet-primary profile:
 `parquetPrimaryArchiveDelayMinutes=5`, `parquetPrimaryIntervalMinutes=1`,
 `maximumFuturePhenomenonSkewMinutes=5`, `maximumStagePartitionsPerCycle=8`,
 2/2/2 export/verification/deletion caps, and `deleteHotAfterArchive=true`. Its
-exact allowlist is `gammaCounts`,
-`gammaThreshold`, `neutronCounts`, `setupGamma`, and `setupNeutron`; mutable
-occupancy/alarm/adjudication outputs are intentionally not Parquet-primary. Set
+exact 21-output allowlist is `gammaCounts`, `gammaThreshold`, `neutronCounts`,
+`setupGamma`, `setupNeutron`, `speed`, `backgroundReport`, `foregroundReport`,
+`status`, `emlContextual`, `emlScanContextual`, `emlAnalysis`, `dailyFile`,
+`connectionStatus`, `occupancyStatus`, `tamper`, `occupancy`, `adjudication`,
+`report`, `siteStatistics`, and `nationalSummary`; post-archive adjudication and
+re-adjudication updates on cold `occupancy` rows persist in `oscar_obs_overlay`
+while `oscar_obs_latest` and `oscar_event_locator` provide O(1) latest-row and
+event-ID resolution. Set
 `STORAGE_HOT_RETENTION_DAYS=1` so the compatibility field matches the live test
 configuration, but do not interpret `hotRetentionDays`, `intervalMinutes`, or
 `rollbackGraceDays` as primary-mode eligibility; those fields preserve the

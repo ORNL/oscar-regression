@@ -547,7 +547,9 @@ test("storage gates require the shipped Parquet-primary policy and fresh index c
     "maximumDeletionsPerCycle: 2",
     '"gammaCounts"', '"gammaThreshold"', '"neutronCounts"', '"setupGamma"', '"setupNeutron"',
     '"speed"', '"backgroundReport"', '"foregroundReport"', '"status"',
-    '"emlContextual"', '"emlScanContextual"', '"emlAnalysis"',
+    '"emlContextual"', '"emlScanContextual"', '"emlAnalysis"', '"dailyFile"',
+    '"connectionStatus"', '"occupancyStatus"', '"tamper"', '"occupancy"',
+    '"adjudication"', '"report"', '"siteStatistics"', '"nationalSummary"',
     "REGRESSION_ARCHIVE_POLICY", "PARQUET_PRIMARY_OUTPUT_NAMES",
     "genericPayloadGinAbsent", "requiredPresent === indexes.requiredCount",
     "eventPathGinExact", "numericEventIndexesExact", "assessImmutableStageHealth",
@@ -555,6 +557,24 @@ test("storage gates require the shipped Parquet-primary policy and fresh index c
   ]) assert.ok(block.includes(required) || scenarios.includes(required),
     `missing Parquet-primary release gate: ${required}`);
   assert.doesNotMatch(block, /rollbackGraceDays:\s*1[\s\S]{0,100}SHIPPING_STORAGE_POLICY/);
+});
+
+test("adjudication scenario exercises re-adjudication of already-adjudicated alarms and adjudication of old alarms", () => {
+  const adjStart = scenarios.indexOf("private async adjudicationAndAlarmTransfer");
+  const adjEnd = scenarios.indexOf("private async emlAutoAdjudication", adjStart);
+  const block = scenarios.slice(adjStart, adjEnd);
+  for (const required of [
+    'action: "re-adjudicate already-adjudicated alarm"',
+    'action: "filter re-adjudicated alarm by updated Adjudication Code on Event Log"',
+    'action: "adjudicate and re-adjudicate an old unadjudicated alarm"',
+    "Code 4: NORM Found",
+    "Code 6: Physical Inspection Negative",
+    "Code 3: Medical Isotope Found",
+    'order: "asc"',
+    '(gammaAlarm=true OR neutronAlarm=true) AND adjudicatedIdsCount=0',
+  ]) {
+    assert.ok(block.includes(required), `missing adjudication scenario coverage: ${required}`);
+  }
 });
 
 test("stage health is read-only, mode-aware, and reports exact short-stage invariants", () => {

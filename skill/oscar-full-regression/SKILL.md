@@ -118,7 +118,10 @@ skill wrapper instead, set `OSCAR_REGRESSION_SUITE_DIR` and run
    retain distinct generation-qualified camera paths, and leave the exact OSCAR
    log window free of camera timeout, quarantine, rejection, result-timeout,
    stale-generation, and command-failure symptoms. Also require `rpm-faults` to
-   verify Lane Details `StatusTable` fault rows with valid ISO timestamps, and
+   verify Lane Details `StatusTable` fault rows with valid ISO timestamps,
+   `adjudication` to verify initial adjudication, re-adjudication of an
+   already-adjudicated alarm, and adjudication + re-adjudication of the oldest
+   unadjudicated alarm (including cold Parquet history), and
    `ui-endurance` to verify Page 0 unadjudicated refill after adjudication and
    Page 1+ cutoff preservation on return to Page 0.
 6. Preserve the entire latest result directory. Confirm reserved-lane-cleanup is
@@ -160,9 +163,14 @@ suite: a fresh database with `storageMode=PARQUET_PRIMARY`,
 `parquetPrimaryIntervalMinutes=1`, `maximumFuturePhenomenonSkewMinutes=5`,
 `maximumStagePartitionsPerCycle=8`, 2/2/2 maximum
 generation/verification/compatibility-deletion work,
-`deleteHotAfterArchive=true`, and exactly `gammaCounts`, `gammaThreshold`,
-`neutronCounts`, `setupGamma`, and `setupNeutron`. Mutable occupancy, alarm,
-and adjudication outputs remain PostgreSQL-backed. Require the actual fresh
+`deleteHotAfterArchive=true`, and the exact 21-output allowlist (`gammaCounts`,
+`gammaThreshold`, `neutronCounts`, `setupGamma`, `setupNeutron`, `speed`,
+`backgroundReport`, `foregroundReport`, `status`, `emlContextual`,
+`emlScanContextual`, `emlAnalysis`, `dailyFile`, `connectionStatus`,
+`occupancyStatus`, `tamper`, `occupancy`, `adjudication`, `report`,
+`siteStatistics`, `nationalSummary`), with post-archive occupancy mutations
+persisted in `oscar_obs_overlay` and latest/event lookups served by
+`oscar_obs_latest` and `oscar_event_locator`. Require the actual fresh
 observation index catalog to omit both the generic payload GIN and the legacy
 archive-generation index while retaining the mutable-event and identity/time
 indexes. Require stage health to report exact attached/detached children,
