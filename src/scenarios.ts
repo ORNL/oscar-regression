@@ -5539,13 +5539,16 @@ export class RegressionScenarios {
     const page = await this.browser.oscarPage();
     let ocrEnabledByScenario = false;
 
-    const findReservedLaneSystem = async (): Promise<{systemId: string; uid: string} | null> => {
+    const findLaneSystems = async (): Promise<{
+      reserved: {systemId: string; uid: string} | null;
+      untouchedBaseline: {systemId: string; uid: string} | null;
+    }> => {
       const res = await page.context().request.get(
         this.viewerUrl("/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500"),
         {headers: {Accept: "application/geo+json, application/json"}},
       );
       try {
-        if (!res.ok()) return null;
+        if (!res.ok()) return {reserved: null, untouchedBaseline: null};
         const json = await res.json() as {
           items?: Array<{
             id?: unknown;
@@ -5553,16 +5556,22 @@ export class RegressionScenarios {
           }>;
         };
         const expectedLower = this.config.testLaneLabel.toLowerCase();
+        let reserved: {systemId: string; uid: string} | null = null;
+        let untouchedBaseline: {systemId: string; uid: string} | null = null;
         for (const item of json.items ?? []) {
           const id = String(item.id ?? "").trim();
           const uid = String(item.properties?.uid ?? "").trim();
           const name = String(item.properties?.name ?? "").trim();
           if (!id || !uid.includes(":lane:")) continue;
-          if (name.toLowerCase() === expectedLower || uid.toLowerCase().endsWith(`:${expectedLower}`)) {
-            return {systemId: id, uid};
+          const lowerName = name.toLowerCase();
+          const lowerUid = uid.toLowerCase();
+          if (lowerName === expectedLower || lowerUid.endsWith(`:${expectedLower}`)) {
+            reserved = {systemId: id, uid};
+          } else if (!untouchedBaseline && (lowerName === "lane01" || lowerUid.endsWith(":lane-01"))) {
+            untouchedBaseline = {systemId: id, uid};
           }
         }
-        return null;
+        return {reserved, untouchedBaseline};
       } finally {
         await res.dispose();
       }
@@ -5671,13 +5680,14 @@ export class RegressionScenarios {
     const setLaneVehicleOcrEnabled = async (
       systemId: string,
       enabled: boolean,
-    ): Promise<{supported: boolean; checkedAfterSave: boolean | null; streamId: string}> => {
+    ): Promise<{supported: boolean; initiallyChecked: boolean | null; checkedAfterSave: boolean | null; streamId: string}> => {
       const enableCheckbox = await selectReservedLaneOcrTab(true);
       if (!enableCheckbox) {
-        return {supported: false, checkedAfterSave: null, streamId: ""};
+        return {supported: false, initiallyChecked: null, checkedAfterSave: null, streamId: ""};
       }
       const input = enableCheckbox.locator('input[type="checkbox"]').first();
-      if ((await input.isChecked()) !== enabled) {
+      const initiallyChecked = await input.isChecked();
+      if (initiallyChecked !== enabled) {
         await enableCheckbox.locator("label").first().click();
         await poll(
           () => input.isChecked(),
@@ -5736,24 +5746,29 @@ export class RegressionScenarios {
       const checkedAfterSave = reloadedCheckbox
         ? await reloadedCheckbox.locator('input[type="checkbox"]').first().isChecked()
         : null;
-      return {supported: true, checkedAfterSave, streamId};
+      return {supported: true, initiallyChecked, checkedAfterSave, streamId};
     };
 
     let laneSystem: {systemId: string; uid: string} | null = null;
     try {
       await this.ensureAlarmMediaBaseline("vehicle-ocr");
-      laneSystem = await findReservedLaneSystem();
+      const discoveredLanes = await findLaneSystems();
+      laneSystem = discoveredLanes.reserved;
       if (!laneSystem) {
         throw new Error(`Unable to resolve ConSys system ID for ${this.config.testLaneLabel}`);
       }
       const targetLaneSystem = laneSystem;
 
-      // Check global vehicleOcr datastreams on non-reserved disabled lanes (strict opt-in zero-overhead contract).
+      // Untouched lanes never register a vehicleOcr datastream; previously tested lanes retain historical
+      // datastream metadata for archived observations while publishing zero new observations when disabled.
+      const untouchedLaneOcrStreams = discoveredLanes.untouchedBaseline
+        ? (await listLaneOcrDatastreams(discoveredLanes.untouchedBaseline.systemId, "latest")).length
+        : 0;
+      const nonReservedOcrStreamIds: string[] = [];
       const allDsRes = await page.context().request.get(
-        this.viewerUrl("/sensorhub/api/datastreams?validTime=now&limit=1000"),
+        this.viewerUrl("/sensorhub/api/datastreams?validTime=latest&limit=2000"),
         {headers: {Accept: "application/json"}},
       );
-      let activeNonReservedOcrStreams = 0;
       try {
         if (allDsRes.ok()) {
           const allDsJson = await allDsRes.json() as {
@@ -5761,9 +5776,10 @@ export class RegressionScenarios {
           };
           for (const ds of allDsJson.items ?? []) {
             if (String(ds.outputName ?? "").trim() !== "vehicleOcr") continue;
+            const dsId = String(ds.id ?? "").trim();
             const sysId = String(ds["system@id"] ?? ds.system?.id ?? "").trim();
-            if (sysId && sysId !== targetLaneSystem.systemId) {
-              activeNonReservedOcrStreams++;
+            if (dsId && sysId && sysId !== targetLaneSystem.systemId) {
+              nonReservedOcrStreamIds.push(dsId);
             }
           }
         }
@@ -5787,14 +5803,16 @@ export class RegressionScenarios {
       ocrEnabledByScenario = true;
 
       const enabledCheck = await this.check(adminMeta, async () => {
-        const passed = activeNonReservedOcrStreams === 0 &&
+        const passed = untouchedLaneOcrStreams === 0 &&
+          enableOutcome.initiallyChecked === false &&
           enableOutcome.checkedAfterSave === true &&
           enableOutcome.streamId.length > 0;
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "vehicle-ocr-enable-failed");
         return {
           passed,
           value: enableOutcome.streamId,
-          observed: `nonReservedActiveOcrStreams=${activeNonReservedOcrStreams}; ` +
+          observed: `untouchedLaneOcrStreams=${untouchedLaneOcrStreams}; ` +
+            `initiallyChecked=${enableOutcome.initiallyChecked}; ` +
             `checkedAfterSave=${enableOutcome.checkedAfterSave}; vehicleOcrStreamId=${enableOutcome.streamId || "none"}`,
           evidence,
         };
@@ -5920,6 +5938,25 @@ export class RegressionScenarios {
           };
         }
 
+        let nonReservedNewOcrObs = 0;
+        const verifyEndIso = new Date(Date.now() + 60_000).toISOString();
+        for (const dsId of nonReservedOcrStreamIds) {
+          const checkRes = await page.context().request.get(
+            this.viewerUrl(
+              `/sensorhub/api/datastreams/${encodeURIComponent(dsId)}/observations?resultTime=${encodeURIComponent(`${triggerWindowStartIso}/${verifyEndIso}`)}&limit=5`,
+            ),
+            {headers: {Accept: "application/om+json, application/json"}},
+          );
+          try {
+            if (checkRes.ok()) {
+              const checkJson = await checkRes.json() as {items?: unknown[]};
+              nonReservedNewOcrObs += (checkJson.items ?? []).length;
+            }
+          } finally {
+            await checkRes.dispose();
+          }
+        }
+
         let cropHttpStatus = 0;
         let cropContentType = "";
         let cropBytes = 0;
@@ -5963,13 +6000,15 @@ export class RegressionScenarios {
           matchesExpectedContainer(best.normalizedValue) &&
           best.confidence >= 0.5 &&
           best.readCount >= 1 &&
+          nonReservedNewOcrObs === 0 &&
           cropValid;
 
         return {
           passed,
           value: best,
           observed: `normalizedValue=${best.normalizedValue}; idType=${best.idType}; checksumValid=${best.checksumValid}; ` +
-            `confidence=${best.confidence.toFixed(3)}; readCount=${best.readCount}; crop=${best.evidenceImagePath || "none"} ` +
+            `confidence=${best.confidence.toFixed(3)}; readCount=${best.readCount}; nonReservedNewOcrObs=${nonReservedNewOcrObs}; ` +
+            `crop=${best.evidenceImagePath || "none"} ` +
             `(HTTP ${cropHttpStatus}, ${cropContentType || "no-type"}, ${cropBytes} bytes, jpegMagic=${cropJpegMagic})`,
         };
       });
