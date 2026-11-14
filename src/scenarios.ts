@@ -996,23 +996,25 @@ export class RegressionScenarios {
         expected: "opening the earliest stored alarm in Event Details and switching rows in Event Preview renders bounded charts without client-side TimeScale exceptions",
       }, async () => {
         const dsResponse = await page.context().request.get(
-          this.viewerUrl("/sensorhub/api/datastreams?observedProperty=http://sensorml.com/ont/swe/property/Occupancy&limit=200"),
+          this.viewerUrl("/sensorhub/api/datastreams?limit=1000"),
           {headers: {Accept: "application/json"}},
         );
         let earliestAlarmId = "";
         let earliestStartTime = "";
+        let hasOccupancyStreams = false;
         try {
           if (dsResponse.ok()) {
-            const dsPayload = await dsResponse.json() as {items?: Array<{id?: string}>};
+            const dsPayload = await dsResponse.json() as {items?: Array<{id?: string; outputName?: string}>};
             const occIds = (dsPayload.items ?? [])
+              .filter((item) => String(item.outputName ?? "").trim() === "occupancy")
               .map((item) => String(item.id ?? "").trim())
               .filter(Boolean)
               .slice(0, 50);
+            hasOccupancyStreams = occIds.length > 0;
             if (occIds.length > 0) {
               const obsParams = new URLSearchParams({
                 dataStream: occIds.join(","),
-                filter: "gammaAlarm=true OR neutronAlarm=true",
-                format: "application/om+json",
+                filter: "(gammaAlarm=true OR neutronAlarm=true)",
                 order: "asc",
                 limit: "1",
               });
@@ -1023,11 +1025,18 @@ export class RegressionScenarios {
               try {
                 if (obsResponse.ok()) {
                   const obsPayload = await obsResponse.json() as {
-                    items?: Array<{id?: string; result?: {startTime?: string}; properties?: {result?: {startTime?: string}}}>;
+                    items?: Array<{
+                      id?: string;
+                      phenomenonTime?: string;
+                      result?: {startTime?: string};
+                      properties?: {result?: {startTime?: string}};
+                    }>;
                   };
                   const first = obsPayload.items?.[0];
                   earliestAlarmId = String(first?.id ?? "").trim();
-                  earliestStartTime = String(first?.result?.startTime ?? first?.properties?.result?.startTime ?? "");
+                  earliestStartTime = String(
+                    first?.result?.startTime ?? first?.properties?.result?.startTime ?? first?.phenomenonTime ?? "",
+                  );
                 }
               } finally {
                 await obsResponse.dispose();
@@ -1057,6 +1066,9 @@ export class RegressionScenarios {
         await this.goto(page, "/event-log");
         await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
         const gridRows = page.locator(".MuiDataGrid-row");
+        if (hasOccupancyStreams) {
+          await gridRows.first().waitFor({timeout: 5_000}).catch(() => undefined);
+        }
         const visibleRowCount = await gridRows.count();
         let previewTransitions = 0;
         for (let idx = 0; idx < Math.min(2, visibleRowCount); idx++) {
