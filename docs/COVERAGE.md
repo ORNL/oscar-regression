@@ -29,6 +29,7 @@ oracles. A rendered control alone is not considered proof of a working workflow.
 | Alarm transfer | selected alarm JSON round-trip and SHA-256 integrity; each imported non-empty series redraws with its chart-specific dataset color; the received package downloads with the same canonical payload, integrity, transport, and UUID while export-only QR metadata may be omitted; the actual exported QR PNG uploads and imports successfully | full | local artifacts only |
 | Adjudication | Code 9 submission, confirmation, success, audit display | full | permanent audit record |
 | EML auto-adjudication | external LLNL EML plugin upload/activation in `Services -> OSCAR Service -> EML Plugin Path`, zero HTTP bucket exposure, distributed NORM gamma alarm auto-adjudicated as Code `9999` (`EML Non-Threat`) with `EML_METADATA` JSON, suppressed from Dashboard unadjudicated queue, queryable in Event Log (`Adjudicated = EML Non-Threat`), and localized threat `INVESTIGATE` alarm kept unadjudicated on Dashboard | full | permanent event/audit records + private `/var/lib/oscar/eml-plugin` state |
+| Vehicle OCR | zero `vehicleOcr` datastream overhead while disabled; per-lane `Enable Vehicle OCR` activation in SensorHub Admin; real container-transit gamma alarm recorded over RTSP, scanned asynchronously by `OnnxOcrEngine` + `Iso6346`, published on `vehicleOcr` (`checksumValid=true`) with a bounded JPEG crop in `/sensorhub/buckets/ocr/crops/`, auto-filled into Event Details `Vehicle ID` with verified ISO 6346 suggestion chip + crop preview, persisted via Code 9 adjudication, and cleanly restored to disabled (`0` `vehicleOcr` datastreams) | full | temporary `Lane50` OCR toggle + permanent event/audit/crop records |
 | Extended occupancy | a deterministic quiet occupancy lasts at least 150 seconds so OSCAR has its complete 60-second reconnect allowance and both Status of Health and Dashboard retain a 30-second observation window after the Viewer's strict one-minute threshold; both surfaces fault, then clear | full | reserved RPM only |
 | Adjudication report | one-lane PDF is generated and validated | full | report bucket write |
 | Performance | runner plus optional host/container time series and aggregates | both | read-only SSH |
@@ -87,7 +88,7 @@ These require a disposable deployment and a separate, explicit test plan.
 `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`,
 `status-of-health`, `dashboard-health`, `lane-video`, `event-filtering`, `operational-views`,
 `reporting`, `alarm-transfer`, `alarm-transfer-camera`, `rpm-connection`,
-`rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `eml-auto-adjudication`, `extended-occupancy`,
+`rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `eml-auto-adjudication`, `vehicle-ocr`, `extended-occupancy`,
 `adjudication-report`, `storage-health`, `storage-lifecycle`, and the isolated
 `storage-restore-drill` scenario selected only by `--profile restore-drill`.
 

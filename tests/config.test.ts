@@ -225,6 +225,10 @@ test("3.9.2 release certification is unfiltered and requires every release gate"
     OSCAR_EML_PLUGIN_PATH: "fixtures/oscar-50-lane-config.csv"}, () => {
     assert.throws(() => loadConfig(["--profile", "3.11.0-release"]), /must end with \.jar/);
   });
+  withEnvironment({...releaseEnvironment,
+    EXPECTED_VEHICLE_OCR_CONTAINER: "NOT_AN_ISO_CODE"}, () => {
+    assert.throws(() => loadConfig(["--profile", "smoke"]), /EXPECTED_VEHICLE_OCR_CONTAINER/);
+  });
   const tempEmlDir = mkdtempSync(join(tmpdir(), "oscar-eml-cfg-"));
   const tempEmlJar = join(tempEmlDir, "synthetic-plugin.jar");
   writeFileSync(tempEmlJar, "PK\x03\x04");
@@ -233,12 +237,22 @@ test("3.9.2 release certification is unfiltered and requires every release gate"
       OSCAR_BUILD_LABEL: "oscar-3.11.0-candidate-def456",
       EML_WORKFLOW: "required",
       OSCAR_EML_PLUGIN_PATH: tempEmlJar,
+      VEHICLE_OCR_WORKFLOW: "auto"}, () => {
+      assert.throws(() => loadConfig(["--profile", "3.11.0-release"]), /requires .* workflows/);
+    });
+    withEnvironment({...releaseEnvironment,
+      OSCAR_BUILD_LABEL: "oscar-3.11.0-candidate-def456",
+      EML_WORKFLOW: "required",
+      OSCAR_EML_PLUGIN_PATH: tempEmlJar,
+      VEHICLE_OCR_WORKFLOW: "required",
       OSCAR_BACKUP_MODE: "single",
       OSCAR_3_11_0_RESTORE_EVIDENCE_DIR: "/tmp/oscar-311-restore-evidence"}, () => {
       const config = loadConfig(["--profile", "3.11.0-release"]);
       assert.equal(config.profile, "3.11.0-release");
       assert.equal(config.emlWorkflow, "required");
       assert.equal(config.emlPluginPath, tempEmlJar);
+      assert.equal(config.vehicleOcrWorkflow, "required");
+      assert.equal(config.expectedVehicleOcrContainer, "EGHU3972694");
       assert.equal(config.releaseRestoreEvidenceDirectory, "/tmp/oscar-311-restore-evidence");
       assert.equal(requiresRemoteSuiteLease(config), true);
     });

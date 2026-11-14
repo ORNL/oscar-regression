@@ -549,7 +549,7 @@ test("storage gates require the shipped Parquet-primary policy and fresh index c
     '"speed"', '"backgroundReport"', '"foregroundReport"', '"status"',
     '"emlContextual"', '"emlScanContextual"', '"emlAnalysis"', '"dailyFile"',
     '"connectionStatus"', '"occupancyStatus"', '"tamper"', '"occupancy"',
-    '"adjudication"', '"report"', '"siteStatistics"', '"nationalSummary"',
+    '"adjudication"', '"report"', '"siteStatistics"', '"nationalSummary"', '"vehicleOcr"',
     "REGRESSION_ARCHIVE_POLICY", "PARQUET_PRIMARY_OUTPUT_NAMES",
     "genericPayloadGinAbsent", "requiredPresent === indexes.requiredCount",
     "eventPathGinExact", "numericEventIndexesExact", "assessImmutableStageHealth",
@@ -1301,7 +1301,7 @@ test("full retained-media proof self-seeds without weakening smoke fixture requi
   const policy = scenarios.slice(policyStart, policyEnd);
   assert.match(policy, /\["full", "3\.9\.2-release", "3\.11\.0-release"\]\.includes\(this\.config\.profile\)/);
   assert.match(policy, /this\.selected\("storage-lifecycle"\)/);
-  for (const producer of ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication"]) {
+  for (const producer of ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr"]) {
     assert.ok(policy.includes(`"${producer}"`), `missing retained-media producer ${producer}`);
   }
 

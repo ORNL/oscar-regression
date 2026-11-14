@@ -213,7 +213,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
-    "event-uuid", "adjudication", "eml-auto-adjudication", "extended-occupancy", "adjudication-report",
+    "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "extended-occupancy", "adjudication-report",
     "storage-health", "storage-lifecycle",
     "storage-restore-drill",
   ]);
@@ -256,6 +256,12 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   if (emlWorkflow === "required" && !emlPluginPath) {
     throw new Error("EML_WORKFLOW=required requires OSCAR_EML_PLUGIN_PATH");
   }
+  const vehicleOcrWorkflow = capabilityMode("VEHICLE_OCR_WORKFLOW", "auto");
+  const expectedVehicleOcrContainer =
+    process.env.EXPECTED_VEHICLE_OCR_CONTAINER?.trim().toUpperCase() || "EGHU3972694";
+  if (!/^(?:ANY|[A-Z]{3}[UJZR]\d{7})$/.test(expectedVehicleOcrContainer)) {
+    throw new Error("EXPECTED_VEHICLE_OCR_CONTAINER must be ANY or an 11-character ISO 6346 container code");
+  }
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
   const storageBackupMode = backupMode("OSCAR_BACKUP_MODE", "disabled");
@@ -271,9 +277,9 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     if (operationalViewWorkflow !== "required" || eventUuidWorkflow !== "required" ||
         alarmTransferCameraWorkflow !== "required" || storageWorkflow !== "required" ||
         storageBackupWorkflow !== "required" ||
-        (profile === "3.11.0-release" && emlWorkflow !== "required")) {
+        (profile === "3.11.0-release" && (emlWorkflow !== "required" || vehicleOcrWorkflow !== "required"))) {
       throw new Error(
-        `${profile} requires operational-view, UUID, camera, storage, backup${profile === "3.11.0-release" ? ", and EML" : ""} workflows to be required`,
+        `${profile} requires operational-view, UUID, camera, storage, backup${profile === "3.11.0-release" ? ", EML, and vehicle-OCR" : ""} workflows to be required`,
       );
     }
     if (!oscarBuildLabel) throw new Error(`${profile} requires OSCAR_BUILD_LABEL`);
@@ -331,6 +337,8 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     alarmTransferCameraWorkflow,
     emlWorkflow,
     ...(emlPluginPath ? {emlPluginPath} : {}),
+    vehicleOcrWorkflow,
+    expectedVehicleOcrContainer,
     storageWorkflow,
     storageExpectedRelease: "3.11.0",
     storageBackupWorkflow,
@@ -500,7 +508,7 @@ export function assertMutationAllowed(config: SuiteConfig): void {
 export function requiresRemoteSuiteLease(config: SuiteConfig): boolean {
   if (["full", "3.9.2-release", "3.11.0-release", "restore-drill"].includes(config.profile)) return true;
   if (config.scenarioFilter.size === 0) return true;
-  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication"].some(
+  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication", "vehicle-ocr"].some(
     name => config.scenarioFilter.has(name),
   )) {
     return true;

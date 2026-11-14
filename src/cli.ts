@@ -104,6 +104,7 @@ async function main(): Promise<number> {
     alarmTransferCameraWorkflow: config.alarmTransferCameraWorkflow,
     emlWorkflow: config.emlWorkflow,
     emlPluginConfigured: Boolean(config.emlPluginPath),
+    vehicleOcrWorkflow: config.vehicleOcrWorkflow,
     storageWorkflow: config.storageWorkflow,
     storageExpectedRelease: config.storageExpectedRelease,
     storageBackupWorkflow: config.storageBackupWorkflow,

@@ -285,6 +285,7 @@ const PARQUET_PRIMARY_OUTPUT_NAMES = [
   "report",
   "siteStatistics",
   "nationalSummary",
+  "vehicleOcr",
 ] as const;
 
 const REGRESSION_ARCHIVE_POLICY = {
@@ -371,7 +372,7 @@ export class RegressionScenarios {
   private fullRunCanSelfSeedRetainedMedia(): boolean {
     return ["full", "3.9.2-release", "3.11.0-release"].includes(this.config.profile) &&
       this.selected("storage-lifecycle") &&
-      ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication"].some(scenario => this.selected(scenario));
+      ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr"].some(scenario => this.selected(scenario));
   }
 
   private async check<T>(metadata: CheckMetadata, probe: () => Promise<ProbeResult<T>>): Promise<T | undefined> {
@@ -623,6 +624,7 @@ export class RegressionScenarios {
         await this.scenario("event-uuid", () => this.eventUuidWorkflow());
         await this.scenario("adjudication", () => this.adjudicationAndAlarmTransfer());
         await this.scenario("eml-auto-adjudication", () => this.emlAutoAdjudication());
+        await this.scenario("vehicle-ocr", () => this.vehicleOcr());
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([{reportType: "ADJUDICATION"}]));
         // Keep the reserved RPM's automatic occupancy/alarm generation disabled until the
@@ -1176,9 +1178,17 @@ export class RegressionScenarios {
         scenario: "sensorhub-admin", category: "admin", action: "open SensorHub Admin GUI",
         target: "/sensorhub/admin", expected: "Admin application loads with sensor/module controls",
       }, async () => {
-        const status = await this.goto(page, "/sensorhub/admin");
-        await page.waitForTimeout(2_000);
-        const body = await page.locator("body").innerText();
+        const status = await this.goto(page, "/sensorhub/admin?restartApplication");
+        const readBody = async () => page.locator("body").innerText().catch(() => "");
+        const body = await poll(
+          readBody,
+          (text) => /sensorhub|admin|module|sensor|system/i.test(text) && text.trim().length > 100 && /\bSensors\b/.test(text),
+          {
+            timeoutMs: Math.max(20_000, this.config.uiTimeoutMs),
+            intervalMs: 250,
+            description: "SensorHub Admin Vaadin UI to render module controls",
+          },
+        ).catch(readBody);
         const hasAdminContent = /sensorhub|admin|module|sensor|system/i.test(body) && body.trim().length > 100;
         const passed = status >= 200 && status < 400 && hasAdminContent;
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "sensorhub-admin-load");
@@ -1284,7 +1294,11 @@ export class RegressionScenarios {
         const states = await poll(
           connectionState,
           (value) => value.every((lane) => lane.chips.every((chip) => /·\s*Online/i.test(chip))),
-          {timeoutMs: 40_000, intervalMs: 1_000, description: "all RPM and camera connection telemetry to resolve online"},
+          {
+            timeoutMs: Math.max(60_000, this.config.uiTimeoutMs),
+            intervalMs: 1_000,
+            description: "all RPM and camera connection telemetry to resolve online",
+          },
         ).catch(connectionState);
         const connections = states.flatMap((lane) => lane.chips.map((chip) => ({laneId: lane.laneId, chip})));
         const waiting = connections.filter(({chip}) => /Waiting/i.test(chip));
@@ -5503,6 +5517,549 @@ export class RegressionScenarios {
     } finally {
       await this.emulator.replaceConfig(this.config.testRpmId, quiet).catch(error =>
         this.reporter.error("eml-auto-adjudication", "restore-quiet-config", error));
+      await page.close();
+    }
+  }
+
+  private async vehicleOcr(): Promise<void> {
+    if (!this.originalRpmConfig) throw new Error("Original RPM configuration is unavailable");
+    const adminMeta: CheckMetadata = {
+      scenario: "vehicle-ocr",
+      category: "ocr",
+      action: "enable per-lane Vehicle OCR on reserved lane in SensorHub Admin",
+      target: `${this.config.testLaneLabel} (/sensorhub/admin)`,
+      expected: "disabled lanes register zero active vehicleOcr datastreams by default; enabling Vehicle OCR on the reserved lane exposes the vehicleOcr datastream",
+    };
+    if (this.config.vehicleOcrWorkflow === "disabled") {
+      this.skip(adminMeta, "VEHICLE_OCR_WORKFLOW=disabled");
+      return;
+    }
+
+    const quiet = this.emulator.quietConfig(this.originalRpmConfig);
+    const page = await this.browser.oscarPage();
+    let ocrEnabledByScenario = false;
+
+    const findReservedLaneSystem = async (): Promise<{systemId: string; uid: string} | null> => {
+      const res = await page.context().request.get(
+        this.viewerUrl("/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500"),
+        {headers: {Accept: "application/geo+json, application/json"}},
+      );
+      try {
+        if (!res.ok()) return null;
+        const json = await res.json() as {
+          items?: Array<{
+            id?: unknown;
+            properties?: {uid?: unknown; name?: unknown};
+          }>;
+        };
+        const expectedLower = this.config.testLaneLabel.toLowerCase();
+        for (const item of json.items ?? []) {
+          const id = String(item.id ?? "").trim();
+          const uid = String(item.properties?.uid ?? "").trim();
+          const name = String(item.properties?.name ?? "").trim();
+          if (!id || !uid.includes(":lane:")) continue;
+          if (name.toLowerCase() === expectedLower || uid.toLowerCase().endsWith(`:${expectedLower}`)) {
+            return {systemId: id, uid};
+          }
+        }
+        return null;
+      } finally {
+        await res.dispose();
+      }
+    };
+
+    const listLaneOcrDatastreams = async (
+      systemId: string,
+      validTime: "now" | "latest",
+    ): Promise<Array<{id: string; outputName: string}>> => {
+      const res = await page.context().request.get(
+        this.viewerUrl(
+          `/sensorhub/api/systems/${encodeURIComponent(systemId)}/datastreams?validTime=${validTime}&limit=100`,
+        ),
+        {headers: {Accept: "application/json"}},
+      );
+      try {
+        if (!res.ok()) return [];
+        const json = await res.json() as {items?: Array<{id?: unknown; outputName?: unknown}>};
+        return (json.items ?? [])
+          .map(item => ({
+            id: String(item.id ?? "").trim(),
+            outputName: String(item.outputName ?? "").trim(),
+          }))
+          .filter(item => item.id.length > 0 && item.outputName === "vehicleOcr");
+      } finally {
+        await res.dispose();
+      }
+    };
+
+    const selectReservedLaneOcrTab = async (restartAdminApp = false): Promise<Locator | null> => {
+      await this.goto(page, restartAdminApp ? "/sensorhub/admin?restartApplication" : "/sensorhub/admin");
+      const sensorsHeader = page.locator(".v-accordion-item-caption").filter({hasText: /\bSensors\b/i}).first();
+      await sensorsHeader.waitFor({timeout: this.config.uiTimeoutMs});
+      const openAccordion = page.locator(".v-accordion-item-open").filter({hasText: /\bSensors\b/i});
+      if ((await openAccordion.count()) === 0) {
+        await sensorsHeader.click();
+      }
+      const tableBody = page.locator(".v-accordion-item-open .v-table-body").first();
+      await tableBody.waitFor({timeout: this.config.uiTimeoutMs});
+      await tableBody.evaluate((el) => { el.scrollTop = 0; });
+      await sleep(250);
+
+      const escapedLane = this.config.testLaneLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const laneCell = page.locator(".v-accordion-item-open .v-table-cell-wrapper")
+        .filter({hasText: new RegExp(`^\\s*${escapedLane}\\s*$`, "i")})
+        .first();
+      let foundLane = false;
+      for (let step = 0; step < 30; step++) {
+        if ((await laneCell.count()) > 0 && await laneCell.isVisible().catch(() => false)) {
+          foundLane = true;
+          break;
+        }
+        const reachedBottom = await tableBody.evaluate((el) => {
+          const prev = el.scrollTop;
+          el.scrollTop = prev + 480;
+          return el.scrollTop === prev;
+        });
+        await sleep(200);
+        if (reachedBottom) {
+          if ((await laneCell.count()) > 0 && await laneCell.isVisible().catch(() => false)) {
+            foundLane = true;
+          }
+          break;
+        }
+      }
+      if (!foundLane) {
+        throw new Error(`Could not locate ${this.config.testLaneLabel} in SensorHub Admin Sensors list`);
+      }
+      await laneCell.click();
+      await sleep(350);
+      await page.locator(".v-label")
+        .filter({hasText: new RegExp(`^\\s*${escapedLane}\\s*$`, "i")})
+        .first()
+        .waitFor({timeout: 10_000});
+      const ocrTab = page.locator(".v-tabsheet-tabitem").filter({hasText: /Vehicle OCR/i}).first();
+      const tabVisible = await ocrTab.waitFor({timeout: 10_000}).then(() => true).catch(() => false);
+      if (!tabVisible) return null;
+
+      const enableCheckbox = page.locator(".v-tabsheet-content .v-checkbox")
+        .filter({hasText: /Enable Vehicle OCR/i})
+        .first();
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const notif = page.locator(".v-Notification").first();
+        if (await notif.isVisible().catch(() => false)) {
+          await notif.click().catch(() => undefined);
+          await sleep(150);
+        }
+        const caption = ocrTab.locator(".v-caption").first();
+        if ((await caption.count()) > 0 && await caption.isVisible().catch(() => false)) {
+          await caption.click({timeout: 5_000}).catch(() => undefined);
+        } else {
+          const tabBox = await ocrTab.boundingBox();
+          if (tabBox) {
+            await page.mouse.click(tabBox.x + tabBox.width / 2, tabBox.y + tabBox.height / 2);
+          }
+        }
+        const checkboxVisible = await enableCheckbox.waitFor({timeout: 3_000}).then(() => true).catch(() => false);
+        if (checkboxVisible) {
+          return enableCheckbox;
+        }
+        await sleep(300);
+      }
+      return null;
+    };
+
+    const setLaneVehicleOcrEnabled = async (
+      systemId: string,
+      enabled: boolean,
+    ): Promise<{supported: boolean; checkedAfterSave: boolean | null; streamId: string}> => {
+      const enableCheckbox = await selectReservedLaneOcrTab(true);
+      if (!enableCheckbox) {
+        return {supported: false, checkedAfterSave: null, streamId: ""};
+      }
+      const input = enableCheckbox.locator('input[type="checkbox"]').first();
+      if ((await input.isChecked()) !== enabled) {
+        await enableCheckbox.locator("label").first().click();
+        await poll(
+          () => input.isChecked(),
+          checked => checked === enabled,
+          {timeoutMs: 5_000, intervalMs: 100, description: `Enable Vehicle OCR checkbox=${enabled}`},
+        );
+      }
+      if (enabled) {
+        const alarmsOnlyBox = page.locator(".v-tabsheet-content .v-checkbox")
+          .filter({hasText: /Alarms Only/i})
+          .first();
+        if ((await alarmsOnlyBox.count()) > 0) {
+          const alarmsOnlyInput = alarmsOnlyBox.locator('input[type="checkbox"]').first();
+          if (!(await alarmsOnlyInput.isChecked())) {
+            await alarmsOnlyBox.locator("label").first().click();
+          }
+        }
+      }
+
+      const notifBefore = page.locator(".v-Notification").first();
+      if (await notifBefore.isVisible().catch(() => false)) {
+        await notifBefore.click().catch(() => undefined);
+      }
+
+      const applyBtn = page.locator(".v-button").filter({hasText: /Apply Changes/i}).first();
+      await applyBtn.waitFor({timeout: this.config.uiTimeoutMs});
+      await applyBtn.click();
+
+      let streamId = "";
+      if (enabled) {
+        const streams = await poll(
+          () => listLaneOcrDatastreams(systemId, "latest"),
+          items => items.length > 0,
+          {timeoutMs: 30_000, intervalMs: 500, description: `${this.config.testLaneLabel} vehicleOcr datastream registration`},
+        );
+        streamId = streams[0]?.id ?? "";
+      } else {
+        await sleep(3_000);
+      }
+
+      const notifMid = page.locator(".v-Notification").first();
+      if (await notifMid.isVisible().catch(() => false)) {
+        await notifMid.click().catch(() => undefined);
+      }
+
+      const saveBtn = page.locator(".v-button").filter({hasText: /\bSave\b/i}).first();
+      if (await saveBtn.isVisible().catch(() => false)) {
+        await saveBtn.click();
+        const confirmYes = page.locator(".v-window .v-button").filter({hasText: /\bYes\b/i}).first();
+        await confirmYes.waitFor({timeout: 10_000});
+        await confirmYes.click();
+        await sleep(1_000);
+      }
+
+      const reloadedCheckbox = await selectReservedLaneOcrTab(true);
+      const checkedAfterSave = reloadedCheckbox
+        ? await reloadedCheckbox.locator('input[type="checkbox"]').first().isChecked()
+        : null;
+      return {supported: true, checkedAfterSave, streamId};
+    };
+
+    let laneSystem: {systemId: string; uid: string} | null = null;
+    try {
+      await this.ensureAlarmMediaBaseline("vehicle-ocr");
+      laneSystem = await findReservedLaneSystem();
+      if (!laneSystem) {
+        throw new Error(`Unable to resolve ConSys system ID for ${this.config.testLaneLabel}`);
+      }
+      const targetLaneSystem = laneSystem;
+
+      // Check global vehicleOcr datastreams on non-reserved disabled lanes (strict opt-in zero-overhead contract).
+      const allDsRes = await page.context().request.get(
+        this.viewerUrl("/sensorhub/api/datastreams?validTime=now&limit=1000"),
+        {headers: {Accept: "application/json"}},
+      );
+      let activeNonReservedOcrStreams = 0;
+      try {
+        if (allDsRes.ok()) {
+          const allDsJson = await allDsRes.json() as {
+            items?: Array<{id?: unknown; outputName?: unknown; "system@id"?: unknown; system?: {id?: unknown}}>;
+          };
+          for (const ds of allDsJson.items ?? []) {
+            if (String(ds.outputName ?? "").trim() !== "vehicleOcr") continue;
+            const sysId = String(ds["system@id"] ?? ds.system?.id ?? "").trim();
+            if (sysId && sysId !== targetLaneSystem.systemId) {
+              activeNonReservedOcrStreams++;
+            }
+          }
+        }
+      } finally {
+        await allDsRes.dispose();
+      }
+
+      const enableOutcome = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, true);
+      if (!enableOutcome.supported) {
+        if (this.config.vehicleOcrWorkflow === "auto") {
+          this.skip(adminMeta, "Vehicle OCR tab is not present on this build (auto detection)");
+        } else {
+          this.reporter.outcome(
+            adminMeta.scenario, adminMeta.category, adminMeta.action, adminMeta.target,
+            adminMeta.expected, "Vehicle OCR configuration tab is absent in SensorHub Admin", "incorrect", 0,
+            await this.screenshotOnFailure(page, "vehicle-ocr-tab-missing"),
+          );
+        }
+        return;
+      }
+      ocrEnabledByScenario = true;
+
+      const enabledCheck = await this.check(adminMeta, async () => {
+        const passed = activeNonReservedOcrStreams === 0 &&
+          enableOutcome.checkedAfterSave === true &&
+          enableOutcome.streamId.length > 0;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "vehicle-ocr-enable-failed");
+        return {
+          passed,
+          value: enableOutcome.streamId,
+          observed: `nonReservedActiveOcrStreams=${activeNonReservedOcrStreams}; ` +
+            `checkedAfterSave=${enableOutcome.checkedAfterSave}; vehicleOcrStreamId=${enableOutcome.streamId || "none"}`,
+          evidence,
+        };
+      });
+      if (!enabledCheck) return;
+
+      // Ensure the lane's RPM and camera reconnect cleanly after the LaneSystem config update, then configure a
+      // 9-second alarm window so cam_50 captures a full transit of the real container loop (7.2s).
+      await this.emulator.replaceConfig(
+        this.config.testRpmId,
+        this.emulator.shortAlarmConfig(this.originalRpmConfig, 9),
+      );
+      await this.waitHealthRpmConnection(page, "online", 60_000);
+      await sleep(2_500);
+
+      const triggerWindowStartIso = new Date(Date.now() - 5_000).toISOString();
+      const trigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+      if (!trigger) throw new Error("Container-transit gamma alarm trigger returned no occupancy identity");
+
+      const alarmRow = await this.findAlarmRow(page, /Gamma/i, trigger);
+      const eventId = await this.resolveAlarmEventUuid(
+        page,
+        alarmRow,
+        "gamma",
+        trigger.occupancyCount,
+        "vehicle-ocr",
+      );
+      if (!eventId) throw new Error("Failed to resolve occupancy UUID for container-transit gamma alarm");
+      await this.captureAlarmMedia(page, eventId, "gamma", trigger.occupancyCount, "vehicle-ocr");
+
+      const expectedContainer = this.config.expectedVehicleOcrContainer;
+      const matchesExpectedContainer = (normalizedValue: string): boolean => {
+        const clean = normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+        if (expectedContainer === "ANY") {
+          return /^[A-Z]{3}[UJZ][0-9]{7}$/.test(clean);
+        }
+        return clean === expectedContainer;
+      };
+
+      interface OcrObservationRecord {
+        id: string;
+        occupancyObsId: string;
+        idType: string;
+        value: string;
+        normalizedValue: string;
+        checksumValid: boolean;
+        confidence: number;
+        readCount: number;
+        cameraUid: string;
+        evidenceImagePath: string;
+      }
+
+      const fetchMatchingOcrObservations = async (): Promise<OcrObservationRecord[]> => {
+        const windowEndIso = new Date(Date.now() + 60_000).toISOString();
+        const params = new URLSearchParams({
+          resultTime: `${triggerWindowStartIso}/${windowEndIso}`,
+          limit: "50",
+        });
+        const res = await page.context().request.get(
+          this.viewerUrl(
+            `/sensorhub/api/datastreams/${encodeURIComponent(enabledCheck)}/observations?${params}`,
+          ),
+          {headers: {Accept: "application/om+json, application/json"}},
+        );
+        try {
+          if (!res.ok()) return [];
+          const json = await res.json() as {
+            items?: Array<{
+              id?: unknown;
+              result?: Record<string, unknown>;
+              properties?: {result?: Record<string, unknown>};
+            }>;
+          };
+          const matched: OcrObservationRecord[] = [];
+          for (const item of json.items ?? []) {
+            const r = item.result ?? item.properties?.result ?? {};
+            const obsId = String(r.occupancyObsId ?? "").trim();
+            if (obsId !== eventId) continue;
+            matched.push({
+              id: String(item.id ?? "").trim(),
+              occupancyObsId: obsId,
+              idType: String(r.idType ?? "").trim(),
+              value: String(r.value ?? "").trim(),
+              normalizedValue: String(r.normalizedValue ?? "").trim(),
+              checksumValid: Boolean(r.checksumValid),
+              confidence: Number(r.confidence ?? 0),
+              readCount: Number(r.readCount ?? 0),
+              cameraUid: String(r.cameraUid ?? "").trim(),
+              evidenceImagePath: String(r.evidenceImagePath ?? "").trim(),
+            });
+          }
+          return matched;
+        } finally {
+          await res.dispose();
+        }
+      };
+
+      const ocrCandidate = await this.check({
+        scenario: "vehicle-ocr",
+        category: "ocr",
+        action: "recognize ISO 6346 container ID and store JPEG evidence crop on alarm clip",
+        target: `${this.config.testLaneLabel}:${trigger.occupancyCount}`,
+        expected: `vehicleOcr publishes checksum-valid container candidate (${expectedContainer}) correlated to occupancy ${eventId} with a valid JPEG crop in /sensorhub/buckets/ocr/crops`,
+      }, async () => {
+        const candidates = await poll(
+          fetchMatchingOcrObservations,
+          items => items.some(c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue)),
+          {
+            timeoutMs: Math.max(this.config.eventTimeoutMs, 60_000),
+            intervalMs: 1_000,
+            description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancy ${eventId}`,
+          },
+        ).catch(() => fetchMatchingOcrObservations());
+
+        const best = candidates.find(
+          c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
+        ) ?? candidates[0];
+
+        if (!best) {
+          return {
+            passed: false,
+            observed: `0 vehicleOcr observations correlated to occupancyObsId=${eventId}`,
+          };
+        }
+
+        let cropHttpStatus = 0;
+        let cropContentType = "";
+        let cropBytes = 0;
+        let cropJpegMagic = false;
+        if (best.evidenceImagePath) {
+          const encodedPath = best.evidenceImagePath
+            .split("/")
+            .filter(Boolean)
+            .map(seg => encodeURIComponent(seg))
+            .join("/");
+          const cropRes = await page.context().request.get(
+            this.viewerUrl(`/sensorhub/buckets/${encodedPath}`),
+            {headers: {Accept: "image/jpeg"}},
+          );
+          try {
+            cropHttpStatus = cropRes.status();
+            cropContentType = (cropRes.headers()["content-type"] ?? "").toLowerCase();
+            if (cropRes.ok()) {
+              const buf = await cropRes.body();
+              cropBytes = buf.length;
+              cropJpegMagic = buf.length >= 4 &&
+                buf[0] === 0xff &&
+                buf[1] === 0xd8 &&
+                buf[buf.length - 2] === 0xff &&
+                buf[buf.length - 1] === 0xd9;
+            }
+          } finally {
+            await cropRes.dispose();
+          }
+        }
+
+        const cropValid = best.evidenceImagePath.startsWith("ocr/crops/") &&
+          cropHttpStatus === 200 &&
+          cropContentType.includes("image/jpeg") &&
+          cropBytes > 500 &&
+          cropBytes <= 2 * 1024 * 1024 &&
+          cropJpegMagic;
+
+        const passed = best.idType === "container" &&
+          best.checksumValid &&
+          matchesExpectedContainer(best.normalizedValue) &&
+          best.confidence >= 0.5 &&
+          best.readCount >= 1 &&
+          cropValid;
+
+        return {
+          passed,
+          value: best,
+          observed: `normalizedValue=${best.normalizedValue}; idType=${best.idType}; checksumValid=${best.checksumValid}; ` +
+            `confidence=${best.confidence.toFixed(3)}; readCount=${best.readCount}; crop=${best.evidenceImagePath || "none"} ` +
+            `(HTTP ${cropHttpStatus}, ${cropContentType || "no-type"}, ${cropBytes} bytes, jpegMagic=${cropJpegMagic})`,
+        };
+      });
+
+      if (ocrCandidate) {
+        const canonicalExpected = ocrCandidate.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+        const ocrNotes = `Container OCR regression ${this.reporter.runId.slice(-12)}`;
+
+        await this.check({
+          scenario: "vehicle-ocr",
+          category: "ocr",
+          action: "auto-fill Vehicle ID from OCR chip and submit adjudication on Event Details",
+          target: `/event-details?eventId=${eventId}`,
+          expected: `Event Details renders OCR suggestion chip (${canonicalExpected}), auto-fills Vehicle ID without manual typing, and persists ${canonicalExpected} in Logged Adjudications`,
+        }, async () => {
+          await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}`);
+          await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+
+          const suggestionsBox = page.getByTestId("vehicle-id-ocr-suggestions");
+          await suggestionsBox.waitFor({timeout: this.config.uiTimeoutMs});
+          const chip = page.getByTestId(`ocr-chip-${canonicalExpected}`);
+          const chipVisible = await chip.waitFor({timeout: this.config.uiTimeoutMs}).then(() => true).catch(() => false);
+
+          const vehicleInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
+          const autoFilledValue = await poll(
+            async () => (await vehicleInput.inputValue()).replace(/[^A-Z0-9]/gi, "").toUpperCase(),
+            val => val === canonicalExpected,
+            {timeoutMs: 15_000, intervalMs: 250, description: `Vehicle ID auto-fill to equal ${canonicalExpected}`},
+          ).catch(async () => (await vehicleInput.inputValue()).replace(/[^A-Z0-9]/gi, "").toUpperCase());
+
+          const evidenceShot = await this.browser.screenshot(page, "vehicle-ocr-event-details-autofill");
+
+          await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
+          await this.selectMui(page, "Secondary Inspection", "NONE");
+          await page.getByLabel("Notes").fill(ocrNotes);
+          await page.getByRole("button", {name: "Submit", exact: true}).click();
+          const confirm = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+          await confirm.waitFor({timeout: this.config.uiTimeoutMs});
+          await confirm.getByRole("button", {name: /Confirm & Submit/i}).click();
+          await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+          await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+          await page.reload({waitUntil: "domcontentloaded"});
+          await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+          const reloadedBody = await poll(
+            () => page.locator("body").innerText(),
+            text => text.includes(canonicalExpected) && text.includes(ocrNotes),
+            {timeoutMs: 30_000, intervalMs: 500, description: "OCR-adjudicated Vehicle ID and notes after reload"},
+          ).catch(() => page.locator("body").innerText());
+
+          const persisted = reloadedBody.includes(canonicalExpected) &&
+            reloadedBody.includes(ocrNotes) &&
+            /Code 9/i.test(reloadedBody);
+          const passed = chipVisible && autoFilledValue === canonicalExpected && persisted;
+          return {
+            passed,
+            observed: `chipVisible=${chipVisible}; autoFilled=${autoFilledValue}; persisted=${persisted}`,
+            evidence: evidenceShot,
+          };
+        });
+      }
+
+      // Restore Enable Vehicle OCR = false on the reserved lane and record explicit verification.
+      const disableOutcome = await this.check({
+        scenario: "vehicle-ocr",
+        category: "ocr",
+        action: "restore reserved lane Vehicle OCR to default disabled state",
+        target: `${this.config.testLaneLabel} (/sensorhub/admin)`,
+        expected: "Enable Vehicle OCR is saved back to false and reserved lane RPM reconnects online",
+      }, async () => {
+        const res = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, false);
+        ocrEnabledByScenario = false;
+        await this.emulator.replaceConfig(this.config.testRpmId, quiet);
+        await this.waitHealthRpmConnection(page, "online", 60_000);
+        const passed = res.supported && res.checkedAfterSave === false;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "vehicle-ocr-disable-failed");
+        return {
+          passed,
+          observed: `supported=${res.supported}; checkedAfterSave=${res.checkedAfterSave}; rpmOnline=true`,
+          evidence,
+        };
+      });
+      void disableOutcome;
+    } finally {
+      if (ocrEnabledByScenario && laneSystem) {
+        await setLaneVehicleOcrEnabled(laneSystem.systemId, false).catch(error =>
+          this.reporter.error("vehicle-ocr", "restore-lane-ocr-disabled", error));
+      }
+      await this.emulator.replaceConfig(this.config.testRpmId, quiet).catch(error =>
+        this.reporter.error("vehicle-ocr", "restore-quiet-config", error));
       await page.close();
     }
   }

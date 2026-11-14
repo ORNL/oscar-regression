@@ -143,11 +143,11 @@ The target must use a fresh database and the 3.9.2 Parquet-primary profile:
 `parquetPrimaryArchiveDelayMinutes=5`, `parquetPrimaryIntervalMinutes=1`,
 `maximumFuturePhenomenonSkewMinutes=5`, `maximumStagePartitionsPerCycle=8`,
 2/2/2 export/verification/deletion caps, and `deleteHotAfterArchive=true`. Its
-exact 21-output allowlist is `gammaCounts`, `gammaThreshold`, `neutronCounts`,
+exact 22-output allowlist is `gammaCounts`, `gammaThreshold`, `neutronCounts`,
 `setupGamma`, `setupNeutron`, `speed`, `backgroundReport`, `foregroundReport`,
 `status`, `emlContextual`, `emlScanContextual`, `emlAnalysis`, `dailyFile`,
 `connectionStatus`, `occupancyStatus`, `tamper`, `occupancy`, `adjudication`,
-`report`, `siteStatistics`, and `nationalSummary`; post-archive adjudication and
+`report`, `siteStatistics`, `nationalSummary`, and `vehicleOcr`; post-archive adjudication and
 re-adjudication updates on cold `occupancy` rows persist in `oscar_obs_overlay`
 while `oscar_obs_latest` and `oscar_event_locator` provide O(1) latest-row and
 event-ID resolution. Set

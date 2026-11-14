@@ -44,6 +44,8 @@ export interface SuiteConfig {
   alarmTransferCameraWorkflow: CapabilityMode;
   emlWorkflow: CapabilityMode;
   emlPluginPath?: string;
+  vehicleOcrWorkflow: CapabilityMode;
+  expectedVehicleOcrContainer: string;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.11.0";
   storageBackupWorkflow: CapabilityMode;
@@ -212,6 +214,7 @@ export interface RunMetadata {
   alarmTransferCameraWorkflow: CapabilityMode;
   emlWorkflow?: CapabilityMode;
   emlPluginConfigured?: boolean;
+  vehicleOcrWorkflow?: CapabilityMode;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.11.0";
   storageBackupWorkflow: CapabilityMode;
