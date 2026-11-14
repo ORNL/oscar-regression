@@ -987,6 +987,97 @@ export class RegressionScenarios {
           evidence,
         };
       });
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "viewer",
+        action: "verify historical Event Details chart bounds and preview transitions",
+        target: "/event-details and /event-log",
+        expected: "opening the earliest stored alarm in Event Details and switching rows in Event Preview renders bounded charts without client-side TimeScale exceptions",
+      }, async () => {
+        const dsResponse = await page.context().request.get(
+          this.viewerUrl("/sensorhub/api/datastreams?observedProperty=http://sensorml.com/ont/swe/property/Occupancy&limit=200"),
+          {headers: {Accept: "application/json"}},
+        );
+        let earliestAlarmId = "";
+        let earliestStartTime = "";
+        try {
+          if (dsResponse.ok()) {
+            const dsPayload = await dsResponse.json() as {items?: Array<{id?: string}>};
+            const occIds = (dsPayload.items ?? [])
+              .map((item) => String(item.id ?? "").trim())
+              .filter(Boolean)
+              .slice(0, 50);
+            if (occIds.length > 0) {
+              const obsParams = new URLSearchParams({
+                dataStream: occIds.join(","),
+                filter: "gammaAlarm=true OR neutronAlarm=true",
+                format: "application/om+json",
+                order: "asc",
+                limit: "1",
+              });
+              const obsResponse = await page.context().request.get(
+                this.viewerUrl(`/sensorhub/api/observations?${obsParams}`),
+                {headers: {Accept: "application/om+json"}},
+              );
+              try {
+                if (obsResponse.ok()) {
+                  const obsPayload = await obsResponse.json() as {
+                    items?: Array<{id?: string; result?: {startTime?: string}; properties?: {result?: {startTime?: string}}}>;
+                  };
+                  const first = obsPayload.items?.[0];
+                  earliestAlarmId = String(first?.id ?? "").trim();
+                  earliestStartTime = String(first?.result?.startTime ?? first?.properties?.result?.startTime ?? "");
+                }
+              } finally {
+                await obsResponse.dispose();
+              }
+            }
+          }
+        } finally {
+          await dsResponse.dispose();
+        }
+
+        let detailsVerified = true;
+        if (earliestAlarmId) {
+          await this.goto(page, `/event-details?eventId=${encodeURIComponent(earliestAlarmId)}`);
+          const uuidVisible = await page.getByTestId("event-uuid-value")
+            .waitFor({timeout: this.config.eventTimeoutMs})
+            .then(() => true)
+            .catch(() => false);
+          const canvasVisible = await page.locator("div.chart-view-event-detail canvas").first()
+            .waitFor({timeout: this.config.uiTimeoutMs})
+            .then(() => true)
+            .catch(() => false);
+          await page.waitForTimeout(1_500);
+          const bodyText = await page.locator("body").innerText();
+          detailsVerified = uuidVisible && canvasVisible && !/application error|internal server error/i.test(bodyText);
+        }
+
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+        const gridRows = page.locator(".MuiDataGrid-row");
+        const visibleRowCount = await gridRows.count();
+        let previewTransitions = 0;
+        for (let idx = 0; idx < Math.min(2, visibleRowCount); idx++) {
+          const targetCell = gridRows.nth(idx).locator('[data-field="laneId"]').first();
+          if (await targetCell.isVisible().catch(() => false)) {
+            await targetCell.click();
+            await page.waitForTimeout(400);
+            previewTransitions++;
+          }
+        }
+        const postPreviewBody = await page.locator("body").innerText();
+        const previewClean = !/application error|internal server error/i.test(postPreviewBody);
+        const passed = detailsVerified && previewClean;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "historical-event-details-preview-failed");
+        return {
+          passed,
+          observed: `earliestAlarmId=${earliestAlarmId || "none"}(${earliestStartTime || "n/a"}); ` +
+            `detailsVerified=${detailsVerified}; previewTransitions=${previewTransitions}; previewClean=${previewClean}`,
+          evidence,
+        };
+      });
     } finally { await page.close(); }
   }
 
