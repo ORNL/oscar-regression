@@ -2579,6 +2579,109 @@ export class RegressionScenarios {
           evidence: passed ? "" : await this.screenshotOnFailure(page, "vehicle-search-correlation-failed"),
         };
       });
+
+      await this.check({
+        scenario: "event-filtering",
+        category: "performance",
+        action: "rapid Dashboard next-page burst and deep-offset slice parity without HTTP 500 or health timeouts",
+        target: "Dashboard Active Alarms pagination and /sensorhub/api/observations",
+        expected: "rapid next-page clicking debounces intermediate page fetches with bounded limit<=30, zero HTTP 5xx responses, zero health snapshot timeouts, and exact offset slice parity",
+      }, async () => {
+        const obs5xxUrls: string[] = [];
+        const healthTimeoutLogs: string[] = [];
+        const paginatedRowLimits: number[] = [];
+
+        const onResponse = (resp: import("playwright").Response) => {
+          const url = resp.url();
+          if (!url.includes("/sensorhub/api/observations")) return;
+          if (resp.status() >= 500) {
+            obs5xxUrls.push(`${resp.status()} ${url}`);
+          }
+          if (!url.includes("/observations/count")) {
+            try {
+              const parsedUrl = new URL(url);
+              const off = Number(parsedUrl.searchParams.get("offset") ?? "0");
+              const lim = Number(parsedUrl.searchParams.get("limit") ?? "0");
+              if (off > 0 && Number.isFinite(lim) && lim > 0) {
+                paginatedRowLimits.push(lim);
+              }
+            } catch {
+              // ignore malformed URL
+            }
+          }
+        };
+        const onConsole = (msg: import("playwright").ConsoleMessage) => {
+          const text = msg.text();
+          if (/Health snapshot timed out/i.test(text)) {
+            healthTimeoutLogs.push(text);
+          }
+        };
+
+        page.on("response", onResponse);
+        page.on("console", onConsole);
+        try {
+          const sourcePromise = this.waitForEventObservationPage(page, "dashboard-alarms");
+          await this.goto(page, "/");
+          await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+          const initialObsResp = await sourcePromise;
+
+          const window15dBtn = page.getByRole("button", {name: /^15d$/i}).first();
+          if ((await window15dBtn.count()) > 0 && await window15dBtn.isVisible().catch(() => false)) {
+            await window15dBtn.click().catch(() => undefined);
+            await sleep(400);
+          }
+
+          const nextBtn = page.locator('button[aria-label="Go to next page"]').first();
+          let clicks = 0;
+          for (let i = 0; i < 25; i += 1) {
+            const enabled = await nextBtn.isEnabled().catch(() => false);
+            if (!enabled) break;
+            await nextBtn.click({delay: 5}).catch(() => undefined);
+            clicks += 1;
+          }
+          await sleep(1_500);
+
+          // Also verify direct ConSys server-side offset/limit slice parity against offset=0.
+          const parityBaseUrl = new URL(initialObsResp.url());
+          parityBaseUrl.searchParams.set("offset", "0");
+          parityBaseUrl.searchParams.set("limit", "30");
+          const sliceUrl = new URL(parityBaseUrl.toString());
+          sliceUrl.searchParams.set("offset", "15");
+          sliceUrl.searchParams.set("limit", "15");
+
+          const [headRes, sliceRes] = await Promise.all([
+            page.evaluate(boundedFetch, {url: parityBaseUrl.toString(), maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES, decodeImage: false}),
+            page.evaluate(boundedFetch, {url: sliceUrl.toString(), maxBytes: ADVANCED_DATE_FILTER_MAX_BYTES, decodeImage: false}),
+          ]);
+          const headItems = headRes.ok
+            ? ((parseBoundedEventApiJson(headRes, "pagination parity offset=0") as {items?: Array<{id?: unknown}>})?.items ?? [])
+            : [];
+          const sliceItems = sliceRes.ok
+            ? ((parseBoundedEventApiJson(sliceRes, "pagination parity offset=15") as {items?: Array<{id?: unknown}>})?.items ?? [])
+            : [];
+          const expectedSliceIds = headItems.slice(15, 30).map(item => String(item.id ?? ""));
+          const actualSliceIds = sliceItems.map(item => String(item.id ?? ""));
+          const sliceParity = headRes.status === 200 &&
+            sliceRes.status === 200 &&
+            expectedSliceIds.length === actualSliceIds.length &&
+            expectedSliceIds.every((id, idx) => id === actualSliceIds[idx]);
+
+          const maxLimit = paginatedRowLimits.length > 0 ? Math.max(...paginatedRowLimits) : 15;
+          const passed = obs5xxUrls.length === 0 &&
+            healthTimeoutLogs.length === 0 &&
+            maxLimit <= 30 &&
+            sliceParity;
+          return {
+            passed,
+            observed: `nextClicks=${clicks}; obs5xx=${obs5xxUrls.length}; healthTimeouts=${healthTimeoutLogs.length}; ` +
+              `maxPaginatedLimit=${maxLimit}; sliceParity=${sliceParity} (sliceItems=${actualSliceIds.length})`,
+            evidence: passed ? "" : await this.screenshotOnFailure(page, "dashboard-rapid-pagination-failed"),
+          };
+        } finally {
+          page.off("response", onResponse);
+          page.off("console", onConsole);
+        }
+      });
     } finally { await page.close(); }
   }
 
@@ -2908,9 +3011,12 @@ export class RegressionScenarios {
     const expectedEvent = reportType === "EVENT"
       ? text.includes(`Event Type: ${eventType}`)
       : true;
-    if (parsed.total < 1 || text.length < 80 || !text.includes(expectedTitle) || !expectedLane || !expectedEvent) {
+    const noRawSystemUrns = reportType === "VEHICLE_INCIDENT"
+      ? !/urn:osh:system:/i.test(text)
+      : true;
+    if (parsed.total < 1 || text.length < 80 || !text.includes(expectedTitle) || !expectedLane || !expectedEvent || !noRawSystemUrns) {
       throw new Error(
-        `${reportType} PDF semantic validation failed: pages=${parsed.total}; title=${text.includes(expectedTitle)}; lane=${expectedLane}; event=${expectedEvent}`,
+        `${reportType} PDF semantic validation failed: pages=${parsed.total}; title=${text.includes(expectedTitle)}; lane=${expectedLane}; event=${expectedEvent}; noRawSystemUrns=${noRawSystemUrns}`,
       );
     }
     const qualifier = eventType ? `-${eventType.toLowerCase()}` : "";
@@ -6495,6 +6601,7 @@ export class RegressionScenarios {
 
           // Load radiation traces inside comparison dialog
           const loadTracesBtn = compDialog.getByTestId("vehicle-load-profiles-btn");
+          await loadTracesBtn.scrollIntoViewIfNeeded().catch(() => {});
           if (await loadTracesBtn.isVisible().catch(() => false)) {
             await loadTracesBtn.click();
           }
@@ -6587,7 +6694,22 @@ export class RegressionScenarios {
               }
               const buf = await dlRes.body();
               exportSizes[fmt] = buf.length;
-              if (fmt === "PDF" && buf.subarray(0, 4).toString() !== "%PDF") allFormatsValid = false;
+              if (fmt === "PDF") {
+                if (buf.subarray(0, 4).toString() !== "%PDF") {
+                  allFormatsValid = false;
+                } else {
+                  const pdfParser = new PDFParse({data: buf});
+                  try {
+                    const pdfParsed = await pdfParser.getText();
+                    const pdfTxt = pdfParsed.text.replaceAll(/\s+/g, " ");
+                    if (!pdfTxt.includes("Vehicle Incident Report") || /urn:osh:system:/i.test(pdfTxt)) {
+                      allFormatsValid = false;
+                    }
+                  } finally {
+                    await pdfParser.destroy();
+                  }
+                }
+              }
               if (fmt === "XLSX" && (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b)) allFormatsValid = false;
               if (fmt === "CSV") {
                 const csvTxt = buf.toString("utf8");
