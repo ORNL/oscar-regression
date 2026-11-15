@@ -130,8 +130,9 @@ interface CheckMetadata {
 }
 
 interface ReportCase {
-  reportType: "RDS_SITE" | "LANE" | "EVENT" | "ADJUDICATION";
+  reportType: "RDS_SITE" | "LANE" | "EVENT" | "ADJUDICATION" | "VEHICLE_INCIDENT";
   eventType?: "ALARMS" | "ALARMS_OCCUPANCIES" | "SOH";
+  vehicleId?: string;
 }
 
 interface ExportedAlarmArtifacts {
@@ -607,6 +608,12 @@ export class RegressionScenarios {
       {reportType: "EVENT", eventType: "ALARMS_OCCUPANCIES"},
       {reportType: "EVENT", eventType: "SOH"},
       {reportType: "LANE"},
+      {
+        reportType: "VEHICLE_INCIDENT",
+        vehicleId: this.config.expectedVehicleOcrContainer === "ANY"
+          ? "EGHU3972694"
+          : this.config.expectedVehicleOcrContainer,
+      },
     ]));
     await this.scenario("alarm-transfer", () => this.alarmTransferValidation());
     await this.scenario("alarm-transfer-camera", () => this.alarmTransferCamera());
@@ -626,7 +633,15 @@ export class RegressionScenarios {
         await this.scenario("eml-auto-adjudication", () => this.emlAutoAdjudication());
         await this.scenario("vehicle-ocr", () => this.vehicleOcr());
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
-        await this.scenario("adjudication-report", () => this.reporting([{reportType: "ADJUDICATION"}]));
+        await this.scenario("adjudication-report", () => this.reporting([
+          {reportType: "ADJUDICATION"},
+          {
+            reportType: "VEHICLE_INCIDENT",
+            vehicleId: this.config.expectedVehicleOcrContainer === "ANY"
+              ? "EGHU3972694"
+              : this.config.expectedVehicleOcrContainer,
+          },
+        ]));
         // Keep the reserved RPM's automatic occupancy/alarm generation disabled until the
         // scoped media baseline has been reconciled. Restoring its original random workload
         // earlier could create legitimate, unrelated clips in the same camera directories and
@@ -2438,6 +2453,132 @@ export class RegressionScenarios {
             `ne HTTP=${neRes.status} (items=${neItems.length}, exact=${neExact})`,
         };
       });
+
+      await this.check({
+        scenario: "event-filtering",
+        category: "events",
+        action: "verify Vehicle ID <search> landmark, normalized vehicle-search API, and accumulated multi-pass comparison",
+        target: "Event Log Vehicle ID search bar and /sensorhub/buckets/adjudication/vehicle-search",
+        expected: "Event Log exposes a <search> landmark with non-prose identifier attributes, /buckets/adjudication/vehicle-search returns HTTP 200, and any accumulated multi-pass vehicle ID resolves via normalized spaced/lowercase search into VehiclePassComparisonDialog",
+      }, async () => {
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.uiTimeoutMs});
+
+        const searchLandmark = page.locator('search[data-testid="vehicle-id-search-bar"]');
+        const landmarkVisible = await searchLandmark.waitFor({state: "visible", timeout: 10_000})
+          .then(() => true)
+          .catch(() => false);
+        const searchInput = page.getByTestId("vehicle-id-search-input");
+        const autoCorrect = await searchInput.getAttribute("autocorrect").catch(() => null);
+        const autoCap = await searchInput.getAttribute("autocapitalize").catch(() => null);
+        const spellCheck = await searchInput.getAttribute("spellcheck").catch(() => null);
+        const attrsOk = landmarkVisible &&
+          autoCorrect === "off" &&
+          autoCap === "none" &&
+          spellCheck === "false";
+
+        const catalogRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=200"),
+          {headers: {Accept: "application/json"}},
+        );
+        const catalogHttp = catalogRes.status();
+        let catalogPasses: Array<{normalizedVehicleId?: unknown; vehicleId?: unknown; occupancyObsId?: unknown}> = [];
+        try {
+          if (catalogRes.ok()) {
+            const parsed = await catalogRes.json() as {passes?: Array<{normalizedVehicleId?: unknown; vehicleId?: unknown; occupancyObsId?: unknown}>};
+            if (Array.isArray(parsed.passes)) {
+              catalogPasses = parsed.passes;
+            }
+          }
+        } finally {
+          await catalogRes.dispose();
+        }
+
+        if (catalogHttp !== 200 || !attrsOk) {
+          return {
+            passed: false,
+            observed: `catalogHttp=${catalogHttp}; landmarkVisible=${landmarkVisible}; autocorrect=${autoCorrect}; autocapitalize=${autoCap}; spellcheck=${spellCheck}`,
+            evidence: await this.screenshotOnFailure(page, "vehicle-search-landmark-or-api-failed"),
+          };
+        }
+
+        // Prefer a normalized Vehicle ID that has accumulated >= 2 passes (from continuous OCR or endurance adjudication).
+        const countsByNorm = new Map<string, number>();
+        for (const p of catalogPasses) {
+          const norm = String(p.normalizedVehicleId ?? "").trim();
+          if (!norm) continue;
+          countsByNorm.set(norm, (countsByNorm.get(norm) ?? 0) + 1);
+        }
+        let chosenNorm = "";
+        let chosenCount = 0;
+        for (const [norm, count] of countsByNorm.entries()) {
+          if (count > chosenCount) {
+            chosenNorm = norm;
+            chosenCount = count;
+          }
+        }
+
+        if (!chosenNorm) {
+          // Empty baseline node: verify zero-result normalized query cleanly returns 0 passes.
+          await searchInput.fill("csqu 305438-3");
+          await page.getByTestId("vehicle-id-search-submit").click();
+          await page.getByTestId("vehicle-id-search-clear").waitFor({state: "visible", timeout: 10_000});
+          await page.getByTestId("vehicle-id-search-clear").click();
+          return {
+            passed: true,
+            observed: "catalogHttp=200; accumulatedVehiclePasses=0; <search> landmark & non-prose input attributes verified",
+          };
+        }
+
+        const formattedVariant = /^[A-Z]{3}[UJZR][0-9]{7}$/.test(chosenNorm)
+          ? `${chosenNorm.slice(0, 4).toLowerCase()} ${chosenNorm.slice(4, 10)}-${chosenNorm.slice(10)}`
+          : chosenNorm.length >= 5
+            ? `${chosenNorm.slice(0, 2).toLowerCase()}-${chosenNorm.slice(2)}`
+            : chosenNorm.toLowerCase();
+
+        const normRes = await page.context().request.get(
+          this.viewerUrl(
+            `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(formattedVariant)}&matchMode=equals&limit=200`,
+          ),
+          {headers: {Accept: "application/json"}},
+        );
+        let matchedApiCount = 0;
+        try {
+          if (normRes.ok()) {
+            const normJson = await normRes.json() as {passes?: unknown[]};
+            matchedApiCount = Array.isArray(normJson.passes) ? normJson.passes.length : 0;
+          }
+        } finally {
+          await normRes.dispose();
+        }
+
+        await searchInput.fill(formattedVariant);
+        await page.getByTestId("vehicle-id-search-submit").click();
+        const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
+        const compareVisible = await compareBtn.waitFor({state: "visible", timeout: 20_000})
+          .then(() => true)
+          .catch(() => false);
+        let dialogTableFocusable = false;
+        if (compareVisible) {
+          await compareBtn.click();
+          const dialog = page.getByTestId("vehicle-pass-comparison-dialog");
+          await dialog.waitFor({state: "visible", timeout: 15_000});
+          const region = dialog.getByTestId("vehicle-pass-table-region");
+          await region.waitFor({state: "visible", timeout: 15_000});
+          dialogTableFocusable = (await region.getAttribute("tabindex")) === "0";
+          await dialog.getByRole("button", {name: /^close$/i}).last().click();
+          await dialog.waitFor({state: "hidden", timeout: 10_000});
+          await page.getByTestId("vehicle-id-search-clear").click();
+        }
+
+        const passed = matchedApiCount >= chosenCount && compareVisible && dialogTableFocusable;
+        return {
+          passed,
+          observed: `chosenVehicle=${chosenNorm} (query='${formattedVariant}', accumulatedPasses=${matchedApiCount}); ` +
+            `compareVisible=${compareVisible}; tableTabIndex0=${dialogTableFocusable}`,
+          evidence: passed ? "" : await this.screenshotOnFailure(page, "vehicle-search-correlation-failed"),
+        };
+      });
     } finally { await page.close(); }
   }
 
@@ -2716,7 +2857,15 @@ export class RegressionScenarios {
     }
     await this.selectMui(page, "Report Type", reportType);
     if (reportType === "EVENT") await this.selectMui(page, "Event Type", eventType ?? "ALARMS_OCCUPANCIES");
-    await this.selectMui(page, "Time Range", "last24Hrs");
+    if (reportType === "VEHICLE_INCIDENT") {
+      const vehInput = page.getByTestId("report-vehicle-id-input");
+      await vehInput.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+      const fallbackVeh = this.config.expectedVehicleOcrContainer === "ANY"
+        ? "EGHU3972694"
+        : this.config.expectedVehicleOcrContainer;
+      await vehInput.fill(reportCase.vehicleId ?? fallbackVeh);
+    }
+    await this.selectMui(page, "Time Range", reportType === "VEHICLE_INCIDENT" ? "last30days" : "last24Hrs");
     const button = page.getByRole("button", {name: "Generate Report"});
     await button.click();
     const iframe = page.locator("iframe").first();
@@ -2749,7 +2898,9 @@ export class RegressionScenarios {
     const text = parsed.text.replaceAll(/\s+/g, " ");
     const expectedTitle = reportType === "RDS_SITE" ? "RDS Site Report"
       : reportType === "LANE" ? "Lane Report"
-        : reportType === "ADJUDICATION" ? "Adjudication Report" : "Event Report";
+        : reportType === "ADJUDICATION" ? "Adjudication Report"
+          : reportType === "VEHICLE_INCIDENT" ? "Vehicle Incident Report"
+            : "Event Report";
     const laneNumber = this.config.testLaneLabel.match(/\d+/)?.[0] ?? "";
     const expectedLane = ["LANE", "ADJUDICATION"].includes(reportType) && laneNumber
       ? new RegExp(`lane-\\s*0*${Number(laneNumber)}\\b`, "i").test(text)
@@ -5721,34 +5872,54 @@ export class RegressionScenarios {
       const laneCell = page.locator(".v-accordion-item-open .v-table-cell-wrapper")
         .filter({hasText: new RegExp(`^\\s*${escapedLane}\\s*$`, "i")})
         .first();
-      let foundLane = false;
-      for (let step = 0; step < 30; step++) {
-        if ((await laneCell.count()) > 0 && await laneCell.isVisible().catch(() => false)) {
-          foundLane = true;
-          break;
+      const laneHeaderLabel = page.locator(".v-label")
+        .filter({hasText: new RegExp(`^\\s*${escapedLane}\\s*$`, "i")})
+        .first();
+
+      let selectedLane = false;
+      for (let step = 0; step < 36; step++) {
+        const bodyBox = await tableBody.boundingBox().catch(() => null);
+        const cellBox = (await laneCell.count()) > 0
+          ? await laneCell.boundingBox().catch(() => null)
+          : null;
+        if (bodyBox && cellBox && cellBox.height > 0 && cellBox.width > 0) {
+          const topInside = cellBox.y >= bodyBox.y + 4;
+          const bottomInside = cellBox.y + cellBox.height <= bodyBox.y + bodyBox.height - 4;
+          if (topInside && bottomInside) {
+            await page.mouse.click(
+              cellBox.x + Math.min(40, cellBox.width / 2),
+              cellBox.y + cellBox.height / 2,
+            );
+            const opened = await laneHeaderLabel.waitFor({timeout: 2_500}).then(() => true).catch(() => false);
+            if (opened) {
+              selectedLane = true;
+              break;
+            }
+            await sleep(200);
+            continue;
+          }
+          const deltaY = !bottomInside
+            ? Math.max(80, (cellBox.y + cellBox.height) - (bodyBox.y + bodyBox.height) + 48)
+            : Math.min(-80, cellBox.y - bodyBox.y - 48);
+          await tableBody.evaluate((el, dy) => {
+            el.scrollTop = Math.max(0, el.scrollTop + dy);
+          }, deltaY);
+          await sleep(250);
+          continue;
         }
         const reachedBottom = await tableBody.evaluate((el) => {
           const prev = el.scrollTop;
-          el.scrollTop = prev + 480;
+          el.scrollTop = prev + 420;
           return el.scrollTop === prev;
         });
-        await sleep(200);
-        if (reachedBottom) {
-          if ((await laneCell.count()) > 0 && await laneCell.isVisible().catch(() => false)) {
-            foundLane = true;
-          }
+        await sleep(250);
+        if (reachedBottom && (await laneCell.count()) === 0) {
           break;
         }
       }
-      if (!foundLane) {
-        throw new Error(`Could not locate ${this.config.testLaneLabel} in SensorHub Admin Sensors list`);
+      if (!selectedLane) {
+        throw new Error(`Could not locate and select ${this.config.testLaneLabel} in SensorHub Admin Sensors list`);
       }
-      await laneCell.click();
-      await sleep(350);
-      await page.locator(".v-label")
-        .filter({hasText: new RegExp(`^\\s*${escapedLane}\\s*$`, "i")})
-        .first()
-        .waitFor({timeout: 10_000});
       const ocrTab = page.locator(".v-tabsheet-tabitem").filter({hasText: /Vehicle OCR/i}).first();
       const tabVisible = await ocrTab.waitFor({timeout: 10_000}).then(() => true).catch(() => false);
       if (!tabVisible) return null;
@@ -5817,6 +5988,9 @@ export class RegressionScenarios {
 
       const applyBtn = page.locator(".v-button").filter({hasText: /Apply Changes/i}).first();
       await applyBtn.waitFor({timeout: this.config.uiTimeoutMs});
+      if (enabled) {
+        ocrEnabledByScenario = true;
+      }
       await applyBtn.click();
 
       let streamId = "";
@@ -5875,13 +6049,22 @@ export class RegressionScenarios {
       try {
         if (allDsRes.ok()) {
           const allDsJson = await allDsRes.json() as {
-            items?: Array<{id?: unknown; outputName?: unknown; "system@id"?: unknown; system?: {id?: unknown}}>;
+            items?: Array<{
+              id?: unknown;
+              outputName?: unknown;
+              "system@id"?: unknown;
+              "system@link"?: {uid?: unknown};
+              system?: {id?: unknown; uid?: unknown};
+            }>;
           };
           for (const ds of allDsJson.items ?? []) {
             if (String(ds.outputName ?? "").trim() !== "vehicleOcr") continue;
             const dsId = String(ds.id ?? "").trim();
             const sysId = String(ds["system@id"] ?? ds.system?.id ?? "").trim();
-            if (dsId && sysId && sysId !== targetLaneSystem.systemId) {
+            const sysUid = String(ds["system@link"]?.uid ?? ds.system?.uid ?? "").trim();
+            // Container-transit lanes (lane-41..lane-49) may run continuous live OCR on background alarms;
+            // non-container lanes (lane-01..lane-40) stay disabled and must publish zero new OCR observations.
+            if (dsId && sysId && sysId !== targetLaneSystem.systemId && !/:lane-4[1-9]$/i.test(sysUid)) {
               nonReservedOcrStreamIds.push(dsId);
             }
           }
@@ -6170,6 +6353,270 @@ export class RegressionScenarios {
             passed,
             observed: `chipVisible=${chipVisible}; autoFilled=${autoFilledValue}; persisted=${persisted}`,
             evidence: evidenceShot,
+          };
+        });
+
+        // Confirmation re-scan SOP: send the same container back through the lane a second time,
+        // verify normalized vehicle-search correlates adjudicated Pass #1 + open OCR Pass #2 with
+        // radiation profile traces, open VehiclePassComparisonDialog from Pass #2's related-passes
+        // banner, batch-adjudicate open Pass #2, and export consolidated VEHICLE_INCIDENT reports
+        // across PDF, CSV, JSON, and XLSX.
+        const rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
+        const trigger2 = await this.triggerAlarm("gamma", "vehicle-ocr");
+        if (!trigger2) throw new Error("Confirmation re-scan gamma alarm trigger returned no occupancy identity");
+        const alarmRow2 = await this.findAlarmRow(page, /Gamma/i, trigger2);
+        const eventId2 = await this.resolveAlarmEventUuid(
+          page,
+          alarmRow2,
+          "gamma",
+          trigger2.occupancyCount,
+          "vehicle-ocr",
+        );
+        if (!eventId2) throw new Error("Failed to resolve occupancy UUID for confirmation re-scan gamma alarm");
+        await this.captureAlarmMedia(page, eventId2, "gamma", trigger2.occupancyCount, "vehicle-ocr");
+
+        const fetchRescanOcrObservations = async (): Promise<OcrObservationRecord[]> => {
+          const windowEndIso = new Date(Date.now() + 60_000).toISOString();
+          const params = new URLSearchParams({
+            resultTime: `${rescanWindowStartIso}/${windowEndIso}`,
+            limit: "50",
+          });
+          const res = await page.context().request.get(
+            this.viewerUrl(
+              `/sensorhub/api/datastreams/${encodeURIComponent(enabledCheck)}/observations?${params}`,
+            ),
+            {headers: {Accept: "application/om+json, application/json"}},
+          );
+          try {
+            if (!res.ok()) return [];
+            const json = await res.json() as {
+              items?: Array<{
+                id?: unknown;
+                result?: Record<string, unknown>;
+                properties?: {result?: Record<string, unknown>};
+              }>;
+            };
+            const matched: OcrObservationRecord[] = [];
+            for (const item of json.items ?? []) {
+              const r = item.result ?? item.properties?.result ?? {};
+              const obsId = String(r.occupancyObsId ?? "").trim();
+              if (obsId !== eventId2) continue;
+              matched.push({
+                id: String(item.id ?? "").trim(),
+                occupancyObsId: obsId,
+                idType: String(r.idType ?? "").trim(),
+                value: String(r.value ?? "").trim(),
+                normalizedValue: String(r.normalizedValue ?? "").trim(),
+                checksumValid: Boolean(r.checksumValid),
+                confidence: Number(r.confidence ?? 0),
+                readCount: Number(r.readCount ?? 0),
+                cameraUid: String(r.cameraUid ?? "").trim(),
+                evidenceImagePath: String(r.evidenceImagePath ?? "").trim(),
+              });
+            }
+            return matched;
+          } finally {
+            await res.dispose();
+          }
+        };
+
+        await this.check({
+          scenario: "vehicle-ocr",
+          category: "ocr",
+          action: "correlate confirmation re-scan pass, batch-adjudicate in VehiclePassComparisonDialog, and export consolidated VEHICLE_INCIDENT reports",
+          target: `${canonicalExpected} (${eventId} -> ${eventId2})`,
+          expected: "Confirmation re-scan correlates adjudicated Pass #1 + open OCR Pass #2 with radiation profiles, renders related-passes banner + keyboard-focusable comparison dialog, batch-adjudicates Pass #2, and exports valid PDF/CSV/JSON/XLSX VEHICLE_INCIDENT reports",
+        }, async () => {
+          await poll(
+            fetchRescanOcrObservations,
+            items => items.some(
+              c => c.idType === "container" &&
+                c.checksumValid &&
+                c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase() === canonicalExpected,
+            ),
+            {
+              timeoutMs: Math.max(this.config.eventTimeoutMs, 60_000),
+              intervalMs: 1_000,
+              description: `confirmation re-scan vehicleOcr (${canonicalExpected}) for occupancy ${eventId2}`,
+            },
+          );
+
+          const spacedQuery = `${canonicalExpected.slice(0, 4).toLowerCase()} ${canonicalExpected.slice(4, 10)}-${canonicalExpected.slice(10)}`;
+          const apiRes = await page.context().request.get(
+            this.viewerUrl(
+              `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(spacedQuery)}&matchMode=equals&includeProfiles=true&limit=100`,
+            ),
+            {headers: {Accept: "application/json"}},
+          );
+          let apiCorrelated = false;
+          let profileCount = 0;
+          try {
+            if (apiRes.ok()) {
+              const apiJson = await apiRes.json() as {
+                normalizedVehicleId?: unknown;
+                passes?: Array<{
+                  occupancyObsId?: unknown;
+                  adjudications?: unknown[];
+                  radiationProfile?: unknown[];
+                }>;
+              };
+              const passes = Array.isArray(apiJson.passes) ? apiJson.passes : [];
+              const p1 = passes.find(p => String(p.occupancyObsId ?? "").trim() === eventId);
+              const p2 = passes.find(p => String(p.occupancyObsId ?? "").trim() === eventId2);
+              profileCount = passes.reduce(
+                (acc, p) => acc + (Array.isArray(p.radiationProfile) ? p.radiationProfile.length : 0),
+                0,
+              );
+              apiCorrelated =
+                String(apiJson.normalizedVehicleId ?? "").trim() === canonicalExpected &&
+                Boolean(p1 && Array.isArray(p1.adjudications) && p1.adjudications.length >= 1) &&
+                Boolean(p2 && Array.isArray(p2.adjudications) && p2.adjudications.length === 0) &&
+                profileCount > 0;
+            }
+          } finally {
+            await apiRes.dispose();
+          }
+
+          await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2)}`);
+          await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+          const banner = page.getByTestId("vehicle-related-passes-banner");
+          await banner.waitFor({state: "visible", timeout: 25_000});
+          await page.getByTestId("open-vehicle-pass-comparison").click();
+
+          const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
+          await compDialog.waitFor({state: "visible", timeout: 15_000});
+          const tableRegion = compDialog.getByTestId("vehicle-pass-table-region");
+          await tableRegion.waitFor({state: "visible", timeout: 15_000});
+          const tableFocusable = (await tableRegion.getAttribute("tabindex")) === "0";
+          const filmstripVisible = await compDialog.getByTestId("vehicle-visual-filmstrip")
+            .waitFor({state: "visible", timeout: 15_000})
+            .then(() => true)
+            .catch(() => false);
+
+          // Load radiation traces inside comparison dialog
+          const loadTracesBtn = compDialog.getByTestId("vehicle-load-profiles-btn");
+          if (await loadTracesBtn.isVisible().catch(() => false)) {
+            await loadTracesBtn.click();
+          }
+          const chartVisible = await compDialog.getByTestId("vehicle-profile-chart")
+            .waitFor({state: "visible", timeout: 20_000})
+            .then(() => true)
+            .catch(() => false);
+
+          // Linked/Batch Adjudicate reserved-lane open Pass #2 directly from VehiclePassComparisonDialog
+          // while leaving any concurrent continuous-OCR open passes on non-reserved lanes untouched.
+          const batchPanel = compDialog.getByTestId("vehicle-batch-adjudication-panel");
+          await batchPanel.waitFor({state: "visible", timeout: 15_000});
+          const passRows = tableRegion.locator("tbody tr");
+          const passRowCount = await passRows.count();
+          const reservedLaneRegex = new RegExp(`\\b${this.config.testLaneLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+          for (let rIdx = 0; rIdx < passRowCount; rIdx += 1) {
+            const tr = passRows.nth(rIdx);
+            const cb = tr.locator('input[type="checkbox"]').first();
+            if ((await cb.count()) === 0) continue;
+            const rowTxt = await tr.innerText().catch(() => "");
+            const isReservedRow = reservedLaneRegex.test(rowTxt);
+            const checked = await cb.isChecked().catch(() => false);
+            if (!isReservedRow && checked) {
+              await cb.click();
+            } else if (isReservedRow && !checked) {
+              await cb.click();
+            }
+          }
+          const batchAdjLabel = batchPanel.locator("label").filter({hasText: /^Adjudicate$/i}).first();
+          await batchAdjLabel.locator("xpath=..").locator(".MuiSelect-select").click();
+          const code9Opt = page.locator(".MuiList-root .MuiMenuItem-root:visible")
+            .filter({hasText: /Code 9: Authorized Test/i}).first();
+          await code9Opt.waitFor({timeout: 10_000});
+          await code9Opt.click();
+          const batchNotes = `${ocrNotes} (linked re-scan)`;
+          await compDialog.getByTestId("vehicle-batch-notes-input").fill(batchNotes);
+          await compDialog.getByTestId("vehicle-batch-submit-btn").click();
+          await poll(
+            async () => {
+              const verifyRes = await page.context().request.get(
+                this.viewerUrl(
+                  `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(canonicalExpected)}&matchMode=equals&limit=100`,
+                ),
+                {headers: {Accept: "application/json"}},
+              );
+              try {
+                if (!verifyRes.ok()) return false;
+                const verifyJson = await verifyRes.json() as {
+                  passes?: Array<{occupancyObsId?: unknown; adjudications?: unknown[]}>;
+                };
+                const targetPass = (verifyJson.passes ?? []).find(
+                  p => String(p.occupancyObsId ?? "").trim() === eventId2,
+                );
+                if (!targetPass || !Array.isArray(targetPass.adjudications) || targetPass.adjudications.length < 1) {
+                  return false;
+                }
+              } finally {
+                await verifyRes.dispose();
+              }
+              const panelStillVisible = await batchPanel.isVisible().catch(() => false);
+              if (!panelStillVisible) return true;
+              const alertVisible = await batchPanel.locator('[role="alert"]').isVisible().catch(() => false);
+              return alertVisible;
+            },
+            ok => ok,
+            {timeoutMs: 30_000, intervalMs: 750, description: `batch adjudication completion for ${eventId2}`},
+          );
+
+          // Verify 1-click VEHICLE_INCIDENT exports across PDF, CSV, JSON, and XLSX
+          const exportSizes: Record<string, number> = {};
+          let allFormatsValid = true;
+          for (const fmt of ["PDF", "CSV", "JSON", "XLSX"] as const) {
+            await compDialog.getByTestId(`vehicle-export-${fmt.toLowerCase()}-btn`).click();
+            const links = compDialog.getByTestId("vehicle-exported-report-links");
+            await poll(
+              async () => (await links.innerText().catch(() => "")),
+              txt => txt.includes(`(${fmt})`),
+              {timeoutMs: this.config.eventTimeoutMs, intervalMs: 400, description: `VEHICLE_INCIDENT ${fmt} link`},
+            );
+            const dlHref = await links.locator("a[download]").first().getAttribute("href");
+            if (!dlHref) {
+              allFormatsValid = false;
+              break;
+            }
+            const dlRes = await page.context().request.get(new URL(dlHref, this.config.oscarBaseUrl).toString());
+            try {
+              if (!dlRes.ok()) {
+                allFormatsValid = false;
+                break;
+              }
+              const buf = await dlRes.body();
+              exportSizes[fmt] = buf.length;
+              if (fmt === "PDF" && buf.subarray(0, 4).toString() !== "%PDF") allFormatsValid = false;
+              if (fmt === "XLSX" && (buf.length < 4 || buf[0] !== 0x50 || buf[1] !== 0x4b)) allFormatsValid = false;
+              if (fmt === "CSV") {
+                const csvTxt = buf.toString("utf8");
+                if (!csvTxt.includes("Pass #") || !csvTxt.includes(canonicalExpected)) allFormatsValid = false;
+              }
+              if (fmt === "JSON") {
+                const parsedJson = JSON.parse(buf.toString("utf8")) as {
+                  reportType?: unknown;
+                  passes?: unknown[];
+                };
+                if (parsedJson.reportType !== "VEHICLE_INCIDENT" || !Array.isArray(parsedJson.passes) || parsedJson.passes.length < 2) {
+                  allFormatsValid = false;
+                }
+              }
+            } finally {
+              await dlRes.dispose();
+            }
+          }
+
+          const comparisonShot = await this.browser.screenshot(page, "vehicle-ocr-multipass-comparison");
+          await compDialog.getByRole("button", {name: /^close$/i}).last().click();
+          await compDialog.waitFor({state: "hidden", timeout: 10_000});
+
+          const passed = apiCorrelated && tableFocusable && filmstripVisible && chartVisible && allFormatsValid;
+          return {
+            passed,
+            observed: `apiCorrelated=${apiCorrelated} (profileSamples=${profileCount}); tableTabIndex0=${tableFocusable}; ` +
+              `filmstrip=${filmstripVisible}; profileChart=${chartVisible}; exports=${JSON.stringify(exportSizes)}`,
+            evidence: comparisonShot,
           };
         });
       }

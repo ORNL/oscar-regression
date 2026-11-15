@@ -13,11 +13,16 @@ import {
   compareAlarmsByViewerPriority,
   DEFAULT_OPERATOR_RECYCLE_CYCLES,
   deriveAlarmStatusFromResult,
+  ENDURANCE_RECURRING_VEHICLE_IDS,
   extractConSysNextPath,
+  formatSpacedVehicleQueryVariant,
+  INCIDENT_REPORT_FORMATS,
   isAlarmGridHydrationSettled,
   isBenignViewerConsoleError,
   MAX_BULK_ADJUDICATION_ROWS,
+  normalizeEnduranceVehicleId,
   parseUiEnduranceCliArgs,
+  resolveEffectiveEnduranceVehicleId,
   SECONDARY_INSPECTION_STATUSES,
   selectAdjudicationCandidates,
   shouldPurgePriorScopedNotification,
@@ -259,7 +264,12 @@ test("buildCycleExecutionPlan rotates across all workflows, operational views, i
     if (plan.workflow === "pwa-notification-detail" || plan.workflow === "event-log-filter-detail") {
       detailQrModes.add(plan.qrClearMode);
     }
-    assert.match(plan.vehicleId, /^NIMO-UI-TEST01-\d{5}$/);
+    assert.ok(
+      (ENDURANCE_RECURRING_VEHICLE_IDS as readonly string[]).includes(plan.vehicleId),
+    );
+    assert.equal(plan.normalizedVehicleId, normalizeEnduranceVehicleId(plan.vehicleId));
+    assert.ok((INCIDENT_REPORT_FORMATS as readonly string[]).includes(plan.incidentReportFormat));
+    assert.match(plan.notes, /run=TEST01, cycle=\d{5}\)$/);
   }
 
   assert.deepEqual([...workflows].sort(), [...UI_ENDURANCE_WORKFLOWS].sort());
@@ -267,6 +277,25 @@ test("buildCycleExecutionPlan rotates across all workflows, operational views, i
   assert.deepEqual([...inspections].sort(), [...SECONDARY_INSPECTION_STATUSES].sort());
   assert.deepEqual([...isotopeModes].sort(), ["multi", "single", "unknown-exclusivity"]);
   assert.deepEqual([...detailQrModes].sort(), ["clear-all-in-dialog", "delete-in-form"]);
+});
+
+test("resolveEffectiveEnduranceVehicleId preserves live OCR auto-fill and normalizes recurring fleet variants", () => {
+  const fromOcr = resolveEffectiveEnduranceVehicleId("EGHU 967470 0", "TN-8842B");
+  assert.deepEqual(fromOcr, {
+    vehicleId: "EGHU 967470 0",
+    normalizedVehicleId: "EGHU9674700",
+    preservedOcr: true,
+  });
+
+  const fromFleet = resolveEffectiveEnduranceVehicleId("", "csqu 305438-3");
+  assert.deepEqual(fromFleet, {
+    vehicleId: "csqu 305438-3",
+    normalizedVehicleId: "CSQU3054383",
+    preservedOcr: false,
+  });
+
+  assert.equal(formatSpacedVehicleQueryVariant("CSQU3054383"), "csqu 305438-3");
+  assert.equal(formatSpacedVehicleQueryVariant("TN8842B"), "tn-8842B");
 });
 
 test("parseUiEnduranceCliArgs defaults to 4 bounded cycles and supports continuous daemon flags", () => {

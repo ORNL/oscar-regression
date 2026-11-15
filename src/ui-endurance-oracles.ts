@@ -24,6 +24,62 @@ export const SECONDARY_INSPECTION_STATUSES = [
 
 export type SecondaryInspectionStatus = (typeof SECONDARY_INSPECTION_STATUSES)[number];
 
+export const INCIDENT_REPORT_FORMATS = ["PDF", "CSV", "JSON", "XLSX"] as const;
+
+export type IncidentReportFormat = (typeof INCIDENT_REPORT_FORMATS)[number];
+
+/**
+ * Deterministic rotating fleet of recurring vehicle identifiers (ISO 6346 checksum-valid
+ * containers plus tractor fleet plates, deliberately mixing uppercase/lowercase, spaces,
+ * and hyphens) so continuous endurance cycles naturally accumulate multi-pass histories
+ * under shared normalized vehicle IDs while exercising normalized matching end-to-end.
+ */
+export const ENDURANCE_RECURRING_VEHICLE_IDS = [
+  "EGHU3972694",
+  "eghu 397269-4",
+  "CSNU2164744",
+  "csnu 216474-4",
+  "JHSU2675475",
+  "TN-8842B",
+] as const;
+
+export function normalizeEnduranceVehicleId(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "-") return "";
+  return trimmed.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+export function formatSpacedVehicleQueryVariant(normalizedOrRaw: string): string {
+  const norm = normalizeEnduranceVehicleId(normalizedOrRaw);
+  if (/^[A-Z]{3}[UJZR][0-9]{7}$/.test(norm)) {
+    return `${norm.slice(0, 4).toLowerCase()} ${norm.slice(4, 10)}-${norm.slice(10)}`;
+  }
+  if (norm.length >= 5) {
+    return `${norm.slice(0, 2).toLowerCase()}-${norm.slice(2)}`;
+  }
+  return normalizedOrRaw.trim();
+}
+
+export function resolveEffectiveEnduranceVehicleId(
+  autoFilledOcrValue: string,
+  plannedVehicleId: string,
+): {readonly vehicleId: string; readonly normalizedVehicleId: string; readonly preservedOcr: boolean} {
+  const trimmedOcr = autoFilledOcrValue.trim();
+  const normOcr = normalizeEnduranceVehicleId(trimmedOcr);
+  if (normOcr.length >= 4) {
+    return {
+      vehicleId: trimmedOcr,
+      normalizedVehicleId: normOcr,
+      preservedOcr: true,
+    };
+  }
+  return {
+    vehicleId: plannedVehicleId,
+    normalizedVehicleId: normalizeEnduranceVehicleId(plannedVehicleId),
+    preservedOcr: false,
+  };
+}
+
 export interface IsotopeTestPlan {
   readonly mode: "single" | "multi" | "unknown-exclusivity";
   readonly preSelect: readonly string[];
@@ -58,7 +114,9 @@ export interface CycleExecutionPlan {
   readonly secondaryInspection: SecondaryInspectionStatus;
   readonly isotopePlan: IsotopeTestPlan;
   readonly qrClearMode: "delete-in-form" | "clear-all-in-dialog";
+  readonly incidentReportFormat: IncidentReportFormat;
   readonly vehicleId: string;
+  readonly normalizedVehicleId: string;
   readonly notes: string;
 }
 
@@ -453,11 +511,15 @@ export function buildCycleExecutionPlan(params: {
   const qrClearMode = Math.floor(params.cycleIndex / 2) % 2 === 0
     ? "clear-all-in-dialog"
     : "delete-in-form";
+  const incidentReportFormat =
+    INCIDENT_REPORT_FORMATS[params.cycleIndex % INCIDENT_REPORT_FORMATS.length]!;
   const seq = String(params.cycleIndex + 1).padStart(5, "0");
   const safeTag = params.runTag.replace(/[^A-Za-z0-9-]/g, "").slice(-10) || "ENDURANCE";
-  const vehicleId = `NIMO-UI-${safeTag}-${seq}`;
+  const vehicleId =
+    ENDURANCE_RECURRING_VEHICLE_IDS[params.cycleIndex % ENDURANCE_RECURRING_VEHICLE_IDS.length]!;
+  const normalizedVehicleId = normalizeEnduranceVehicleId(vehicleId);
   const scopeLabel = operatorViewKey ? `view=${operatorViewKey}` : "view=unscoped";
-  const notes = `Nimo automated UI endurance (${workflow}, ${scopeLabel}, cycle=${seq})`;
+  const notes = `Nimo automated UI endurance (${workflow}, ${scopeLabel}, run=${safeTag}, cycle=${seq})`;
 
   return {
     cycleIndex: params.cycleIndex,
@@ -469,7 +531,9 @@ export function buildCycleExecutionPlan(params: {
     secondaryInspection,
     isotopePlan,
     qrClearMode,
+    incidentReportFormat,
     vehicleId,
+    normalizedVehicleId,
     notes,
   };
 }

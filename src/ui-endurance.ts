@@ -29,11 +29,14 @@ import {
   collectConSysPaginatedItems,
   deriveAlarmStatusFromResult,
   discoverTlsSpkiHashes,
+  formatSpacedVehicleQueryVariant,
   isAlarmGridHydrationSettled,
   isBenignViewerConsoleError,
   isUnadjudicatedAlarm,
   MAX_BULK_ADJUDICATION_ROWS,
+  normalizeEnduranceVehicleId,
   parseUiEnduranceCliArgs,
+  resolveEffectiveEnduranceVehicleId,
   selectAdjudicationCandidates,
   shouldPurgePriorScopedNotification,
   UI_ENDURANCE_PAGE_SIZE,
@@ -124,6 +127,14 @@ interface OccupancyCatalog {
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function searchErrorCleanup(page: Page): Promise<void> {
+  const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
+  if (await compDialog.isVisible().catch(() => false)) {
+    await page.keyboard.press("Escape").catch(() => undefined);
+    await compDialog.waitFor({state: "hidden", timeout: 5_000}).catch(() => undefined);
+  }
 }
 
 function writeAtomicPrivateFile(targetPath: string, contents: string): void {
@@ -1108,8 +1119,12 @@ class UiEnduranceRunner {
     return page.locator(".MuiDataGrid-row").evaluateAll((elements) =>
       elements
         .map((row, fallbackIdx) => {
-          const laneSpan = row.querySelector('[data-field="laneId"] span');
+          const lanePrimary = row.querySelector('[data-field="laneId"] .alarm-cell-primary');
+          const laneFallback = row.querySelector(
+            '[data-field="laneId"] span:not(.unread-alarm-dot):not(.visually-hidden)',
+          );
           const laneCell = row.querySelector('[data-field="laneId"]');
+          const occPrimary = row.querySelector('[data-field="occupancyCount"] .alarm-cell-primary');
           const occCell = row.querySelector('[data-field="occupancyCount"]');
           const statusCell = row.querySelector('[data-field="status"]');
           const startCell = row.querySelector('[data-field="startTime"]');
@@ -1118,8 +1133,13 @@ class UiEnduranceRunner {
             rowIndex: Number.isFinite(idxAttr) ? idxAttr : fallbackIdx + 10_000,
             row: {
               rowKey: row.getAttribute("data-id") ?? "",
-              laneId: (laneSpan?.textContent ?? laneCell?.textContent ?? "").trim(),
-              occupancyCount: (occCell?.textContent ?? "").trim(),
+              laneId: (
+                lanePrimary?.textContent ||
+                laneFallback?.textContent ||
+                laneCell?.textContent ||
+                ""
+              ).trim(),
+              occupancyCount: (occPrimary?.textContent || occCell?.textContent || "").trim(),
               status: (statusCell?.textContent ?? "").trim(),
               startTimeText: (startCell?.textContent ?? "").trim(),
             },
@@ -1687,7 +1707,8 @@ class UiEnduranceRunner {
     page: Page,
     plan: CycleExecutionPlan,
     observationId: string,
-  ): Promise<{evidenceSummary: string; consysVerified: boolean}> {
+    allowedLanes?: ReadonlySet<string>,
+  ): Promise<{evidenceSummary: string; consysVerified: boolean; effectiveVehicleId: string}> {
     await page.getByText("Adjudication Form", {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
@@ -1840,9 +1861,14 @@ class UiEnduranceRunner {
       {timeoutMs: 8_000, intervalMs: 200, description: "camera MediaStreamTrack release after QR dialog close"},
     );
 
-    // 4. Fill Vehicle ID, verify Adjudicate group headers, select Code 9
+    // 4. Preserve live OCR auto-fill when present on OCR-enabled lanes; otherwise use recurring fleet ID
     const vehicleInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
-    await vehicleInput.fill(plan.vehicleId);
+    const autoFilledRaw = await vehicleInput.inputValue().catch(() => "");
+    const resolvedVehicle = resolveEffectiveEnduranceVehicleId(autoFilledRaw, plan.vehicleId);
+    const effectiveVehicleId = resolvedVehicle.vehicleId;
+    if (!resolvedVehicle.preservedOcr) {
+      await vehicleInput.fill(effectiveVehicleId);
+    }
 
     const adjLabel = page.locator("label").filter({hasText: /^Adjudicate$/}).first();
     await adjLabel.locator("xpath=..").locator(".MuiSelect-select").click();
@@ -1887,7 +1913,7 @@ class UiEnduranceRunner {
     await confirmDialog.waitFor({timeout: 10_000});
 
     const confirmText = await confirmDialog.innerText();
-    for (const expectedFragment of [plan.vehicleId, "Code 9", plan.notes, keepFileName, "Files (1)"]) {
+    for (const expectedFragment of [effectiveVehicleId, "Code 9", plan.notes, keepFileName, "Files (1)"]) {
       if (!confirmText.includes(expectedFragment)) {
         throw new Error(`Confirm Adjudication Submission dialog missing '${expectedFragment}'`);
       }
@@ -1897,8 +1923,8 @@ class UiEnduranceRunner {
     await confirmDialog.getByRole("button", {name: "Cancel", exact: true}).click();
     await confirmDialog.waitFor({state: "hidden", timeout: 10_000});
     const preservedVehicle = await vehicleInput.inputValue();
-    if (preservedVehicle !== plan.vehicleId) {
-      throw new Error(`Cancel cleared Vehicle ID (expected '${plan.vehicleId}', got '${preservedVehicle}')`);
+    if (preservedVehicle !== effectiveVehicleId) {
+      throw new Error(`Cancel cleared Vehicle ID (expected '${effectiveVehicleId}', got '${preservedVehicle}')`);
     }
 
     // Re-open and Confirm & Submit
@@ -1921,7 +1947,10 @@ class UiEnduranceRunner {
     const notePrefix = plan.notes.slice(0, 40);
     const bodyAfterReload = await poll(
       () => page.locator("body").innerText(),
-      (text) => text.includes(plan.vehicleId) && text.includes(notePrefix) && /Code 9/i.test(text),
+      (text) =>
+        (text.includes(effectiveVehicleId) || normalizeEnduranceVehicleId(text).includes(resolvedVehicle.normalizedVehicleId)) &&
+        text.includes(notePrefix) &&
+        /Code 9/i.test(text),
       {timeoutMs: 25_000, intervalMs: 500, description: "reloaded Logged Adjudications persistence"},
     );
 
@@ -1953,9 +1982,186 @@ class UiEnduranceRunner {
       bucketPersisted ||
       bodyAfterReload.includes(keepFileName);
 
+    // 8. Exercise multi-pass correlation banner, VehiclePassComparisonDialog (radiation traces + linked
+    // adjudication of at most one correlated non-reserved open alarm pass), and 1-click VEHICLE_INCIDENT
+    // report export whenever >= 2 in-scope passes share this normalized Vehicle ID.
+    let multiPassSummary = "multiPass=single";
+    try {
+      const searchRes = await page.context().request.get(
+        this.viewerUrl(
+          `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(effectiveVehicleId)}&matchMode=equals&limit=100`,
+        ),
+      );
+      if (searchRes.ok()) {
+        const searchJson = (await searchRes.json()) as {
+          passes?: Array<{
+            laneName?: unknown;
+            occupancyObsId?: unknown;
+            occupancyCount?: unknown;
+            isAlarm?: unknown;
+            adjudications?: unknown[];
+          }>;
+        };
+        const rawPasses = Array.isArray(searchJson.passes) ? searchJson.passes : [];
+        const inScopePasses = allowedLanes
+          ? rawPasses.filter((p) => allowedLanes.has(String(p.laneName ?? "").trim()))
+          : rawPasses;
+
+        if (inScopePasses.length >= 2) {
+          const banner = page.getByTestId("vehicle-related-passes-banner");
+          await banner.waitFor({state: "visible", timeout: 20_000});
+          await page.getByTestId("open-vehicle-pass-comparison").click();
+
+          const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
+          await compDialog.waitFor({state: "visible", timeout: 15_000});
+          const tableRegion = compDialog.getByTestId("vehicle-pass-table-region");
+          await tableRegion.waitFor({state: "visible", timeout: 15_000});
+          const tabIndex = await tableRegion.getAttribute("tabindex");
+          if (tabIndex !== "0") {
+            throw new Error(`VehiclePassComparisonDialog table region missing tabindex="0" (got ${String(tabIndex)})`);
+          }
+
+          const loadTracesBtn = compDialog.getByTestId("vehicle-load-profiles-btn");
+          if (await loadTracesBtn.isVisible().catch(() => false)) {
+            await loadTracesBtn.click();
+            await compDialog.getByTestId("vehicle-profile-chart")
+              .waitFor({state: "visible", timeout: 20_000})
+              .catch(() => undefined);
+          }
+
+          let linkedAdjTag = "linkedAdj=none";
+          const openCorrelatedCandidate = inScopePasses.find((p) => {
+            const pLane = String(p.laneName ?? "").trim();
+            const pObsId = String(p.occupancyObsId ?? "").trim();
+            const pAdjs = Array.isArray(p.adjudications) ? p.adjudications : [];
+            return (
+              Boolean(p.isAlarm) &&
+              pAdjs.length === 0 &&
+              pObsId.length > 0 &&
+              pObsId !== observationId &&
+              pLane.length > 0 &&
+              pLane !== this.config.testLaneLabel
+            );
+          });
+          const batchPanel = compDialog.getByTestId("vehicle-batch-adjudication-panel");
+          if (openCorrelatedCandidate && (await batchPanel.isVisible().catch(() => false))) {
+            const targetLane = String(openCorrelatedCandidate.laneName ?? "").trim();
+            const targetObsId = String(openCorrelatedCandidate.occupancyObsId ?? "").trim();
+            const targetCount = String(openCorrelatedCandidate.occupancyCount ?? "").trim();
+            const targetLaneRe = new RegExp(`\\b${escapeRegExp(targetLane)}\\b`, "i");
+            const targetCountRe = targetCount ? new RegExp(`#${escapeRegExp(targetCount)}\\b`) : null;
+            const passRows = tableRegion.locator("tbody tr");
+            const rowCount = await passRows.count();
+            let matchedRowSelected = false;
+            for (let rIdx = 0; rIdx < rowCount; rIdx += 1) {
+              const tr = passRows.nth(rIdx);
+              const cb = tr.locator('input[type="checkbox"]').first();
+              if ((await cb.count()) === 0) continue;
+              const rowTxt = await tr.innerText().catch(() => "");
+              const isTargetRow =
+                !matchedRowSelected &&
+                targetLaneRe.test(rowTxt) &&
+                (targetCountRe ? targetCountRe.test(rowTxt) : true);
+              const checked = await cb.isChecked().catch(() => false);
+              if (isTargetRow) {
+                matchedRowSelected = true;
+                if (!checked) await cb.click();
+              } else if (checked) {
+                await cb.click();
+              }
+            }
+            if (matchedRowSelected) {
+              const batchAdjLabel = batchPanel.locator("label").filter({hasText: /^Adjudicate$/i}).first();
+              await batchAdjLabel.locator("xpath=..").locator(".MuiSelect-select").click();
+              const code9Opt = page.locator(".MuiList-root .MuiMenuItem-root:visible")
+                .filter({hasText: /Code 9: Authorized Test/i}).first();
+              await code9Opt.waitFor({timeout: 10_000});
+              await code9Opt.click();
+              await compDialog.getByTestId("vehicle-batch-notes-input").fill(`${plan.notes} [linked-pass]`);
+              await compDialog.getByTestId("vehicle-batch-submit-btn").click();
+              await poll(
+                async () => {
+                  const vRes = await page.context().request.get(
+                    this.viewerUrl(
+                      `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(effectiveVehicleId)}&matchMode=equals&limit=100`,
+                    ),
+                  );
+                  try {
+                    if (!vRes.ok()) return false;
+                    const vJson = (await vRes.json()) as {
+                      passes?: Array<{occupancyObsId?: unknown; adjudications?: unknown[]}>;
+                    };
+                    const found = (vJson.passes ?? []).find(
+                      (p) => String(p.occupancyObsId ?? "").trim() === targetObsId,
+                    );
+                    if (!found || !Array.isArray(found.adjudications) || found.adjudications.length < 1) {
+                      return false;
+                    }
+                  } finally {
+                    await vRes.dispose();
+                  }
+                  const stillOpen = await batchPanel.isVisible().catch(() => false);
+                  if (!stillOpen) return true;
+                  return await batchPanel.locator('[role="alert"]').isVisible().catch(() => false);
+                },
+                Boolean,
+                {timeoutMs: 30_000, intervalMs: 750, description: `linked adjudication for ${targetObsId}`},
+              );
+              if (targetCount) {
+                this.rememberAdjudicatedKey(`${targetLane}#${targetCount}`);
+              }
+              linkedAdjTag = `linkedAdj=${targetLane}#${targetCount || targetObsId}`;
+            }
+          }
+
+          const fmt = plan.incidentReportFormat;
+          await compDialog.getByTestId(`vehicle-export-${fmt.toLowerCase()}-btn`).click();
+          const linksStack = compDialog.getByTestId("vehicle-exported-report-links");
+          await linksStack.waitFor({state: "visible", timeout: this.config.eventTimeoutMs});
+
+          const downloadHref = await linksStack.locator("a[download]").first().getAttribute("href");
+          if (!downloadHref) {
+            throw new Error(`Missing download link after ${fmt} VEHICLE_INCIDENT export`);
+          }
+          const dlRes = await page.context().request.get(new URL(downloadHref, this.config.oscarBaseUrl).toString());
+          if (!dlRes.ok()) {
+            throw new Error(`VEHICLE_INCIDENT ${fmt} download returned HTTP ${dlRes.status()}`);
+          }
+          const dlBody = await dlRes.body();
+          await dlRes.dispose();
+          if (fmt === "PDF" && dlBody.subarray(0, 4).toString() !== "%PDF") {
+            throw new Error("VEHICLE_INCIDENT PDF export missing %PDF magic header");
+          }
+          if (fmt === "XLSX" && (dlBody.length < 4 || dlBody[0] !== 0x50 || dlBody[1] !== 0x4b)) {
+            throw new Error("VEHICLE_INCIDENT XLSX export missing PK zip workbook header");
+          }
+          if (fmt === "CSV" && !dlBody.toString("utf8").includes("Pass #")) {
+            throw new Error("VEHICLE_INCIDENT CSV export missing Pass # header");
+          }
+          if (fmt === "JSON") {
+            const parsedIncident = JSON.parse(dlBody.toString("utf8")) as {reportType?: unknown};
+            if (parsedIncident.reportType !== "VEHICLE_INCIDENT") {
+              throw new Error(`VEHICLE_INCIDENT JSON export returned reportType=${String(parsedIncident.reportType)}`);
+            }
+          }
+
+          await compDialog.getByRole("button", {name: /^close$/i}).last().click();
+          await compDialog.waitFor({state: "hidden", timeout: 10_000});
+          multiPassSummary = `multiPass=${inScopePasses.length};${linkedAdjTag};export=${fmt}(${dlBody.length}B)`;
+        }
+      }
+      await searchRes.dispose();
+    } catch (err) {
+      await searchErrorCleanup(page);
+      throw err;
+    }
+
     return {
-      evidenceSummary: `file=${keepFileName}(persisted=${filePersisted}); webIdUi=tested; qr=${plan.qrClearMode}`,
+      evidenceSummary:
+        `file=${keepFileName}(persisted=${filePersisted}); ocrPreserved=${resolvedVehicle.preservedOcr}; ` +
+        `${multiPassSummary}; webIdUi=tested; qr=${plan.qrClearMode}`,
       consysVerified: consysVerified && filePersisted,
+      effectiveVehicleId,
     };
   }
 
@@ -2128,6 +2334,7 @@ class UiEnduranceRunner {
       page,
       plan,
       targetNotification.eventId,
+      allowedLanes,
     );
 
     this.rememberAdjudicatedKey(
@@ -2142,7 +2349,7 @@ class UiEnduranceRunner {
       laneId: targetNotification.laneId,
       occupancyCount: targetNotification.occupancyCount,
       observationId: targetNotification.eventId,
-      vehicleId: plan.vehicleId,
+      vehicleId: detailOutcome.effectiveVehicleId,
       secondaryInspection: plan.secondaryInspection,
       isotopes: plan.isotopePlan.finalExpected.join("+"),
       evidenceSummary: detailOutcome.evidenceSummary,
@@ -2400,12 +2607,48 @@ class UiEnduranceRunner {
       page,
       plan,
       target.observationId,
+      allowedLanes,
     );
 
-    // Return to /event-log and filter to `Adjudicated = Yes` + `Lane ID = target.laneId` to prove
-    // adjudicated status renders `Yes` in Event Log!
+    // Return to /event-log, exercise the <search data-testid="vehicle-id-search-bar"> landmark against
+    // the adjudicated Vehicle ID (using a deliberately spaced/lowercase query variant), verify Compare Passes
+    // and VehiclePassComparisonDialog, clear Vehicle ID search, and then verify Adjudicated = Yes!
     await this.gotoOperator(page, eventLogPath);
     await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
+
+    const searchLandmark = page.locator('search[data-testid="vehicle-id-search-bar"]');
+    await searchLandmark.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+    const searchInput = page.getByTestId("vehicle-id-search-input");
+    const autoCorrectAttr = await searchInput.getAttribute("autocorrect");
+    const autoCapAttr = await searchInput.getAttribute("autocapitalize");
+    const spellCheckAttr = await searchInput.getAttribute("spellcheck");
+    if (autoCorrectAttr !== "off" || autoCapAttr !== "none" || spellCheckAttr !== "false") {
+      throw new Error(
+        `Vehicle ID search input missing non-prose attributes (autocorrect=${autoCorrectAttr}, autocapitalize=${autoCapAttr}, spellcheck=${spellCheckAttr})`,
+      );
+    }
+
+    const queryVariant = formatSpacedVehicleQueryVariant(detailOutcome.effectiveVehicleId);
+    await searchInput.fill(queryVariant);
+    await page.getByTestId("vehicle-id-search-submit").click();
+
+    const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
+    await compareBtn.waitFor({state: "visible", timeout: 25_000});
+    const compareText = (await compareBtn.innerText()).trim();
+    if (!/^Compare Passes \(\d+\)$/i.test(compareText)) {
+      throw new Error(`Unexpected Compare Passes button label '${compareText}'`);
+    }
+    await compareBtn.click();
+    const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
+    await compDialog.waitFor({state: "visible", timeout: 15_000});
+    await compDialog.getByTestId("vehicle-pass-table-region").waitFor({state: "visible", timeout: 15_000});
+    await compDialog.getByRole("button", {name: /^close$/i}).last().click();
+    await compDialog.waitFor({state: "hidden", timeout: 10_000});
+
+    await page.getByTestId("vehicle-id-search-clear").click();
+    await compareBtn.waitFor({state: "hidden", timeout: 10_000});
+    await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
+
     await page.getByRole("button", {name: /advanced filters/i}).first().click();
     await filterDialog.waitFor({timeout: this.config.uiTimeoutMs});
     await filterDialog.getByRole("button", {name: /add condition/i}).click();
@@ -2461,10 +2704,10 @@ class UiEnduranceRunner {
       laneId: target.laneId,
       occupancyCount: target.occupancyCount,
       observationId: target.observationId,
-      vehicleId: plan.vehicleId,
+      vehicleId: detailOutcome.effectiveVehicleId,
       secondaryInspection: plan.secondaryInspection,
       isotopes: plan.isotopePlan.finalExpected.join("+"),
-      evidenceSummary: `${detailOutcome.evidenceSummary}; eventLogAdjudicatedYes=${verifiedAdjudicatedYes}`,
+      evidenceSummary: `${detailOutcome.evidenceSummary}; vehicleSearchBar=tested; eventLogAdjudicatedYes=${verifiedAdjudicatedYes}`,
       consysVerified: detailOutcome.consysVerified,
       uiRemovedLive: verifiedAdjudicatedYes,
       durationMs: Date.now() - started,
