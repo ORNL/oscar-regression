@@ -44,6 +44,8 @@ export interface SuiteConfig {
   alarmTransferCameraWorkflow: CapabilityMode;
   emlWorkflow: CapabilityMode;
   emlPluginPath?: string;
+  spectroscopicWorkflow: CapabilityMode;
+  spectraDirectory?: string;
   vehicleOcrWorkflow: CapabilityMode;
   expectedVehicleOcrContainer: string;
   storageWorkflow: CapabilityMode;
@@ -214,6 +216,8 @@ export interface RunMetadata {
   alarmTransferCameraWorkflow: CapabilityMode;
   emlWorkflow?: CapabilityMode;
   emlPluginConfigured?: boolean;
+  spectroscopicWorkflow?: CapabilityMode;
+  spectroscopicSampleCount?: number;
   vehicleOcrWorkflow?: CapabilityMode;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: "3.11.0";

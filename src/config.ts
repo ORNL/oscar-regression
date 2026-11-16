@@ -256,6 +256,19 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   if (emlWorkflow === "required" && !emlPluginPath) {
     throw new Error("EML_WORKFLOW=required requires OSCAR_EML_PLUGIN_PATH");
   }
+  const spectroscopicWorkflow = capabilityMode("SPECTROSCOPIC_WORKFLOW", "auto");
+  const spectraDirRaw = process.env.OSCAR_SPECTRA_DIR?.trim();
+  let spectraDirectory: string | undefined;
+  if (spectraDirRaw) {
+    if (/[\0\r\n]/.test(spectraDirRaw)) {
+      throw new Error("OSCAR_SPECTRA_DIR must not contain control characters");
+    }
+    const resolvedSpectraDir = resolve(spectraDirRaw);
+    if (!existsSync(resolvedSpectraDir) || !statSync(resolvedSpectraDir).isDirectory()) {
+      throw new Error(`OSCAR_SPECTRA_DIR does not point to an existing directory: ${resolvedSpectraDir}`);
+    }
+    spectraDirectory = resolvedSpectraDir;
+  }
   const vehicleOcrWorkflow = capabilityMode("VEHICLE_OCR_WORKFLOW", "auto");
   const expectedVehicleOcrContainer =
     process.env.EXPECTED_VEHICLE_OCR_CONTAINER?.trim().toUpperCase() || "EGHU3972694";
@@ -337,6 +350,8 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     alarmTransferCameraWorkflow,
     emlWorkflow,
     ...(emlPluginPath ? {emlPluginPath} : {}),
+    spectroscopicWorkflow,
+    ...(spectraDirectory ? {spectraDirectory} : {}),
     vehicleOcrWorkflow,
     expectedVehicleOcrContainer,
     storageWorkflow,

@@ -167,6 +167,7 @@ export interface UiEnduranceCliOptions {
   readonly operatorRecycleCycles: number;
   readonly wallboardSettleMs: number;
   readonly readOnlyWallboard: boolean;
+  readonly spectraDir?: string;
 }
 
 const BENIGN_VIEWER_CONSOLE_FRAGMENTS = [
@@ -551,6 +552,7 @@ export function parseUiEnduranceCliArgs(
     "--scoped-hold-cycles",
     "--operator-recycle-cycles",
     "--wallboard-settle-ms",
+    "--spectra-dir",
   ]);
   const switchFlags = new Set(["--continuous", "--read-only-wallboard"]);
 
@@ -627,6 +629,7 @@ export function parseUiEnduranceCliArgs(
     1_000,
     120_000,
   ) ?? 6_000;
+  const rawSpectraDir = (values.get("--spectra-dir") ?? env.OSCAR_SPECTRA_DIR ?? "").trim();
 
   return {
     ...(effectiveMaxCycles === undefined ? {} : {maxCycles: effectiveMaxCycles}),
@@ -636,6 +639,7 @@ export function parseUiEnduranceCliArgs(
     operatorRecycleCycles,
     wallboardSettleMs,
     readOnlyWallboard,
+    ...(rawSpectraDir ? {spectraDir: rawSpectraDir} : {}),
   };
 }
 

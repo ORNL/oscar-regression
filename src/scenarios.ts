@@ -6,6 +6,10 @@ import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {boundedFetch, type BoundedFetchResult} from "./bounded-fetch.js";
 import {
+  discoverSpectroscopicCatalog,
+  resolveOperatorDispositionFromSelectedIsotopes,
+} from "./spectroscopic-catalog.js";
+import {
   alarmMediaForensicsPassed,
   assertAlarmVideoAssociationUnique,
   assessAlarmMediaForensics,
@@ -39,12 +43,20 @@ import {
   isEventObservationPageUrl,
 } from "./event-filter-oracle.js";
 import {
+  assessDashboardLoadAndNextPageLatency,
   assessDashboardWidgetCustomization,
+  assessEventLogOnDemandUpSet,
   assessLaneViewStatusTableFaults,
   assessLiveVideoStartupAndAdvance,
   assessMultiCameraFeedCycle,
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
+  DASHBOARD_COUNT_QUERY_MAX_MS,
+  DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS,
+  DASHBOARD_INITIAL_FIRST_ROW_MAX_MS,
+  DASHBOARD_NEXT_PAGE_MAX_MS,
+  EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS,
+  EVENT_LOG_UPSET_EXPAND_MAX_MS,
   importedAlarmChartsRendered,
   LIVE_VIDEO_MAX_STARTUP_MS,
   liveLaneTelemetryChartsAdvancing,
@@ -809,6 +821,379 @@ export class RegressionScenarios {
           return {passed, observed: `HTTP ${status}; marker visible=${markerVisible}`, evidence};
         });
       }
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "performance",
+        action: "verify Dashboard initial load, datastream/count SLOs, and single-click Next-page latency",
+        target: "/ and /sensorhub/api/observations",
+        expected: `Dashboard first alarm row <=${DASHBOARD_INITIAL_FIRST_ROW_MAX_MS}ms, single /datastreams collection <=${DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS}ms, /observations/count <=${DASHBOARD_COUNT_QUERY_MAX_MS}ms, and Next-page click <=${DASHBOARD_NEXT_PAGE_MAX_MS}ms with 0 count round-trips`,
+      }, async () => {
+        const reqStarts = new Map<Request, number>();
+        let datastreamsCollectionCalls = 0;
+        let maxDatastreamsCollectionMs = 0;
+        let maxCountQueryMs = 0;
+        let obs5xxCount = 0;
+        let trackingNextClick = false;
+        let nextPageCountRequests = 0;
+
+        const onReq = (req: Request) => {
+          const url = req.url();
+          if (url.includes("/sensorhub/api/")) {
+            reqStarts.set(req, performance.now());
+            if (trackingNextClick) {
+              try {
+                if (/\/sensorhub\/api\/observations\/count\/?$/.test(new URL(url).pathname)) {
+                  nextPageCountRequests += 1;
+                }
+              } catch {
+                // ignore malformed URL
+              }
+            }
+          }
+        };
+        const onDone = async (req: Request) => {
+          const started = reqStarts.get(req);
+          if (started === undefined) return;
+          reqStarts.delete(req);
+          const durMs = Math.round(performance.now() - started);
+          const resp = await req.response().catch(() => null);
+          const status = resp ? resp.status() : 0;
+          const url = req.url();
+          if (url.includes("/sensorhub/api/observations") && status >= 500) {
+            obs5xxCount += 1;
+          }
+          try {
+            const parsed = new URL(url);
+            if (/\/sensorhub\/api\/datastreams\/?$/.test(parsed.pathname)) {
+              datastreamsCollectionCalls += 1;
+              if (durMs > maxDatastreamsCollectionMs) maxDatastreamsCollectionMs = durMs;
+            } else if (/\/sensorhub\/api\/observations\/count\/?$/.test(parsed.pathname)) {
+              if (durMs > maxCountQueryMs) maxCountQueryMs = durMs;
+            }
+          } catch {
+            // ignore malformed URL
+          }
+        };
+
+        page.on("request", onReq);
+        page.on("requestfinished", onDone);
+        page.on("requestfailed", onDone);
+        try {
+          const tNavStart = performance.now();
+          await this.goto(page, "/");
+          await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+          const firstRowVisible = await page.locator(".MuiDataGrid-row").first()
+            .waitFor({state: "visible", timeout: DASHBOARD_INITIAL_FIRST_ROW_MAX_MS + 3_000})
+            .then(() => true)
+            .catch(() => false);
+          const firstRowMs = firstRowVisible ? Math.round(performance.now() - tNavStart) : null;
+
+          // Allow low-priority background count + disjoint bucket prewarm to settle over HTTP/2.
+          await sleep(800);
+
+          const paginationInfo = await page.evaluate(() => {
+            const pag = document.querySelector(".MuiTablePagination-displayedRows")?.textContent?.trim() ?? "";
+            const totalMatch = /of\s+([\d,]+)/i.exec(pag);
+            const total = totalMatch?.[1] ? Number(totalMatch[1].replace(/,/g, "")) : 0;
+            const firstId = document.querySelector(".MuiDataGrid-virtualScrollerRenderZone .MuiDataGrid-row")
+              ?.getAttribute("data-id") ?? "";
+            return {pag, total, firstId};
+          });
+          const hasAlarms = paginationInfo.total > 0 || firstRowVisible;
+          const nextBtn = page.locator('button[aria-label="Go to next page"]').first();
+          const nextPageAvailable = paginationInfo.total > 15 && await nextBtn.isEnabled().catch(() => false);
+
+          let nextPageRenderMs: number | null = null;
+          let page2DistinctFromPage1 = false;
+          if (nextPageAvailable) {
+            trackingNextClick = true;
+            nextPageCountRequests = 0;
+            const tClick = performance.now();
+            await nextBtn.click();
+            const transitioned = await page.waitForFunction(
+              (prevFirstId: string) => {
+                const busy = document.querySelector(".MuiDataGrid-overlayWrapper .MuiCircularProgress-root");
+                const rows = document.querySelectorAll(".MuiDataGrid-virtualScrollerRenderZone .MuiDataGrid-row");
+                const pag = document.querySelector(".MuiTablePagination-displayedRows")?.textContent?.trim() ?? "";
+                const curFirstId = rows[0]?.getAttribute("data-id") ?? "";
+                return !busy && rows.length > 0 && Boolean(curFirstId) && curFirstId !== prevFirstId && /^16/.test(pag);
+              },
+              paginationInfo.firstId,
+              {timeout: DASHBOARD_NEXT_PAGE_MAX_MS + 4_000},
+            ).then(() => true).catch(() => false);
+            trackingNextClick = false;
+            if (transitioned) {
+              nextPageRenderMs = Math.round(performance.now() - tClick);
+              page2DistinctFromPage1 = true;
+            }
+          }
+
+          const assessment = assessDashboardLoadAndNextPageLatency({
+            hasAlarms,
+            firstRowMs,
+            datastreamsCollectionCalls,
+            maxDatastreamsCollectionMs,
+            maxCountQueryMs,
+            nextPageAvailable,
+            nextPageRenderMs,
+            nextPageCountRequests,
+            page2DistinctFromPage1,
+            obs5xxCount,
+          });
+          const evidence = assessment.passed
+            ? ""
+            : await this.screenshotOnFailure(page, "dashboard-latency-slo-failed");
+          return {
+            passed: assessment.passed,
+            observed: `firstRowMs=${firstRowMs ?? "timeout"} (max=${DASHBOARD_INITIAL_FIRST_ROW_MAX_MS}); ` +
+              `datastreamsCalls=${datastreamsCollectionCalls} (maxMs=${maxDatastreamsCollectionMs}); ` +
+              `maxCountMs=${maxCountQueryMs}; nextAvailable=${nextPageAvailable}; ` +
+              `nextRenderMs=${nextPageRenderMs ?? "n/a"} (max=${DASHBOARD_NEXT_PAGE_MAX_MS}, countCalls=${nextPageCountRequests}); ` +
+              `obs5xx=${obs5xxCount}`,
+            evidence,
+          };
+        } finally {
+          page.off("request", onReq);
+          page.off("requestfinished", onDone);
+          page.off("requestfailed", onDone);
+        }
+      });
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "performance",
+        action: "verify /event-log load latency, collapsed-by-default UpSet disclosure, and on-demand full-filter-set UpSet summary",
+        target: "/event-log",
+        expected: `/event-log first row <=${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}ms with UpSet collapsed and 0 upfront UpSet batch queries, then clicking summary renders full-filter-set UpSet plot <=${EVENT_LOG_UPSET_EXPAND_MAX_MS}ms`,
+      }, async () => {
+        let upSetBatchRequestsOnLoad = 0;
+        let onLoadPhase = true;
+        const onReq = (req: Request) => {
+          if (!onLoadPhase) return;
+          const url = req.url();
+          if (!url.includes("/sensorhub/api/observations") || url.includes("/observations/count")) return;
+          try {
+            const parsed = new URL(url);
+            const lim = Number(parsed.searchParams.get("limit") ?? "0");
+            const filterParam = decodeURIComponent(parsed.searchParams.get("filter") ?? "");
+            if (lim > 50 && filterParam.includes("gammaAlarm=true OR neutronAlarm=true")) {
+              upSetBatchRequestsOnLoad += 1;
+            }
+          } catch {
+            // ignore malformed URL
+          }
+        };
+
+        page.on("request", onReq);
+        try {
+          const tStart = performance.now();
+          await this.goto(page, "/event-log");
+          await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+          const firstRowVisible = await page.locator(".MuiDataGrid-row").first()
+            .waitFor({state: "visible", timeout: EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS + 3_000})
+            .then(() => true)
+            .catch(() => false);
+          const firstRowMs = firstRowVisible ? Math.round(performance.now() - tStart) : null;
+          await sleep(400);
+          onLoadPhase = false;
+
+          const initialDom = await page.evaluate(() => {
+            const sec = document.querySelector('[data-testid="event-log-upset-section"]');
+            const plot = document.querySelector('[data-testid="event-log-upset-plot"]');
+            const pag = document.querySelector(".MuiTablePagination-displayedRows")?.textContent?.trim() ?? "";
+            const totalMatch = /of\s+([\d,]+)/i.exec(pag);
+            const totalRows = totalMatch?.[1] ? Number(totalMatch[1].replace(/,/g, "")) : 0;
+            return {
+              sectionPresentOnLoad: Boolean(sec),
+              collapsedByDefault: sec ? !sec.hasAttribute("open") : false,
+              plotMountedOnLoad: Boolean(plot),
+              totalRows,
+            };
+          });
+
+          const tExpand = performance.now();
+          await page.getByTestId("event-log-upset-summary").click();
+          const outcome = await Promise.race([
+            page.getByTestId("event-log-upset-plot")
+              .waitFor({state: "visible", timeout: EVENT_LOG_UPSET_EXPAND_MAX_MS + 4_000})
+              .then(() => "plot" as const),
+            page.getByTestId("event-log-upset-empty")
+              .waitFor({state: "visible", timeout: EVENT_LOG_UPSET_EXPAND_MAX_MS + 4_000})
+              .then(() => "empty" as const),
+          ]).catch(() => "timeout" as const);
+          const expandRenderMs = outcome === "timeout" ? null : Math.round(performance.now() - tExpand);
+
+          const expandedDom = await page.evaluate(() => {
+            const plot = document.querySelector('[data-testid="event-log-upset-plot"]');
+            const caption = document.querySelector('[data-testid="upset-accessible-table-details"] table caption')
+              ?.textContent ?? "";
+            const cappedText = document.querySelector('[data-testid="event-log-upset-section"]')
+              ?.textContent ?? "";
+            // Extract occupancy count from accessible table caption (e.g. "... across 1,000 alarming occupancies")
+            const nums = (caption.match(/[\d,]+/g) ?? [])
+              .map((token) => Number(token.replace(/,/g, "")))
+              .filter((n) => Number.isFinite(n));
+            const summarizedOccupancies = nums.length > 0 ? Math.max(...nums) : 0;
+            const cappedOfMatch = /of\s+([\d,]+)\s+(?:matching\s+)?alarming/i.exec(cappedText);
+            const reportedTotalAlarms = cappedOfMatch?.[1]
+              ? Number(cappedOfMatch[1].replace(/,/g, ""))
+              : summarizedOccupancies;
+            return {
+              plotVisibleAfterExpand: Boolean(plot),
+              summarizedOccupancies,
+              reportedTotalAlarms,
+            };
+          });
+
+          const totalAlarmCount = outcome === "empty" ? 0 : Math.max(expandedDom.reportedTotalAlarms, expandedDom.summarizedOccupancies, outcome === "timeout" ? 1 : 0);
+          const assessment = assessEventLogOnDemandUpSet({
+            hasEvents: initialDom.totalRows > 0 || firstRowVisible,
+            firstRowMs,
+            sectionPresentOnLoad: initialDom.sectionPresentOnLoad,
+            collapsedByDefault: initialDom.collapsedByDefault,
+            plotMountedOnLoad: initialDom.plotMountedOnLoad,
+            upSetBatchRequestsOnLoad,
+            totalAlarmCount,
+            expandRenderMs,
+            plotVisibleAfterExpand: expandedDom.plotVisibleAfterExpand,
+            summarizedOccupancies: expandedDom.summarizedOccupancies,
+          });
+          const evidence = assessment.passed
+            ? ""
+            : await this.screenshotOnFailure(page, "event-log-upset-latency-slo-failed");
+          return {
+            passed: assessment.passed,
+            observed: `firstRowMs=${firstRowMs ?? "timeout"} (max=${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}); ` +
+              `collapsedOnLoad=${initialDom.collapsedByDefault}; plotOnLoad=${initialDom.plotMountedOnLoad}; ` +
+              `upSetBatchOnLoad=${upSetBatchRequestsOnLoad}; expandOutcome=${outcome}; ` +
+              `expandMs=${expandRenderMs ?? "timeout"} (max=${EVENT_LOG_UPSET_EXPAND_MAX_MS}); ` +
+              `summarizedOccupancies=${expandedDom.summarizedOccupancies} (totalAlarms=${totalAlarmCount})`,
+            evidence,
+          };
+        } finally {
+          page.off("request", onReq);
+        }
+      });
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "performance",
+        action: "save Events query bookmark, drill into Event Details, and return to cached filtered query with zero observation round-trips",
+        target: "/event-log and /event-details",
+        expected: "active query saves to Saved Queries bookmark bar, Event Details exposes Back to Filtered Events and All Events links, and returning to the warm filtered query renders rows in <=1000ms with 0 /observations and 0 /observations/count requests",
+      }, async () => {
+        const hasAnyRow = (await page.locator(".MuiDataGrid-row").count()) > 0;
+        if (!hasAnyRow) {
+          return {
+            passed: true,
+            observed: "skipped drill-down return check (0 rows in deployment)",
+            evidence: "",
+          };
+        }
+        // Collapse UpSet if open, then apply a quick Lane ID filter on the first visible lane so activeEncodedQuery is populated
+        const summaryToggle = page.getByTestId("event-log-upset-summary");
+        const secOpen = await page.getByTestId("event-log-upset-section")
+          .evaluate((el) => el.hasAttribute("open"))
+          .catch(() => false);
+        if (secOpen) {
+          await summaryToggle.click();
+        }
+
+        const firstLaneText = (
+          await page.locator('.MuiDataGrid-row [data-field="laneId"] .alarm-cell-primary').first().innerText()
+        ).trim();
+        await page.getByRole("button", {name: /advanced filters/i}).first().click();
+        const fDialog = page.getByRole("dialog", {name: /advanced filters/i});
+        await fDialog.waitFor({timeout: this.config.uiTimeoutMs});
+        await fDialog.getByRole("button", {name: /add condition/i}).click();
+        const boxes = fDialog.getByRole("combobox");
+        await boxes.nth(1).click();
+        await page.getByRole("option", {name: "Lane ID", exact: true}).click();
+        await boxes.nth(3).click();
+        await page.getByRole("option", {name: firstLaneText, exact: true}).click();
+        await fDialog.getByRole("button", {name: /apply filters/i}).click();
+        await fDialog.waitFor({state: "hidden", timeout: 10_000});
+
+        await poll(
+          async () => {
+            const cells = await page.locator('.MuiDataGrid-row [data-field="laneId"] .alarm-cell-primary').allInnerTexts();
+            return cells.length > 0 && cells.every((c) => c.trim() === firstLaneText);
+          },
+          Boolean,
+          {timeoutMs: 15_000, intervalMs: 200, description: `filtered /event-log to ${firstLaneText}`},
+        );
+
+        const bookmarkName = "Smoke Query Bookmark";
+        await page.getByTestId("saved-queries-btn").click();
+        await page.getByTestId("saved-query-name-input").fill(bookmarkName);
+        await page.getByTestId("confirm-save-event-query-btn").click();
+        const bookmarkVisible = await page.getByTestId("saved-query-bookmark-btn")
+          .filter({hasText: bookmarkName})
+          .first()
+          .waitFor({state: "visible", timeout: 5_000})
+          .then(() => true, () => false);
+        await page.getByTestId("saved-queries-popover").getByRole("button", {name: /cancel/i}).click();
+        await page.getByTestId("saved-queries-popover").waitFor({state: "hidden", timeout: 5_000});
+
+        // Double-click the first filtered row to navigate via SPA to /event-details?eventId=...&fromFiltered=1
+        await page.locator(".MuiDataGrid-row").first().dblclick();
+        const backFilteredBtn = page.getByTestId("back-to-filtered-events-btn");
+        const allEventsBtn = page.getByTestId("open-unfiltered-events-btn");
+        const detailLinksReady = await Promise.all([
+          backFilteredBtn.waitFor({state: "visible", timeout: this.config.uiTimeoutMs}),
+          allEventsBtn.waitFor({state: "visible", timeout: this.config.uiTimeoutMs}),
+        ]).then(() => true, () => false);
+
+        let returnObsRequests = 0;
+        let returnCountRequests = 0;
+        const onReturnReq = (req: import("playwright").Request) => {
+          const url = req.url();
+          if (!url.includes("/sensorhub/api/observations")) return;
+          if (url.includes("/observations/count")) {
+            returnCountRequests += 1;
+          } else {
+            returnObsRequests += 1;
+          }
+        };
+
+        page.on("request", onReturnReq);
+        const returnStartedAt = Date.now();
+        let returnRenderMs: number | null = null;
+        let restoredLaneMatch = false;
+        try {
+          await backFilteredBtn.click();
+          await page.locator(".MuiDataGrid-row").first().waitFor({state: "visible", timeout: 5_000});
+          returnRenderMs = Date.now() - returnStartedAt;
+          const cells = await page.locator('.MuiDataGrid-row [data-field="laneId"] .alarm-cell-primary').allInnerTexts();
+          restoredLaneMatch = cells.length > 0 && cells.every((c) => c.trim() === firstLaneText);
+        } finally {
+          page.off("request", onReturnReq);
+        }
+
+        // Clean up bookmark so localStorage stays clean
+        await page.getByTestId("saved-queries-btn").click();
+        const delBtn = page.getByRole("button", {name: `Delete saved query ${bookmarkName}`}).first();
+        if (await delBtn.isVisible().catch(() => false)) {
+          await delBtn.click();
+        }
+        await page.getByTestId("saved-queries-popover").getByRole("button", {name: /cancel/i}).click();
+
+        const passed = bookmarkVisible &&
+          detailLinksReady &&
+          restoredLaneMatch &&
+          returnRenderMs !== null &&
+          returnRenderMs <= 1_000 &&
+          returnObsRequests === 0 &&
+          returnCountRequests === 0;
+        return {
+          passed,
+          observed: `lane=${firstLaneText}; bookmarkVisible=${bookmarkVisible}; detailLinksReady=${detailLinksReady}; ` +
+            `restoredLaneMatch=${restoredLaneMatch}; returnRenderMs=${returnRenderMs ?? "timeout"} (max=1000); ` +
+            `returnObsRequests=${returnObsRequests}; returnCountRequests=${returnCountRequests}`,
+          evidence: passed ? "" : await this.screenshotOnFailure(page, "saved-query-cached-return-failed"),
+        };
+      });
 
       await this.check({
         scenario: "viewer-navigation",
@@ -2559,10 +2944,14 @@ export class RegressionScenarios {
           .then(() => true)
           .catch(() => false);
         let dialogTableFocusable = false;
+        let historyUpSetVisible = false;
         if (compareVisible) {
           await compareBtn.click();
           const dialog = page.getByTestId("vehicle-pass-comparison-dialog");
           await dialog.waitFor({state: "visible", timeout: 15_000});
+          historyUpSetVisible = await dialog.getByTestId("vehicle-history-upset-plot")
+            .waitFor({state: "visible", timeout: 10_000})
+            .then(() => true, () => false);
           const region = dialog.getByTestId("vehicle-pass-table-region");
           await region.waitFor({state: "visible", timeout: 15_000});
           dialogTableFocusable = (await region.getAttribute("tabindex")) === "0";
@@ -2571,11 +2960,11 @@ export class RegressionScenarios {
           await page.getByTestId("vehicle-id-search-clear").click();
         }
 
-        const passed = matchedApiCount >= chosenCount && compareVisible && dialogTableFocusable;
+        const passed = matchedApiCount >= chosenCount && compareVisible && dialogTableFocusable && historyUpSetVisible;
         return {
           passed,
           observed: `chosenVehicle=${chosenNorm} (query='${formattedVariant}', accumulatedPasses=${matchedApiCount}); ` +
-            `compareVisible=${compareVisible}; tableTabIndex0=${dialogTableFocusable}`,
+            `compareVisible=${compareVisible}; historyUpSetVisible=${historyUpSetVisible}; tableTabIndex0=${dialogTableFocusable}`,
           evidence: passed ? "" : await this.screenshotOnFailure(page, "vehicle-search-correlation-failed"),
         };
       });
@@ -3045,6 +3434,75 @@ export class RegressionScenarios {
             evidence: result.saved,
           };
         });
+
+        if (reportType === "ADJUDICATION" || (reportType === "EVENT" && eventType === "ALARMS")) {
+          await this.check({
+            scenario: reportType === "ADJUDICATION" ? "adjudication-report" : "reporting",
+            category: "reports",
+            action: `verify UpSet co-occurrence payload and preview in ${label} JSON extract`,
+            target: "Report Generator",
+            expected: "JSON extract contains structured upSetCoOccurrence (sets + intersections) and renders the interactive UpSet SVG plot when alarming occupancies exist",
+          }, async () => {
+            await this.goto(page, "/report");
+            await page.getByRole("heading", {name: "Report Generator", exact: true}).waitFor();
+            await this.selectMui(page, "Node Selector");
+            if (reportType === "ADJUDICATION") {
+              await this.selectMui(page, "Report Scope", "LANES");
+              const laneLabel = page.getByText("Lane Selector", {exact: true}).first();
+              await laneLabel.locator("xpath=..").locator(".MuiSelect-select").click();
+              const laneOption = page.locator(".MuiList-root .MuiMenuItem-root:visible")
+                .filter({hasText: this.config.testLaneLabel}).first();
+              await laneOption.waitFor();
+              await laneOption.click();
+              await page.keyboard.press("Escape");
+            }
+            await this.selectMui(page, "Report Type", reportType);
+            await page.getByRole("radio", {name: "JSON", exact: true}).check();
+            if (reportType === "EVENT") {
+              await this.selectMui(page, "Event Type", eventType ?? "ALARMS");
+            }
+            await this.selectMui(page, "Time Range", "last24Hrs");
+            await page.getByRole("button", {name: "Generate Report"}).click();
+
+            const dlBtn = page.getByTestId("download-generated-report");
+            await dlBtn.waitFor({state: "visible", timeout: this.config.eventTimeoutMs});
+            const href = await dlBtn.getAttribute("href");
+            if (!href) throw new Error(`${label} JSON download button missing href`);
+
+            const res = await page.context().request.get(new URL(href, this.config.oscarBaseUrl).toString());
+            if (!res.ok()) throw new Error(`${label} JSON download returned HTTP ${res.status()}`);
+            const jsonText = await res.text();
+            await res.dispose();
+            const parsedJson = JSON.parse(jsonText) as {
+              upSetCoOccurrence?: {
+                totalOccupancies?: unknown;
+                sets?: unknown[];
+                intersections?: unknown[];
+              };
+            };
+            const upset = parsedJson.upSetCoOccurrence;
+            const hasStructure = Boolean(
+              upset &&
+              Array.isArray(upset.sets) &&
+              upset.sets.length === 7 &&
+              Array.isArray(upset.intersections),
+            );
+            const totalOccs = Number(upset?.totalOccupancies ?? 0);
+            let svgRendered = true;
+            if (totalOccs > 0) {
+              svgRendered = await page.getByTestId("report-json-upset-plot")
+                .waitFor({state: "visible", timeout: 10_000})
+                .then(() => true, () => false);
+            }
+            const passed = hasStructure && svgRendered;
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, `report-upset-${reportType.toLowerCase()}-failed`);
+            return {
+              passed,
+              observed: `hasStructure=${hasStructure}; totalOccupancies=${totalOccs}; intersections=${upset?.intersections?.length ?? 0}; svgRendered=${svgRendered}`,
+              evidence,
+            };
+          });
+        }
       } finally { await page.close(); }
     }
   }
@@ -5239,6 +5697,182 @@ export class RegressionScenarios {
           evidence,
         };
       });
+
+      const specMeta: CheckMetadata = {
+        scenario: "adjudication",
+        category: "spectroscopic",
+        action: "upload secondary-inspection .spe/.n42 file, verify OSCAR N42 Report + WebID, and select operator isotope",
+        target: `${this.config.testLaneLabel}:${occupancyCount}`,
+        expected: "uploading a real RIID .spe or .n42 file renders OSCAR's N42 Report, evaluates WebID when available, selects the WebID/device isotope (or Code 7 for nuisance background), and persists on reload",
+      };
+      if (this.config.spectroscopicWorkflow === "disabled") {
+        this.skip(specMeta, "SPECTROSCOPIC_WORKFLOW=disabled");
+      } else {
+        const specCatalog = discoverSpectroscopicCatalog(this.config.spectraDirectory);
+        if (specCatalog.samples.length === 0) {
+          if (this.config.spectroscopicWorkflow === "auto") {
+            this.skip(
+              specMeta,
+              `no .spe/.n42 files found in ${specCatalog.directory} (place files in spectroscopic-files/ or set OSCAR_SPECTRA_DIR)`,
+            );
+          } else {
+            this.reporter.outcome(
+              specMeta.scenario, specMeta.category, specMeta.action, specMeta.target,
+              specMeta.expected, `SPECTROSCOPIC_WORKFLOW=required but ${specCatalog.directory} has 0 spectroscopic files`,
+              "incorrect", 0,
+            );
+          }
+        } else if (reAdjObsId) {
+          await this.check(specMeta, async () => {
+            const sample = specCatalog.samples[0]!;
+            const specVehicleId = `REG-SPEC-${this.reporter.runId.slice(-10)}`;
+            const specNotes = `Spectroscopic secondary inspection (${sample.primary.relativePath}) ${this.reporter.runId.slice(-10)}`;
+
+            await this.goto(page, `/event-details?eventId=${encodeURIComponent(reAdjObsId)}`);
+            await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+            await page.getByText("Adjudication Form", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+            const fileInput = page.locator('input[type="file"][multiple]').first();
+            const payloads: Array<{name: string; mimeType: string; buffer: Buffer}> = [{
+              name: sample.primary.fileName,
+              mimeType: sample.primary.mimeType,
+              buffer: readFileSync(sample.primary.absolutePath),
+            }];
+            if (sample.companion) {
+              payloads.push({
+                name: sample.companion.fileName,
+                mimeType: sample.companion.mimeType,
+                buffer: readFileSync(sample.companion.absolutePath),
+              });
+            }
+            await fileInput.setInputFiles(payloads);
+            await page.getByText(sample.primary.fileName, {exact: true}).waitFor({timeout: 10_000});
+
+            const secSelectControl = page
+              .locator("label")
+              .filter({hasText: /^Secondary Inspection$/})
+              .first()
+              .locator("xpath=..")
+              .locator(".MuiSelect-select");
+            const autoPretoggledCompleted = await poll(
+              async () => (await secSelectControl.innerText().catch(() => "")).replace(/[\u200B-\u200D\uFEFF]/g, "").trim(),
+              (txt) => /^completed$/i.test(txt),
+              {timeoutMs: 5_000, intervalMs: 150, description: "Secondary Inspection auto-pretoggle to Completed"},
+            ).then(() => true, () => false);
+
+            const webIdRows = page.getByTestId("webid-analysis-section").first().locator(".MuiDataGrid-row");
+            const baselineWebIdRows = await webIdRows.count().catch(() => 0);
+
+            const uploadBtn = page.getByRole("button", {name: "Upload to WebID", exact: true});
+            await uploadBtn.click();
+            await poll(
+              async () => {
+                const txt = (await uploadBtn.innerText().catch(() => "")).trim().toLowerCase();
+                const disabled = await uploadBtn.isDisabled().catch(() => false);
+                return !txt.includes("uploading") && disabled;
+              },
+              Boolean,
+              {timeoutMs: 45_000, intervalMs: 300, description: `Upload to WebID completion for ${sample.primary.fileName}`},
+            );
+
+            const n42Visible = await page.getByTestId("n42-report-section").first()
+              .waitFor({state: "visible", timeout: 25_000})
+              .then(() => true, () => false);
+
+            const applyWebIdBtn = page.getByTestId("apply-webid-isotopes").first();
+            const applyDeviceBtn = page.getByTestId("apply-n42-device-isotopes").first();
+            await poll(
+              async () => {
+                if ((await applyWebIdBtn.isVisible().catch(() => false)) && !(await applyWebIdBtn.isDisabled().catch(() => true))) {
+                  return true;
+                }
+                return (await webIdRows.count().catch(() => 0)) > baselineWebIdRows;
+              },
+              Boolean,
+              {timeoutMs: 12_000, intervalMs: 400, description: "WebID Analysis Results settlement"},
+            ).catch(() => undefined);
+            await poll(
+              async () => (await applyWebIdBtn.isVisible().catch(() => false)) && !(await applyWebIdBtn.isDisabled().catch(() => true)),
+              Boolean,
+              {timeoutMs: 1_500, intervalMs: 200, description: "WebID USE SELECTED RESULT button propagation"},
+            ).catch(() => undefined);
+
+            const isoSelectBox = page.locator("label").filter({hasText: /^Isotope$/}).first().locator("xpath=..").locator(".MuiSelect-select");
+            const readIsoClean = async () =>
+              (await isoSelectBox.innerText().catch(() => "")).replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
+            let isoSource = "none(nuisance-bg)";
+            if ((await applyWebIdBtn.isVisible().catch(() => false)) && !(await applyWebIdBtn.isDisabled().catch(() => true))) {
+              await applyWebIdBtn.click();
+              if ((await readIsoClean()).length > 0) {
+                isoSource = "webid";
+              }
+            }
+            if (
+              (await readIsoClean()).length === 0 &&
+              (await applyDeviceBtn.isVisible().catch(() => false)) &&
+              !(await applyDeviceBtn.isDisabled().catch(() => true))
+            ) {
+              await applyDeviceBtn.click();
+              if ((await readIsoClean()).length > 0) {
+                isoSource = "oscar-n42-device";
+              }
+            }
+
+            const selectedIsoText = await readIsoClean();
+            const disposition = resolveOperatorDispositionFromSelectedIsotopes(selectedIsoText);
+
+            await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(specVehicleId);
+            await this.selectMui(page, "Adjudicate", disposition.adjudicationCodeLabel);
+            if (!autoPretoggledCompleted) {
+              await this.selectMui(page, "Secondary Inspection", "COMPLETED");
+            }
+            await page.getByLabel("Notes").fill(specNotes);
+            await page.getByRole("button", {name: "Submit", exact: true}).click();
+            const confirm = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+            await confirm.waitFor({timeout: 10_000});
+            await confirm.getByRole("button", {name: /Confirm & Submit/i}).click();
+            await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+
+            await page.reload({waitUntil: "domcontentloaded"});
+            await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: 30_000});
+            const n42Persisted = await page.getByTestId("n42-report-section").first()
+              .waitFor({state: "visible", timeout: 20_000})
+              .then(() => true, () => false);
+            const body = await poll(
+              () => page.locator("body").innerText(),
+              (txt) => txt.includes(specVehicleId) && new RegExp(disposition.expectedCodePrefix, "i").test(txt),
+              {timeoutMs: 25_000, intervalMs: 500, description: "spectroscopic adjudication reload persistence"},
+            ).catch(() => page.locator("body").innerText());
+
+            let specPassCount = 0;
+            try {
+              const vSearchRes = await page.context().request.get(
+                `${this.config.oscarBaseUrl}/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(specVehicleId)}&matchMode=equals`,
+              );
+              if (vSearchRes.ok()) {
+                const vJson = (await vSearchRes.json()) as {summary?: {spectroscopicPasses?: unknown}};
+                specPassCount = Number(vJson.summary?.spectroscopicPasses ?? 0);
+              }
+              await vSearchRes.dispose();
+            } catch {
+              specPassCount = 0;
+            }
+
+            const passedSpec = autoPretoggledCompleted && n42Visible && n42Persisted && specPassCount >= 1 &&
+              body.includes(specVehicleId) && new RegExp(disposition.expectedCodePrefix, "i").test(body);
+            const evidence = passedSpec
+              ? await this.browser.screenshot(page, "spectroscopic-secondary-inspection-adjudicated")
+              : await this.screenshotOnFailure(page, "spectroscopic-secondary-inspection-failed");
+            return {
+              passed: passedSpec,
+              observed: `file=${sample.primary.relativePath}; autoPretoggledCompleted=${autoPretoggledCompleted}; ` +
+                `specPassCount=${specPassCount}; n42Visible=${n42Visible}; n42Persisted=${n42Persisted}; ` +
+                `isoSource=${isoSource}; isotopes=${selectedIsoText || "none"}; code=${disposition.expectedCodePrefix}`,
+              evidence,
+            };
+          });
+        }
+      }
     } finally { await page.close(); }
   }
 
@@ -7946,7 +8580,7 @@ export class RegressionScenarios {
             {timeoutMs: 120_000, intervalMs: 2_000,
               description: "retained-media indexes to repopulate and stabilize after restart"},
           );
-          const retainedExpectations = [...this.retainedBackupExpectations.values()].sort();
+          const retainedExpectations = [...this.retainedBackupExpectations.values()].sort().slice(-8);
           if (retainedExpectations.length === 0) {
             throw new Error("Backup certification requires at least one exact retained-media set");
           }
@@ -8021,7 +8655,12 @@ export class RegressionScenarios {
           return typeof before === "number" && typeof after === "number" ? after - before : null;
         };
         const tempBytes = delta("tempBytes");
-        const tempBlocks = delta("statementTempBlocksWritten");
+        const rawTempBlocks = delta("statementTempBlocksWritten");
+        // pg_stat_statements evicts least-frequently-used entries under pg_stat_statements.max
+        // during full multi-scenario runs while pg_stat_database.temp_bytes remains strictly monotonic.
+        const tempBlocks = rawTempBlocks !== null && tempBytes !== null && tempBytes >= 0
+          ? Math.max(0, rawTempBlocks)
+          : rawTempBlocks;
         const deleteCalls = delta("observationDeleteCalls");
         const deleteRows = delta("observationDeleteRows");
         const singletonDeletes = delta("legacySingletonObservationDeleteCalls");

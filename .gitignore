@@ -26,3 +26,9 @@ id_ed25519.*
 EML-VM250-*
 eml-vm250-*
 *eml*.jar
+spectroscopic-files/*
+!spectroscopic-files/README.md
+*.spe
+*.n42
+*.n42.xml
+*.spc

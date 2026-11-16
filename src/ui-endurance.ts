@@ -1,6 +1,6 @@
 import {execFile} from "node:child_process";
 import {randomBytes, randomUUID} from "node:crypto";
-import {appendFileSync, chmodSync, existsSync, mkdirSync, renameSync, writeFileSync} from "node:fs";
+import {appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync} from "node:fs";
 import {join, resolve} from "node:path";
 import {promisify} from "node:util";
 import {
@@ -18,6 +18,12 @@ import {isExpectedRetainedMediaMiss} from "./browser.js";
 import {loadConfig} from "./config.js";
 import {csvCell} from "./csv.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS, type LaneConfigOracle} from "./lane-config.js";
+import {
+  discoverSpectroscopicCatalog,
+  resolveOperatorDispositionFromSelectedIsotopes,
+  selectSpectroscopicSampleForCycle,
+  type SpectroscopicCatalog,
+} from "./spectroscopic-catalog.js";
 import type {SuiteConfig} from "./types.js";
 import {
   alarmPriorityRank,
@@ -127,6 +133,10 @@ interface OccupancyCatalog {
 
 function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeMuiSelectText(raw: string): string {
+  return raw.replace(/[\u200B-\u200D\uFEFF]/g, "").trim();
 }
 
 async function searchErrorCleanup(page: Page): Promise<void> {
@@ -454,6 +464,13 @@ class UiEnduranceRunner {
   private failedAdjudicationCycles = 0;
   private skippedAdjudicationCycles = 0;
   private readonly workflowsVerified = new Set<string>();
+  private readonly spectroscopicCatalog: SpectroscopicCatalog;
+  private spectroscopicUploadSequence = 0;
+  private spectroscopicUploadsCompleted = 0;
+  private spectroscopicSecondariesCompleted = 0;
+  private webIdIsotopeSelections = 0;
+  private deviceIsotopeSelections = 0;
+  private nuisanceBackgroundSelections = 0;
   private hardErrorCount = 0;
   private warningCount = 0;
 
@@ -461,6 +478,7 @@ class UiEnduranceRunner {
     private readonly config: SuiteConfig,
     private readonly options: UiEnduranceCliOptions,
   ) {
+    this.spectroscopicCatalog = discoverSpectroscopicCatalog(options.spectraDir);
     const stamp = this.startedAtIso.replace(/[-:.]/g, "").slice(0, 15) + "Z";
     const suffix = randomBytes(4).toString("hex");
     this.runId = `${stamp}-${suffix}`;
@@ -1708,7 +1726,13 @@ class UiEnduranceRunner {
     plan: CycleExecutionPlan,
     observationId: string,
     allowedLanes?: ReadonlySet<string>,
-  ): Promise<{evidenceSummary: string; consysVerified: boolean; effectiveVehicleId: string}> {
+  ): Promise<{
+    evidenceSummary: string;
+    consysVerified: boolean;
+    effectiveVehicleId: string;
+    effectiveSecondaryInspection: string;
+    selectedIsotopesSummary: string;
+  }> {
     await page.getByText("Adjudication Form", {exact: true}).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
@@ -1749,53 +1773,7 @@ class UiEnduranceRunner {
       throw new Error("Confirm Adjudication Submission opened with unselected Code 0");
     }
 
-    // 2. Evidence Collection: Multi-file upload + WebID UI controls + delete extra file
-    const keepFileName = `nimo-evidence-${this.runId.slice(-6)}-${plan.cycleIndex + 1}.txt`;
-    const tempWebIdFileName = `nimo-webid-ui-${plan.cycleIndex + 1}.n42`;
-    const fileInput = page.locator('input[type="file"][multiple]').first();
-    await fileInput.setInputFiles([
-      {
-        name: keepFileName,
-        mimeType: "text/plain",
-        buffer: Buffer.from(
-          `OSCAR UI endurance diagnostic attachment\ncycle=${plan.cycleIndex + 1}\nvehicle=${plan.vehicleId}\n`,
-          "utf8",
-        ),
-      },
-      {
-        name: tempWebIdFileName,
-        mimeType: "application/xml",
-        buffer: Buffer.from("<RadInstrumentData/>", "utf8"),
-      },
-    ]);
-
-    await page.getByText(keepFileName, {exact: true}).waitFor({timeout: 10_000});
-    await page.getByText(tempWebIdFileName, {exact: true}).waitFor({timeout: 10_000});
-
-    // Toggle WebID ON for the second file (index 1) and exercise Spectrum Type + Synthesize Background
-    const webIdCheckboxes = page.getByRole("checkbox", {name: "WebID"});
-    await webIdCheckboxes.nth(1).check();
-    await page.locator("label").filter({hasText: /^Detector Response Function$/}).first().waitFor({
-      timeout: 10_000,
-    });
-    await this.selectMui(page, "Spectrum Type", "Foreground");
-    const synthCheckbox = page.getByRole("checkbox", {name: "Synthesize Background"}).first();
-    await synthCheckbox.waitFor({timeout: 10_000});
-    await synthCheckbox.check();
-    const uploadToWebIdBtn = page.getByRole("button", {name: "Upload to WebID", exact: true});
-    if (await uploadToWebIdBtn.isDisabled()) {
-      throw new Error("Upload to WebID button remained disabled with WebID file checked");
-    }
-
-    // Delete the temporary WebID file so only the local bucket diagnostic file remains
-    await page.getByRole("button", {name: `Delete ${tempWebIdFileName}`, exact: true}).click();
-    await poll(
-      async () => !(await page.getByText(tempWebIdFileName, {exact: true}).isVisible().catch(() => false)),
-      Boolean,
-      {timeoutMs: 5_000, intervalMs: 200, description: "deletion of temporary WebID file"},
-    );
-
-    // 3. Evidence Collection: Spectroscopic QR Code Scanner + deterministic camera + track release
+    // 2. Evidence Collection: Spectroscopic QR Code Scanner + deterministic camera + track release
     await page.getByText("QR Scanner", {exact: true}).click();
     const qrDialog = page.getByRole("dialog", {name: /Spectroscopic QR Code Scanner/i});
     await qrDialog.waitFor({timeout: this.config.uiTimeoutMs});
@@ -1861,6 +1839,195 @@ class UiEnduranceRunner {
       {timeoutMs: 8_000, intervalMs: 200, description: "camera MediaStreamTrack release after QR dialog close"},
     );
 
+    // 3. Evidence Collection: Multi-file upload + real secondary-inspection .spe/.n42 upload
+    //    (OSCAR N42 Report display + Sandia WebID analysis + operator isotope & code selection)
+    const keepFileName = `nimo-evidence-${this.runId.slice(-6)}-${plan.cycleIndex + 1}.txt`;
+    const tempWebIdFileName = `nimo-webid-ui-${plan.cycleIndex + 1}.n42`;
+    const specSample = selectSpectroscopicSampleForCycle(
+      this.spectroscopicCatalog,
+      this.spectroscopicUploadSequence++,
+    );
+    const fileInput = page.locator('input[type="file"][multiple]').first();
+    const uploadPayloads: Array<{name: string; mimeType: string; buffer: Buffer}> = [
+      {
+        name: keepFileName,
+        mimeType: "text/plain",
+        buffer: Buffer.from(
+          `OSCAR UI endurance diagnostic attachment\ncycle=${plan.cycleIndex + 1}\nvehicle=${plan.vehicleId}\n`,
+          "utf8",
+        ),
+      },
+      {
+        name: tempWebIdFileName,
+        mimeType: "application/xml",
+        buffer: Buffer.from("<RadInstrumentData/>", "utf8"),
+      },
+    ];
+    if (specSample) {
+      uploadPayloads.push({
+        name: specSample.primary.fileName,
+        mimeType: specSample.primary.mimeType,
+        buffer: readFileSync(specSample.primary.absolutePath),
+      });
+      if (specSample.companion) {
+        uploadPayloads.push({
+          name: specSample.companion.fileName,
+          mimeType: specSample.companion.mimeType,
+          buffer: readFileSync(specSample.companion.absolutePath),
+        });
+      }
+    }
+    await fileInput.setInputFiles(uploadPayloads);
+
+    await page.getByText(keepFileName, {exact: true}).waitFor({timeout: 10_000});
+    await page.getByText(tempWebIdFileName, {exact: true}).waitFor({timeout: 10_000});
+    if (specSample) {
+      await page.getByText(specSample.primary.fileName, {exact: true}).waitFor({timeout: 10_000});
+    }
+
+    // Verify Secondary Inspection automatically pretoggled to "Completed" when spectroscopic files were attached
+    const secSelectControl = page
+      .locator("label")
+      .filter({hasText: /^Secondary Inspection$/})
+      .first()
+      .locator("xpath=..")
+      .locator(".MuiSelect-select");
+    await poll(
+      async () => normalizeMuiSelectText(await secSelectControl.innerText().catch(() => "")),
+      (txt) => /^completed$/i.test(txt),
+      {timeoutMs: 5_000, intervalMs: 150, description: "Secondary Inspection auto-pretoggle to Completed"},
+    );
+
+    // Exercise WebID controls on the temporary item and delete it cleanly
+    const webIdCheckboxes = page.getByRole("checkbox", {name: "WebID"});
+    await webIdCheckboxes.nth(1).check();
+    await page.locator("label").filter({hasText: /^Detector Response Function$/}).first().waitFor({
+      timeout: 10_000,
+    });
+    const uploadToWebIdBtn = page.getByRole("button", {name: "Upload to WebID", exact: true});
+    if (await uploadToWebIdBtn.isDisabled()) {
+      throw new Error("Upload to WebID button remained disabled with WebID file checked");
+    }
+    await page.getByRole("button", {name: `Delete ${tempWebIdFileName}`, exact: true}).click();
+    await poll(
+      async () => !(await page.getByText(tempWebIdFileName, {exact: true}).isVisible().catch(() => false)),
+      Boolean,
+      {timeoutMs: 5_000, intervalMs: 200, description: "deletion of temporary WebID file"},
+    );
+
+    let effectiveCodeLabel = CODE_9_LABEL;
+    let expectedCodePrefix = "Code 9";
+    let effectiveSecondaryInspection: string = plan.secondaryInspection;
+    let selectedIsotopesSummary = plan.isotopePlan.finalExpected.join("+");
+    let specSummaryTag = "spectra=synthetic-fallback";
+
+    if (specSample) {
+      // Ensure WebID checkbox is active on the primary spectroscopic file and upload to OSCAR + WebID
+      const primaryWebIdCheckbox = page.getByRole("checkbox", {name: "WebID"}).nth(1);
+      if (!(await primaryWebIdCheckbox.isChecked())) {
+        await primaryWebIdCheckbox.check();
+      }
+      if (!specSample.companion) {
+        const expectedTypeLabel = specSample.primary.role === "background" ? "Background" : "Foreground";
+        await this.selectMui(page, "Spectrum Type", expectedTypeLabel);
+        if (expectedTypeLabel === "Foreground") {
+          const synthCheckbox = page.getByRole("checkbox", {name: "Synthesize Background"}).first();
+          await synthCheckbox.waitFor({timeout: 10_000});
+          if (specSample.synthesizeBackground) {
+            await synthCheckbox.check();
+          } else {
+            await synthCheckbox.uncheck();
+          }
+        }
+      }
+
+      const webIdRows = page.getByTestId("webid-analysis-section").first().locator(".MuiDataGrid-row");
+      const baselineWebIdRows = await webIdRows.count().catch(() => 0);
+
+      if (await uploadToWebIdBtn.isDisabled()) {
+        throw new Error(`Upload to WebID button disabled before uploading ${specSample.primary.fileName}`);
+      }
+      await uploadToWebIdBtn.click();
+
+      // Wait for multipart upload + server WebID round-trip to complete
+      await poll(
+        async () => {
+          const btnTxt = (await uploadToWebIdBtn.innerText().catch(() => "")).trim().toLowerCase();
+          const disabled = await uploadToWebIdBtn.isDisabled().catch(() => false);
+          return !btnTxt.includes("uploading") && disabled;
+        },
+        Boolean,
+        {timeoutMs: 45_000, intervalMs: 300, description: `Upload to WebID completion for ${specSample.primary.fileName}`},
+      );
+      this.spectroscopicUploadsCompleted += 1;
+
+      // Verify OSCAR renders the uploaded secondary-inspection spectrum in the N42 Report section
+      const n42Section = page.getByTestId("n42-report-section").first();
+      await n42Section.waitFor({state: "visible", timeout: 25_000});
+
+      // Poll for Sandia WebID analysis row arrival (when Sandia WebID is reachable)
+      const applyWebIdBtn = page.getByTestId("apply-webid-isotopes").first();
+      const applyDeviceBtn = page.getByTestId("apply-n42-device-isotopes").first();
+      await poll(
+        async () => {
+          if ((await applyWebIdBtn.isVisible().catch(() => false)) && !(await applyWebIdBtn.isDisabled().catch(() => true))) {
+            return true;
+          }
+          return (await webIdRows.count().catch(() => 0)) > baselineWebIdRows;
+        },
+        Boolean,
+        {timeoutMs: 12_000, intervalMs: 400, description: "WebID Analysis Results settlement"},
+      ).catch(() => undefined);
+      await poll(
+        async () => (await applyWebIdBtn.isVisible().catch(() => false)) && !(await applyWebIdBtn.isDisabled().catch(() => true)),
+        Boolean,
+        {timeoutMs: 1_500, intervalMs: 200, description: "WebID USE SELECTED RESULT button propagation"},
+      ).catch(() => undefined);
+
+      const isoLabel = page.locator("label").filter({hasText: /^Isotope$/}).first();
+      const isoSelectBox = isoLabel.locator("xpath=..").locator(".MuiSelect-select");
+      let isotopeSource = "none(background-nuisance)";
+
+      // Operator Priority 1: Highest-confidence WebID analysis result
+      if ((await applyWebIdBtn.isVisible().catch(() => false)) && !(await applyWebIdBtn.isDisabled().catch(() => true))) {
+        await applyWebIdBtn.click();
+        const afterWebId = normalizeMuiSelectText(await isoSelectBox.innerText().catch(() => ""));
+        if (afterWebId.length > 0) {
+          isotopeSource = "webid";
+          this.webIdIsotopeSelections += 1;
+        }
+      }
+
+      // Operator Priority 2: OSCAR N42 Report device-identified nuclide(s)
+      const currentIsoText = normalizeMuiSelectText(await isoSelectBox.innerText().catch(() => ""));
+      if (
+        currentIsoText.length === 0 &&
+        (await applyDeviceBtn.isVisible().catch(() => false)) &&
+        !(await applyDeviceBtn.isDisabled().catch(() => true))
+      ) {
+        await applyDeviceBtn.click();
+        const afterDevice = normalizeMuiSelectText(await isoSelectBox.innerText().catch(() => ""));
+        if (afterDevice.length > 0) {
+          isotopeSource = "oscar-n42-device";
+          this.deviceIsotopeSelections += 1;
+        }
+      }
+
+      const finalIsoText = normalizeMuiSelectText(await isoSelectBox.innerText().catch(() => ""));
+      if (finalIsoText.length === 0) {
+        this.nuisanceBackgroundSelections += 1;
+      }
+      const disposition = resolveOperatorDispositionFromSelectedIsotopes(finalIsoText);
+      effectiveCodeLabel = disposition.adjudicationCodeLabel;
+      expectedCodePrefix = disposition.expectedCodePrefix;
+      effectiveSecondaryInspection = "COMPLETED";
+      selectedIsotopesSummary = finalIsoText.length > 0 ? finalIsoText : "none(nuisance-bg)";
+      specSummaryTag =
+        `spectra=${specSample.primary.relativePath}` +
+        `${specSample.companion ? `+${specSample.companion.fileName}` : ""}` +
+        `(source=${isotopeSource};cat=${disposition.category};code=${expectedCodePrefix};sec=COMPLETED)`;
+    }
+
     // 4. Preserve live OCR auto-fill when present on OCR-enabled lanes; otherwise use recurring fleet ID
     const vehicleInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
     const autoFilledRaw = await vehicleInput.inputValue().catch(() => "");
@@ -1879,32 +2046,42 @@ class UiEnduranceRunner {
     }
     await page
       .locator(".MuiList-root .MuiMenuItem-root:visible")
-      .filter({hasText: CODE_9_LABEL})
+      .filter({hasText: effectiveCodeLabel})
       .first()
       .click();
 
-    // 5. Isotope multi-select (including Unknown exclusivity rule check)
-    const isoLabel = page.locator("label").filter({hasText: /^Isotope$/}).first();
-    const isoSelectBox = isoLabel.locator("xpath=..").locator(".MuiSelect-select");
-    await isoSelectBox.click();
-    for (const isoValue of plan.isotopePlan.preSelect) {
-      const item = page.locator(`.MuiList-root .MuiMenuItem-root[data-value="${isoValue}"]:visible`).first();
-      await item.waitFor({timeout: 10_000});
-      await item.click();
-    }
-    await page.keyboard.press("Escape");
-    await page.locator(".MuiList-root .MuiMenuItem-root:visible").first().waitFor({
-      state: "hidden",
-      timeout: 10_000,
-    }).catch(() => undefined);
+    // 5. Isotope multi-select fallback when no local spectroscopic corpus is configured
+    if (!specSample) {
+      const isoLabel = page.locator("label").filter({hasText: /^Isotope$/}).first();
+      const isoSelectBox = isoLabel.locator("xpath=..").locator(".MuiSelect-select");
+      await isoSelectBox.click();
+      for (const isoValue of plan.isotopePlan.preSelect) {
+        const item = page.locator(`.MuiList-root .MuiMenuItem-root[data-value="${isoValue}"]:visible`).first();
+        await item.waitFor({timeout: 10_000});
+        await item.click();
+      }
+      await page.keyboard.press("Escape");
+      await page.locator(".MuiList-root .MuiMenuItem-root:visible").first().waitFor({
+        state: "hidden",
+        timeout: 10_000,
+      }).catch(() => undefined);
 
-    const renderedIsotopes = (await isoSelectBox.innerText()).trim();
-    if (plan.isotopePlan.mode === "unknown-exclusivity" && renderedIsotopes !== "Unknown") {
-      throw new Error(`Expected Unknown exclusivity to collapse Isotope selection to 'Unknown'; got '${renderedIsotopes}'`);
+      const renderedIsotopes = (await isoSelectBox.innerText()).trim();
+      if (plan.isotopePlan.mode === "unknown-exclusivity" && renderedIsotopes !== "Unknown") {
+        throw new Error(`Expected Unknown exclusivity to collapse Isotope selection to 'Unknown'; got '${renderedIsotopes}'`);
+      }
     }
 
     // 6. Secondary Inspection + Notes
-    await this.selectMui(page, "Secondary Inspection", plan.secondaryInspection);
+    // When specSample remained attached, Secondary Inspection stays pretoggled to "Completed" without extra menu clicks;
+    // when tempWebIdFileName was deleted with no specSample, it reverted to empty and selectMui selects plan.secondaryInspection.
+    const currentSecText = normalizeMuiSelectText(await secSelectControl.innerText().catch(() => ""));
+    if (specSample && !/^completed$/i.test(currentSecText)) {
+      throw new Error(`Expected Secondary Inspection to remain pretoggled to 'Completed' for spectroscopic upload; got '${currentSecText}'`);
+    }
+    if (currentSecText.toUpperCase() !== effectiveSecondaryInspection.toUpperCase()) {
+      await this.selectMui(page, "Secondary Inspection", effectiveSecondaryInspection);
+    }
     await page.getByLabel("Notes").fill(plan.notes);
 
     // 7. Submit -> Verify Confirm Dialog Summary -> Test Cancel -> Re-open & Confirm & Submit
@@ -1912,8 +2089,17 @@ class UiEnduranceRunner {
     const confirmDialog = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
     await confirmDialog.waitFor({timeout: 10_000});
 
+    const expectedFileCount = 1 + (specSample ? (specSample.companion ? 2 : 1) : 0);
+    const expectedConfirmFragments = [
+      effectiveVehicleId,
+      expectedCodePrefix,
+      plan.notes,
+      keepFileName,
+      ...(specSample ? [specSample.primary.fileName, "Completed"] : []),
+      `Files (${expectedFileCount})`,
+    ];
     const confirmText = await confirmDialog.innerText();
-    for (const expectedFragment of [effectiveVehicleId, "Code 9", plan.notes, keepFileName, "Files (1)"]) {
+    for (const expectedFragment of expectedConfirmFragments) {
       if (!confirmText.includes(expectedFragment)) {
         throw new Error(`Confirm Adjudication Submission dialog missing '${expectedFragment}'`);
       }
@@ -1939,26 +2125,38 @@ class UiEnduranceRunner {
       page.context().request,
       observationId,
     );
+    if (specSample && consysVerified) {
+      this.spectroscopicSecondariesCompleted += 1;
+    }
 
     // Reload Event Details and confirm vehicleId, notes (including Read more dialog when > 50 chars),
-    // Code 9, and uploaded bucket file link persist in Logged Adjudications
+    // selected disposition code, N42 Report section, and uploaded bucket file links persist
     await page.reload({waitUntil: "domcontentloaded"});
     await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: 30_000});
     const notePrefix = plan.notes.slice(0, 40);
+    const codeReloadRe = new RegExp(escapeRegExp(expectedCodePrefix), "i");
     const bodyAfterReload = await poll(
       () => page.locator("body").innerText(),
       (text) =>
         (text.includes(effectiveVehicleId) || normalizeEnduranceVehicleId(text).includes(resolvedVehicle.normalizedVehicleId)) &&
         text.includes(notePrefix) &&
-        /Code 9/i.test(text),
+        codeReloadRe.test(text),
       {timeoutMs: 25_000, intervalMs: 500, description: "reloaded Logged Adjudications persistence"},
     );
+    if (specSample) {
+      await page.getByTestId("n42-report-section").first().waitFor({state: "visible", timeout: 20_000});
+    }
 
-    const readMoreBtn = page.getByRole("button", {name: /^Read more$/i}).first();
+    const readMoreBtn = page
+      .locator("tr")
+      .filter({hasText: effectiveVehicleId})
+      .getByRole("button", {name: /^Read more$/i})
+      .last();
     if (await readMoreBtn.isVisible().catch(() => false)) {
       await readMoreBtn.click();
       await page.getByRole("dialog").getByText(plan.notes, {exact: true}).waitFor({timeout: 10_000});
       await page.keyboard.press("Escape");
+      await page.getByRole("dialog").waitFor({state: "hidden", timeout: 5_000}).catch(() => undefined);
     }
 
     const fileHref = await page
@@ -1994,14 +2192,25 @@ class UiEnduranceRunner {
       );
       if (searchRes.ok()) {
         const searchJson = (await searchRes.json()) as {
+          summary?: {
+            alarmingPasses?: unknown;
+            spectroscopicPasses?: unknown;
+          };
           passes?: Array<{
             laneName?: unknown;
             occupancyObsId?: unknown;
             occupancyCount?: unknown;
+            gammaAlarm?: unknown;
+            neutronAlarm?: unknown;
             isAlarm?: unknown;
             adjudications?: unknown[];
           }>;
         };
+        if (specSample && Number(searchJson.summary?.spectroscopicPasses ?? 0) < 1) {
+          throw new Error(
+            `Expected spectroscopicPasses >= 1 in vehicle-search summary after spectroscopic secondary upload for ${effectiveVehicleId}; got ${String(searchJson.summary?.spectroscopicPasses)}`,
+          );
+        }
         const rawPasses = Array.isArray(searchJson.passes) ? searchJson.passes : [];
         const inScopePasses = allowedLanes
           ? rawPasses.filter((p) => allowedLanes.has(String(p.laneName ?? "").trim()))
@@ -2014,6 +2223,9 @@ class UiEnduranceRunner {
 
           const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
           await compDialog.waitFor({state: "visible", timeout: 15_000});
+          if (Number(searchJson.summary?.alarmingPasses ?? 0) > 0) {
+            await compDialog.getByTestId("vehicle-history-upset-plot").waitFor({state: "visible", timeout: 10_000});
+          }
           const tableRegion = compDialog.getByTestId("vehicle-pass-table-region");
           await tableRegion.waitFor({state: "visible", timeout: 15_000});
           const tabIndex = await tableRegion.getAttribute("tabindex");
@@ -2158,10 +2370,12 @@ class UiEnduranceRunner {
 
     return {
       evidenceSummary:
-        `file=${keepFileName}(persisted=${filePersisted}); ocrPreserved=${resolvedVehicle.preservedOcr}; ` +
-        `${multiPassSummary}; webIdUi=tested; qr=${plan.qrClearMode}`,
+        `file=${keepFileName}(persisted=${filePersisted}); ${specSummaryTag}; ocrPreserved=${resolvedVehicle.preservedOcr}; ` +
+        `${multiPassSummary}; qr=${plan.qrClearMode}`,
       consysVerified: consysVerified && filePersisted,
       effectiveVehicleId,
+      effectiveSecondaryInspection,
+      selectedIsotopesSummary,
     };
   }
 
@@ -2350,8 +2564,8 @@ class UiEnduranceRunner {
       occupancyCount: targetNotification.occupancyCount,
       observationId: targetNotification.eventId,
       vehicleId: detailOutcome.effectiveVehicleId,
-      secondaryInspection: plan.secondaryInspection,
-      isotopes: plan.isotopePlan.finalExpected.join("+"),
+      secondaryInspection: detailOutcome.effectiveSecondaryInspection,
+      isotopes: detailOutcome.selectedIsotopesSummary,
       evidenceSummary: detailOutcome.evidenceSummary,
       consysVerified: detailOutcome.consysVerified,
       uiRemovedLive: true,
@@ -2597,11 +2811,40 @@ class UiEnduranceRunner {
       {timeoutMs: 25_000, intervalMs: 400, description: `Event Log filtered strictly to ${target.laneId}`},
     );
 
-    // Navigate to Event Details for the target observation (preserving view query when scoped)
-    const detailHref = viewKey
-      ? `/event-details?eventId=${encodeURIComponent(target.observationId)}&view=${encodeURIComponent(viewKey)}`
-      : `/event-details?eventId=${encodeURIComponent(target.observationId)}`;
-    await this.gotoOperator(page, detailHref);
+    // Save the active query via the toolbar Saved Queries popover, drill into Event Details with fromFiltered=1,
+    // adjudicate, and return via "Back to Filtered Events".
+    const bookmarkName = "Endurance Lane Watch";
+    await page.getByTestId("saved-queries-btn").click();
+    await page.getByTestId("saved-query-name-input").fill(bookmarkName);
+    await page.getByTestId("confirm-save-event-query-btn").click();
+    await page.getByTestId("saved-query-bookmark-btn").filter({hasText: bookmarkName}).first().waitFor({
+      state: "visible",
+      timeout: 10_000,
+    });
+    await page.getByTestId("saved-queries-popover").getByRole("button", {name: /cancel/i}).click();
+    await page.getByTestId("saved-queries-popover").waitFor({state: "hidden", timeout: 5_000});
+
+    const matchingPageRow = page
+      .locator(`.MuiDataGrid-row[data-id*="${target.observationId}"]`)
+      .first();
+    if (await matchingPageRow.isVisible().catch(() => false)) {
+      await matchingPageRow.locator('[data-field="laneId"]').dblclick();
+    } else {
+      const detailParams = new URLSearchParams({
+        eventId: target.observationId,
+        fromFiltered: "1",
+        ...(viewKey ? {view: viewKey} : {}),
+      });
+      await this.gotoOperator(page, `/event-details?${detailParams.toString()}`);
+    }
+    await page.getByTestId("back-to-filtered-events-btn").waitFor({
+      state: "visible",
+      timeout: this.config.uiTimeoutMs,
+    });
+    await page.getByTestId("open-unfiltered-events-btn").waitFor({
+      state: "visible",
+      timeout: this.config.uiTimeoutMs,
+    });
 
     const detailOutcome = await this.exerciseFullAdjudicationDetailForm(
       page,
@@ -2610,10 +2853,25 @@ class UiEnduranceRunner {
       allowedLanes,
     );
 
-    // Return to /event-log, exercise the <search data-testid="vehicle-id-search-bar"> landmark against
-    // the adjudicated Vehicle ID (using a deliberately spaced/lowercase query variant), verify Compare Passes
-    // and VehiclePassComparisonDialog, clear Vehicle ID search, and then verify Adjudicated = Yes!
-    await this.gotoOperator(page, eventLogPath);
+    // Click "Back to Filtered Events" and verify the Lane ID query restores cleanly,
+    // then clean up the saved query bookmark and reset to unfiltered /event-log for Vehicle ID search.
+    await page.getByTestId("back-to-filtered-events-btn").click();
+    await poll(
+      async () => {
+        const returnedFiltered = await this.readRenderedRows(page);
+        return returnedFiltered.length > 0 && returnedFiltered.every((r) => r.laneId === target.laneId);
+      },
+      Boolean,
+      {timeoutMs: 25_000, intervalMs: 300, description: `Back to Filtered Events restored Lane ID=${target.laneId} query`},
+    );
+    await page.getByTestId("saved-queries-btn").click();
+    const delBookmarkBtn = page.getByRole("button", {name: `Delete saved query ${bookmarkName}`}).first();
+    if (await delBookmarkBtn.isVisible().catch(() => false)) {
+      await delBookmarkBtn.click();
+    }
+    await page.getByTestId("saved-queries-popover").getByRole("button", {name: /cancel/i}).click();
+    await page.getByTestId("saved-queries-popover").waitFor({state: "hidden", timeout: 5_000});
+    await page.getByTestId("reset-event-query-btn").click();
     await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
 
     const searchLandmark = page.locator('search[data-testid="vehicle-id-search-bar"]');
@@ -2641,6 +2899,7 @@ class UiEnduranceRunner {
     await compareBtn.click();
     const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
     await compDialog.waitFor({state: "visible", timeout: 15_000});
+    await compDialog.getByTestId("vehicle-history-upset-plot").waitFor({state: "visible", timeout: 10_000});
     await compDialog.getByTestId("vehicle-pass-table-region").waitFor({state: "visible", timeout: 15_000});
     await compDialog.getByRole("button", {name: /^close$/i}).last().click();
     await compDialog.waitFor({state: "hidden", timeout: 10_000});
@@ -2648,6 +2907,9 @@ class UiEnduranceRunner {
     await page.getByTestId("vehicle-id-search-clear").click();
     await compareBtn.waitFor({state: "hidden", timeout: 10_000});
     await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
+
+    // Verify the interactive UpSet alarm co-occurrence plot renders when alarming rows exist on /event-log
+    const upsetPlotVisible = await page.getByTestId("event-log-upset-plot").first().isVisible().catch(() => false);
 
     await page.getByRole("button", {name: /advanced filters/i}).first().click();
     await filterDialog.waitFor({timeout: this.config.uiTimeoutMs});
@@ -2705,9 +2967,9 @@ class UiEnduranceRunner {
       occupancyCount: target.occupancyCount,
       observationId: target.observationId,
       vehicleId: detailOutcome.effectiveVehicleId,
-      secondaryInspection: plan.secondaryInspection,
-      isotopes: plan.isotopePlan.finalExpected.join("+"),
-      evidenceSummary: `${detailOutcome.evidenceSummary}; vehicleSearchBar=tested; eventLogAdjudicatedYes=${verifiedAdjudicatedYes}`,
+      secondaryInspection: detailOutcome.effectiveSecondaryInspection,
+      isotopes: detailOutcome.selectedIsotopesSummary,
+      evidenceSummary: `${detailOutcome.evidenceSummary}; vehicleSearchBar=tested; upsetPlot=${upsetPlotVisible}; eventLogAdjudicatedYes=${verifiedAdjudicatedYes}`,
       consysVerified: detailOutcome.consysVerified,
       uiRemovedLive: verifiedAdjudicatedYes,
       durationMs: Date.now() - started,
@@ -2927,6 +3189,13 @@ class UiEnduranceRunner {
         skipped: skippedCycles,
         workflowsVerified: workflowsCovered,
         reservedLaneExcluded: this.config.testLaneLabel,
+        spectroscopicCatalogDir: this.spectroscopicCatalog.directory,
+        spectroscopicCatalogSampleCount: this.spectroscopicCatalog.samples.length,
+        spectroscopicUploadsCompleted: this.spectroscopicUploadsCompleted,
+        spectroscopicSecondariesCompleted: this.spectroscopicSecondariesCompleted,
+        webIdIsotopeSelections: this.webIdIsotopeSelections,
+        deviceIsotopeSelections: this.deviceIsotopeSelections,
+        nuisanceBackgroundSelections: this.nuisanceBackgroundSelections,
       },
       errors: {
         errorCount: hardErrors,
@@ -2946,6 +3215,7 @@ class UiEnduranceRunner {
       `- **Wallboard Samples:** \`${this.totalWallboardSamples - failedWallboards}/${this.totalWallboardSamples} PASS\` (unscoped never-reloaded mount preserved: \`${summary.wallboards.unscopedMountPreservedAllCycles}\`, heap \`${firstHeap} MB -> ${lastHeap} MB\`)`,
       `- **Scoped Views Verified:** \`${viewsCovered.join(", ") || "none"}\``,
       `- **Adjudication Workflows:** \`${passedCycles} passed\`, \`${failedCycles} failed\`, \`${skippedCycles} skipped\` (workflows: \`${workflowsCovered.join(", ") || "none"}\`; reserved lane \`${this.config.testLaneLabel}\` excluded)`,
+      `- **Secondary-Inspection Spectra:** \`${this.spectroscopicCatalog.samples.length}\` sample(s) in \`${this.spectroscopicCatalog.directory}\` (\`${this.spectroscopicUploadsCompleted}\` uploaded; spectroscopic secondaries completed: \`${this.spectroscopicSecondariesCompleted}\`; WebID selections: \`${this.webIdIsotopeSelections}\`; OSCAR N42 device selections: \`${this.deviceIsotopeSelections}\`; nuisance/background Code 7: \`${this.nuisanceBackgroundSelections}\`)`,
       `- **Browser/HTTP Errors:** \`${hardErrors}\` error(s), \`${summary.errors.warningCount}\` warning(s)`,
       ``,
       `## Recent Adjudication Cycles`,

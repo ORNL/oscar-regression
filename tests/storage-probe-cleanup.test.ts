@@ -216,6 +216,9 @@ esac
     assert.deepEqual(await client.runJson("restore-drill", ["restore_timeout_test"]), {
       restored: true,
     });
+    assert.deepEqual(await client.runJson("backup-check", ["backup_timeout_test"]), {
+      restored: true,
+    });
     await client.cleanup();
   } finally {
     if (oldPath === undefined) delete process.env.PATH;

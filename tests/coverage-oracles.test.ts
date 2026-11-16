@@ -2,12 +2,20 @@ import assert from "node:assert/strict";
 import {resolve} from "node:path";
 import test from "node:test";
 import {
+  assessDashboardLoadAndNextPageLatency,
   assessDashboardWidgetCustomization,
+  assessEventLogOnDemandUpSet,
   assessLaneViewStatusTableFaults,
   assessLiveVideoStartupAndAdvance,
   assessMultiCameraFeedCycle,
   assessViewerCachePolicy,
   canonicalAlarmTransferDocumentJson,
+  DASHBOARD_COUNT_QUERY_MAX_MS,
+  DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS,
+  DASHBOARD_INITIAL_FIRST_ROW_MAX_MS,
+  DASHBOARD_NEXT_PAGE_MAX_MS,
+  EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS,
+  EVENT_LOG_UPSET_EXPAND_MAX_MS,
   importedAlarmChartsRendered,
   LIVE_VIDEO_MAX_STARTUP_MS,
   liveLaneTelemetryChartsAdvancing,
@@ -284,6 +292,118 @@ test("assessDashboardWidgetCustomization and assessLaneViewStatusTableFaults val
       [{status: "Tamper", timestamp: "Invalid Date"}, ...validRows.slice(0, 3)],
       expectedFaults,
     ),
+    false,
+  );
+});
+
+test("assessDashboardLoadAndNextPageLatency enforces Dashboard load, datastreams, count, and Next-page SLOs", () => {
+  const healthy = {
+    hasAlarms: true,
+    firstRowMs: 1850,
+    datastreamsCollectionCalls: 1,
+    maxDatastreamsCollectionMs: 260,
+    maxCountQueryMs: 380,
+    nextPageAvailable: true,
+    nextPageRenderMs: 240,
+    nextPageCountRequests: 0,
+    page2DistinctFromPage1: true,
+    obs5xxCount: 0,
+  };
+  assert.equal(assessDashboardLoadAndNextPageLatency(healthy).passed, true);
+
+  // Catches 6,176 ms slow Dashboard initial load
+  assert.equal(
+    assessDashboardLoadAndNextPageLatency({
+      ...healthy,
+      firstRowMs: DASHBOARD_INITIAL_FIRST_ROW_MAX_MS + 500,
+    }).passed,
+    false,
+  );
+
+  // Catches multi-page datastreams waterfall (>1 call per node) or slow correlated EXISTS subquery
+  assert.equal(
+    assessDashboardLoadAndNextPageLatency({...healthy, datastreamsCollectionCalls: 2}).passed,
+    false,
+  );
+  assert.equal(
+    assessDashboardLoadAndNextPageLatency({
+      ...healthy,
+      maxDatastreamsCollectionMs: DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS + 100,
+    }).passed,
+    false,
+  );
+
+  // Catches 6,206 ms unpushed overlay count scan
+  assert.equal(
+    assessDashboardLoadAndNextPageLatency({
+      ...healthy,
+      maxCountQueryMs: DASHBOARD_COUNT_QUERY_MAX_MS + 100,
+    }).passed,
+    false,
+  );
+
+  // Catches 2,561 ms Next-arrow click latency or un-prewarmed interactive count waterfall
+  assert.equal(
+    assessDashboardLoadAndNextPageLatency({
+      ...healthy,
+      nextPageRenderMs: DASHBOARD_NEXT_PAGE_MAX_MS + 100,
+    }).passed,
+    false,
+  );
+  assert.equal(
+    assessDashboardLoadAndNextPageLatency({...healthy, nextPageCountRequests: 3}).passed,
+    false,
+  );
+});
+
+test("assessEventLogOnDemandUpSet requires collapsed zero-cost load and full-filter-set expansion within SLO", () => {
+  const healthy = {
+    hasEvents: true,
+    firstRowMs: 1900,
+    sectionPresentOnLoad: true,
+    collapsedByDefault: true,
+    plotMountedOnLoad: false,
+    upSetBatchRequestsOnLoad: 0,
+    totalAlarmCount: 250,
+    expandRenderMs: 1650,
+    plotVisibleAfterExpand: true,
+    summarizedOccupancies: 250,
+  };
+  assert.equal(assessEventLogOnDemandUpSet(healthy).passed, true);
+
+  // Rejects eager UpSet mount or upfront batch query on /event-log load
+  assert.equal(
+    assessEventLogOnDemandUpSet({...healthy, collapsedByDefault: false}).passed,
+    false,
+  );
+  assert.equal(
+    assessEventLogOnDemandUpSet({...healthy, plotMountedOnLoad: true}).passed,
+    false,
+  );
+  assert.equal(
+    assessEventLogOnDemandUpSet({...healthy, upSetBatchRequestsOnLoad: 1}).passed,
+    false,
+  );
+
+  // Rejects slow /event-log initial load or slow UpSet expansion
+  assert.equal(
+    assessEventLogOnDemandUpSet({
+      ...healthy,
+      firstRowMs: EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS + 100,
+    }).passed,
+    false,
+  );
+  assert.equal(
+    assessEventLogOnDemandUpSet({
+      ...healthy,
+      expandRenderMs: EVENT_LOG_UPSET_EXPAND_MAX_MS + 100,
+    }).passed,
+    false,
+  );
+
+  // Rejects summarizing only the 15 paginated rows on Page 1 when totalAlarmCount > 15
+  assert.equal(
+    assessEventLogOnDemandUpSet({...healthy, summarizedOccupancies: 15}).passed,
     false,
   );
 });

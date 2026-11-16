@@ -261,7 +261,7 @@ export class StorageProbeClient {
     if (!this.remoteWorkspace || !this.remoteScript) {
       throw new Error("Storage restore probe is not installed");
     }
-    const prefix = `${this.remoteWorkspace}/restore-drill`;
+    const prefix = `${this.remoteWorkspace}/${action}`;
     const outputPath = `${prefix}.stdout`;
     const errorPath = `${prefix}.stderr`;
     const statusPath = `${prefix}.status`;
@@ -479,7 +479,9 @@ export class StorageProbeClient {
     if (this.installed) await this.verifyTargetBinding();
     else await this.install();
     if (!this.remoteScript) throw new Error("Storage probe is not installed");
-    const restore = action === "restore-drill" ? await this.restoreCommand(action, args) : undefined;
+    const restore = action === "restore-drill" || action === "backup-check"
+      ? await this.restoreCommand(action, args)
+      : undefined;
     const command = restore?.command ?? [
       "sudo", "-n", "bash", this.remoteScript,
       "--release-dir", this.releaseDirectory,
@@ -515,9 +517,11 @@ export class StorageProbeClient {
         );
       }
       if (restore && commandTimedOut(error)) {
+        const label = action === "restore-drill" ? "Storage restore probe" : `Storage ${action} probe`;
+        const resumePhase = action === "restore-drill" ? "post-restore" : "post-backup";
         throw new Error(
-          `Storage restore probe exceeded its bounded ${this.config.storageRestoreProbeTimeoutMs ?? 7_200_000} ms deadline; ` +
-          "the remote command reached a terminal state before post-restore checks resumed",
+          `${label} exceeded its bounded ${this.config.storageRestoreProbeTimeoutMs ?? 7_200_000} ms deadline; ` +
+          `the remote command reached a terminal state before ${resumePhase} checks resumed`,
           {cause: error},
         );
       }

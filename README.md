@@ -43,8 +43,14 @@ source review before the suite can certify that version.
   (`<= 15 s`), decoded dimensions, advancing playback time, and multi-camera
   `Next`/`Previous` feed cycling (`Camera X of N`) on multi-camera lanes
 - continuous 24/7/365 `EventTable` unadjudicated Page 0 refill after inline or
-  bulk adjudication (`rowCount >= min(15, totalCount)`) and snapshot cutoff
-  preservation when paging to Page 1+ and returning to Page 0
+  bulk adjudication (`rowCount >= min(15, totalCount)`), snapshot cutoff
+  preservation when paging to Page 1+ and returning to Page 0, Dashboard initial
+  first-row load SLO (`<= 4.5 s`), single `/datastreams` collection discovery
+  SLO (`<= 1.5 s`), `/observations/count` query SLO (`<= 3.5 s`), single-click
+  Dashboard Next-page (`>`) latency SLO (`<= 1.5 s` with zero interactive count
+  round-trips), and `/event-log` initial load SLO (`<= 4.5 s`) with
+  collapsed-by-default UpSet disclosure (`0` upfront UpSet batch queries) plus
+  on-demand full-filter-set UpSet expansion (`<= 6.0 s`)
 - back-to-back one-second gamma/neutron alarm occupancies that exercise a short
   CLOSE behind the keyframe-gated camera OPEN, with a count-only OSCAR log gate
   rejecting camera-command timeout, quarantine, result-timeout, rejection, and
@@ -62,11 +68,16 @@ source review before the suite can certify that version.
   when the received package is downloaded again
 - deterministic Alarm Transfer camera scanning, lifecycle cleanup, permission
   failure/retry, and exported QR PNG image import
-- full adjudication, confirmation, and audit-history display
+- full adjudication, confirmation, and audit-history display, including optional
+  real secondary-inspection `.spe` and `.n42` uploads, OSCAR `N42 Report` rendering,
+  Sandia WebID analysis, and operator isotope/disposition selection
+  (see [`spectroscopic-files/README.md`](spectroscopic-files/README.md))
 - continuous never-reloaded Wallboard Watcher + PWA Service Worker notification +
   scoped/unscoped full Adjudication UI endurance testing
   (`scripts/run-ui-endurance.sh`; see [`docs/UI_ENDURANCE.md`](docs/UI_ENDURANCE.md))
-- site, lane, event, state-of-health, and adjudication PDF reports
+- site, lane, event, state-of-health, vehicle-incident, and adjudication reports,
+  including UpSet alarm & source-category co-occurrence plots across PDF, JSON,
+  XLSX, `/report`, and `/event-log`
 - exact membership for all five location and both direction operational views,
   Health-navigation query persistence, and malformed/unassigned inputs failing closed
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
@@ -248,6 +259,8 @@ Start from [.env.example](.env.example). Required values are:
 | `OSCAR_LANE_CONFIG_PATH` | current-schema lane CSV used both to provision the test site and as the membership oracle |
 | `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
 | `ALARM_TRANSFER_CAMERA_WORKFLOW` | `auto` for backward-compatible camera-control detection, `required` for a release gate, or `disabled` |
+| `SPECTROSCOPIC_WORKFLOW` | `auto` (default) exercises real secondary-inspection `.spe` / `.n42` upload, OSCAR `N42 Report`, Sandia WebID, and operator isotope selection when local files exist in `spectroscopic-files/` or `OSCAR_SPECTRA_DIR`; `required` fails if no spectra are supplied; `disabled` skips |
+| `OSCAR_SPECTRA_DIR` | optional path to an external folder of `.spe` / `.n42` secondary-inspection files (defaults to `<repo>/spectroscopic-files`; never commit spectroscopic data to Git — see [`spectroscopic-files/README.md`](spectroscopic-files/README.md)) |
 | `STORAGE_WORKFLOW` | `required` (default), explicit legacy `auto`, or `disabled` for the OSCAR 3.9.2 storage profile |
 | `OSCAR_BACKUP_MODE` | exact product policy to certify: `disabled` (default) or optional `single` |
 | `STORAGE_BACKUP_WORKFLOW` | `required` validates the selected mode, `auto` follows configured coverage, and `disabled` skips its mode-specific gate |

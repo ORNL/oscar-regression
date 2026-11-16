@@ -305,3 +305,127 @@ export function canonicalAlarmTransferDocumentJson(value: unknown): string {
     transport: document.transport,
   });
 }
+
+export const DASHBOARD_INITIAL_FIRST_ROW_MAX_MS = 4_500;
+export const DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS = 1_500;
+export const DASHBOARD_COUNT_QUERY_MAX_MS = 3_500;
+export const DASHBOARD_NEXT_PAGE_MAX_MS = 1_500;
+export const EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS = 4_500;
+export const EVENT_LOG_UPSET_EXPAND_MAX_MS = 6_000;
+
+export interface DashboardLatencyObservation {
+  hasAlarms: boolean;
+  firstRowMs: number | null;
+  datastreamsCollectionCalls: number;
+  maxDatastreamsCollectionMs: number;
+  maxCountQueryMs: number;
+  nextPageAvailable: boolean;
+  nextPageRenderMs: number | null;
+  nextPageCountRequests: number;
+  page2DistinctFromPage1: boolean;
+  obs5xxCount: number;
+}
+
+export interface DashboardLatencyAssessment {
+  passed: boolean;
+  firstRowValid: boolean;
+  datastreamsDiscoveryValid: boolean;
+  countQueriesValid: boolean;
+  nextPageValid: boolean;
+  no5xx: boolean;
+}
+
+export function assessDashboardLoadAndNextPageLatency(
+  obs: DashboardLatencyObservation,
+  maxNodes = 1,
+): DashboardLatencyAssessment {
+  const firstRowValid = !obs.hasAlarms || (
+    obs.firstRowMs !== null &&
+    Number.isFinite(obs.firstRowMs) &&
+    obs.firstRowMs >= 0 &&
+    obs.firstRowMs <= DASHBOARD_INITIAL_FIRST_ROW_MAX_MS
+  );
+  const datastreamsDiscoveryValid =
+    obs.datastreamsCollectionCalls >= 0 &&
+    obs.datastreamsCollectionCalls <= Math.max(1, maxNodes) &&
+    Number.isFinite(obs.maxDatastreamsCollectionMs) &&
+    obs.maxDatastreamsCollectionMs >= 0 &&
+    obs.maxDatastreamsCollectionMs <= DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS;
+  const countQueriesValid =
+    Number.isFinite(obs.maxCountQueryMs) &&
+    obs.maxCountQueryMs >= 0 &&
+    obs.maxCountQueryMs <= DASHBOARD_COUNT_QUERY_MAX_MS;
+  const nextPageValid = !obs.nextPageAvailable || (
+    obs.nextPageRenderMs !== null &&
+    Number.isFinite(obs.nextPageRenderMs) &&
+    obs.nextPageRenderMs >= 0 &&
+    obs.nextPageRenderMs <= DASHBOARD_NEXT_PAGE_MAX_MS &&
+    obs.nextPageCountRequests === 0 &&
+    obs.page2DistinctFromPage1
+  );
+  const no5xx = obs.obs5xxCount === 0;
+  return {
+    passed: firstRowValid && datastreamsDiscoveryValid && countQueriesValid && nextPageValid && no5xx,
+    firstRowValid,
+    datastreamsDiscoveryValid,
+    countQueriesValid,
+    nextPageValid,
+    no5xx,
+  };
+}
+
+export interface EventLogOnDemandUpSetObservation {
+  hasEvents: boolean;
+  firstRowMs: number | null;
+  sectionPresentOnLoad: boolean;
+  collapsedByDefault: boolean;
+  plotMountedOnLoad: boolean;
+  upSetBatchRequestsOnLoad: number;
+  totalAlarmCount: number;
+  expandRenderMs: number | null;
+  plotVisibleAfterExpand: boolean;
+  summarizedOccupancies: number;
+}
+
+export interface EventLogOnDemandUpSetAssessment {
+  passed: boolean;
+  firstRowValid: boolean;
+  collapsedZeroCostValid: boolean;
+  expandLatencyValid: boolean;
+  fullFilterSummaryValid: boolean;
+}
+
+export function assessEventLogOnDemandUpSet(
+  obs: EventLogOnDemandUpSetObservation,
+): EventLogOnDemandUpSetAssessment {
+  const firstRowValid = !obs.hasEvents || (
+    obs.firstRowMs !== null &&
+    Number.isFinite(obs.firstRowMs) &&
+    obs.firstRowMs >= 0 &&
+    obs.firstRowMs <= EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS
+  );
+  const collapsedZeroCostValid =
+    obs.sectionPresentOnLoad &&
+    obs.collapsedByDefault &&
+    !obs.plotMountedOnLoad &&
+    obs.upSetBatchRequestsOnLoad === 0;
+  const hasAlarms = obs.totalAlarmCount > 0;
+  const expandLatencyValid = !hasAlarms || (
+    obs.plotVisibleAfterExpand &&
+    obs.expandRenderMs !== null &&
+    Number.isFinite(obs.expandRenderMs) &&
+    obs.expandRenderMs >= 0 &&
+    obs.expandRenderMs <= EVENT_LOG_UPSET_EXPAND_MAX_MS
+  );
+  const fullFilterSummaryValid = !hasAlarms || (
+    obs.summarizedOccupancies > 0 &&
+    (obs.totalAlarmCount <= 15 || obs.summarizedOccupancies > 15)
+  );
+  return {
+    passed: firstRowValid && collapsedZeroCostValid && expandLatencyValid && fullFilterSummaryValid,
+    firstRowValid,
+    collapsedZeroCostValid,
+    expandLatencyValid,
+    fullFilterSummaryValid,
+  };
+}

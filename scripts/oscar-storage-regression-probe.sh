@@ -46,6 +46,7 @@ psql_admin() {
 # stdin by default and would otherwise consume the loop's remaining records
 # after validating the first item.
 scalar() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null | tr -d '[:space:]'; }
+scalar_large() { psql_admin --quiet --tuples-only --no-align -f - <<<"$1" | tr -d '[:space:]'; }
 json_query() { psql_admin --quiet --tuples-only --no-align --command "$1" </dev/null | tail -n 1; }
 valid_run() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$ ]]; }
 valid_uuid() { [[ $1 =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; }
@@ -931,38 +932,66 @@ copy_quiesced_confirmation_member() {
     fail 'Quiesced daily-journal confirmation copy violated its byte bound.'
 }
 verify_retained_backup_members() {
-  local archive=$1 inventory=$2 work=$3 listing member_file line kind member expected_sha expected_bytes
-  local lookup matches raw verbose actual_sha actual_bytes header verified=0
+  local archive=$1 inventory=$2 work=$3 listing raw_list verbose_list extract_dir resolved_rows
+  local member_file kind member expected_sha expected_bytes matches raw actual_sha actual_bytes header verified=0
   [[ -f $archive && ! -L $archive && -f $inventory && ! -L $inventory && -s $inventory &&
      -d $work && ! -L $work ]] || fail 'Retained backup verification inputs are missing or unsafe.'
   listing=$work/state-members.txt
   tar -tzf "$archive" >"$listing"
-  [[ $(wc -l <"$listing" | tr -d '[:space:]') -le 200000 ]] ||
-    fail 'OSCAR state backup member inventory exceeds its 200,000-entry safety bound.'
+  [[ $(wc -l <"$listing" | tr -d '[:space:]') -le 5000000 ]] ||
+    fail 'OSCAR state backup member inventory exceeds its 5,000,000-entry safety bound.'
   ! grep -Eq '(^/|(^|/)[.][.](/|$))' "$listing" ||
     fail 'OSCAR state backup contains an absolute or traversal member.'
   [[ $(cut -d'|' -f2 "$inventory" | LC_ALL=C sort | uniq -d | wc -l | tr -d '[:space:]') == 0 ]] ||
     fail 'Retained backup expectation contains duplicate member identities.'
+  resolved_rows=$work/retained-resolved.txt
+  raw_list=$work/retained-raw-members.txt
+  verbose_list=$work/retained-verbose.txt
+  extract_dir=$(mktemp -d "$work/retained-extracted.XXXXXXXX")
   while IFS='|' read -r kind member expected_sha expected_bytes extra; do
     [[ -z ${extra:-} && $kind =~ ^(M|J|C|P|D)$ &&
        $member =~ ^files/videos/retained-media/v1/[A-Za-z0-9._/-]+$ &&
        $expected_sha =~ ^[0-9a-f]{64}$ && $expected_bytes =~ ^[1-9][0-9]*$ ]] ||
       fail 'Retained backup expectation inventory is malformed.'
-    lookup=$(awk -v expected="$member" '
-      { normalized=$0; if (substr(normalized,1,2)=="./") normalized=substr(normalized,3);
-        if (normalized==expected) { count++; raw=$0 } }
-      END { printf "%d|%s", count+0, raw }
-    ' "$listing")
-    IFS='|' read -r matches raw <<<"$lookup"
+  done <"$inventory"
+  awk -F'|' '
+    NR == FNR {
+      want[$2] = 1
+      order[++n] = $0
+      next
+    }
+    {
+      normalized = $0
+      if (substr(normalized, 1, 2) == "./") normalized = substr(normalized, 3)
+      if (normalized in want) {
+        count[normalized]++
+        raw_name[normalized] = $0
+      }
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        split(order[i], parts, "|")
+        m = parts[2]
+        printf "%s|%d|%s\n", order[i], count[m] + 0, raw_name[m]
+      }
+    }
+  ' "$inventory" "$listing" >"$resolved_rows"
+  : >"$raw_list"
+  while IFS='|' read -r kind member expected_sha expected_bytes matches raw; do
     [[ $matches == 1 && -n $raw ]] ||
       fail "Backup must contain exactly one expected retained member: $member"
-    verbose=$(tar -tvzf "$archive" -- "$raw")
-    [[ $(printf '%s\n' "$verbose" | wc -l | tr -d '[:space:]') == 1 ]] ||
-      fail "Backup retained member has an ambiguous archive type: $member"
-    [[ ${verbose:0:1} == - ]] || fail "Backup retained member is not a regular file: $member"
-    member_file=$work/member-$verified
-    tar -xOf "$archive" -- "$raw" >"$member_file"
-    [[ -f $member_file && ! -L $member_file ]] || fail "Could not stream retained backup member: $member"
+    printf '%s\n' "$raw" >>"$raw_list"
+  done <"$resolved_rows"
+  tar -tvzf "$archive" --files-from="$raw_list" >"$verbose_list"
+  if grep -qv '^-' "$verbose_list"; then
+    fail 'Backup retained member is not a regular file'
+  fi
+  [[ $(wc -l <"$verbose_list" | tr -d '[:space:]') == $(wc -l <"$raw_list" | tr -d '[:space:]') ]] ||
+    fail 'Backup retained member verbose listing count mismatch'
+  tar -C "$extract_dir" --no-same-owner -xzf "$archive" --files-from="$raw_list"
+  while IFS='|' read -r kind member expected_sha expected_bytes matches raw; do
+    member_file=$extract_dir/$member
+    [[ -f $member_file && ! -L $member_file ]] || fail "Backup retained member is not a regular file: $member"
     actual_sha=$(sha256_file "$member_file")
     actual_bytes=$(file_size "$member_file")
     [[ $actual_sha == "$expected_sha" && $actual_bytes == "$expected_bytes" ]] ||
@@ -991,11 +1020,12 @@ verify_retained_backup_members() {
         ;;
     esac
     verified=$((verified+1))
-  done <"$inventory"
+  done <"$resolved_rows"
+  rm -rf -- "$extract_dir"
   printf '%s' "$verified"
 }
 verify_daily_receipt_backup_members() {
-  local archive=$1 listing=$2 directory_id=$3 day=$4 inventory=$5 work=$6
+  local archive=$1 listing=$2 directory_id=$3 day=$4 inventory=$5 work=$6 extracted_root=${7:-}
   local expected_names actual_names prefix name expected_bytes expected_sha lookup matches raw verbose member
   local actual_bytes actual_sha verified=0
   [[ -f $archive && ! -L $archive && -f $listing && ! -L $listing &&
@@ -1016,13 +1046,20 @@ verify_daily_receipt_backup_members() {
     ' "$listing")
     IFS='|' read -r matches raw <<<"$lookup"
     [[ $matches == 1 && -n $raw ]] || return 1
-    verbose=$(tar -tvzf "$archive" -- "$raw")
-    [[ $(printf '%s\n' "$verbose" | wc -l | tr -d '[:space:]') == 1 && ${verbose:0:1} == - ]] || return 1
-    member=$(mktemp "$work/daily-segment.XXXXXXXX")
-    tar -xOf "$archive" -- "$raw" >"$member"
-    actual_bytes=$(file_size "$member"); actual_sha=$(sha256_file "$member")
-    [[ $actual_bytes == "$expected_bytes" && $actual_sha == "$expected_sha" ]] || return 1
-    rm -f -- "$member"
+    if [[ -n $extracted_root ]]; then
+      member="$extracted_root/$prefix$name"
+      [[ -f $member && ! -L $member ]] || return 1
+      actual_bytes=$(file_size "$member"); actual_sha=$(sha256_file "$member")
+      [[ $actual_bytes == "$expected_bytes" && $actual_sha == "$expected_sha" ]] || return 1
+    else
+      verbose=$(tar -tvzf "$archive" -- "$raw")
+      [[ $(printf '%s\n' "$verbose" | wc -l | tr -d '[:space:]') == 1 && ${verbose:0:1} == - ]] || return 1
+      member=$(mktemp "$work/daily-segment.XXXXXXXX")
+      tar -xOf "$archive" -- "$raw" >"$member"
+      actual_bytes=$(file_size "$member"); actual_sha=$(sha256_file "$member")
+      [[ $actual_bytes == "$expected_bytes" && $actual_sha == "$expected_sha" ]] || return 1
+      rm -f -- "$member"
+    fi
     verified=$((verified+1))
   done <"$inventory"
   [[ $verified -gt 0 && -z $(LC_ALL=C sort "$expected_names" | uniq -d) ]] || return 1
@@ -3834,8 +3871,8 @@ EOF
     state_listing=$backup_work/state-listing.txt
     tar -tzf "$root/oscar-state.tar.gz" >"$state_listing"
     member_count=$(wc -l <"$state_listing" | tr -d '[:space:]')
-    [[ $member_count =~ ^[0-9]+$ && $member_count -le 200000 ]] ||
-      fail 'OSCAR state backup member inventory exceeds its 200,000-entry safety bound.'
+    [[ $member_count =~ ^[0-9]+$ && $member_count -le 5000000 ]] ||
+      fail 'OSCAR state backup member inventory exceeds its 5,000,000-entry safety bound.'
     if grep -Eq '(^/|(^|/)[.][.](/|$))' "$state_listing"; then
       fail 'OSCAR state backup contains an absolute or traversal member.'
     fi
@@ -3843,6 +3880,24 @@ EOF
     receipt_root=files/.dailyfile-journal/backup-confirmations
     confirmation_set_member="$receipt_root/.sets/$backup.json"
     if ((journal_confirmed_count > 0)); then
+      journal_listing=$backup_work/journal-segments-listing.txt
+      grep -E '^([.]/)?files/[.]dailyfile-journal/segments/' "$state_listing" >"$journal_listing" || true
+      journal_extract_dir=$backup_work/journal-segments-extracted
+      mkdir -p "$journal_extract_dir"
+      journal_tar_prefix=''
+      if grep -Fq './files/.dailyfile-journal/segments/' "$journal_listing"; then
+        journal_tar_prefix='./files/.dailyfile-journal/segments'
+      elif grep -Fq 'files/.dailyfile-journal/segments/' "$journal_listing"; then
+        journal_tar_prefix='files/.dailyfile-journal/segments'
+      fi
+      if [[ -n $journal_tar_prefix ]]; then
+        journal_verbose=$backup_work/journal-segments-verbose.txt
+        tar -tvzf "$root/oscar-state.tar.gz" -- "$journal_tar_prefix" >"$journal_verbose"
+        if grep -qv '^[-d]' "$journal_verbose"; then
+          fail 'OSCAR state backup daily-journal segment tree contains a non-regular/non-directory member.'
+        fi
+        tar -C "$journal_extract_dir" --no-same-owner -xzf "$root/oscar-state.tar.gz" -- "$journal_tar_prefix"
+      fi
       confirmation_set_file=$backup_work/confirmation-set.json
       copy_quiesced_confirmation_member "$confirmation_set_member" "$confirmation_set_file" \
         "$app_image" 786432
@@ -3852,7 +3907,7 @@ EOF
     set_encoded=$(openssl base64 -A -in "$confirmation_set_file" | tr -d '\r\n')
     [[ $set_encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#set_encoded} -le 1048576 ]] ||
       fail 'Daily-journal confirmation-set marker has invalid bounded base64.'
-    set_valid=$(scalar "WITH source AS (
+    set_valid=$(scalar_large "WITH source AS (
         SELECT convert_from(decode('$set_encoded','base64'),'UTF8') AS text),
       doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source),
       receipts AS (SELECT raw_receipt, raw_receipt::jsonb AS receipt FROM doc,
@@ -3879,10 +3934,12 @@ EOF
       FROM doc;")
     [[ $set_valid == t ]] || fail 'Atomic daily-journal confirmation-set marker is invalid.'
     receipt_set_rows=$backup_work/receipt-set-rows.txt
-    psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "WITH doc AS (
-        SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
-      SELECT receipt->>'path',receipt->>'sha256' FROM doc,
-        LATERAL jsonb_array_elements(value->'receipts') receipt ORDER BY receipt->>'path';" >"$receipt_set_rows"
+    psql_admin --quiet --tuples-only --no-align --field-separator='|' -f - <<SQL >"$receipt_set_rows"
+WITH doc AS (
+  SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
+SELECT receipt->>'path',receipt->>'sha256' FROM doc,
+  LATERAL jsonb_array_elements(value->'receipts') receipt ORDER BY receipt->>'path';
+SQL
     while IFS='|' read -r receipt_relative receipt_expected_sha receipt_extra; do
       [[ -z ${receipt_extra:-} &&
          $receipt_relative =~ ^[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}[.]json$ &&
@@ -3899,12 +3956,12 @@ EOF
       encoded=$(openssl base64 -A -in "$receipt_file" | tr -d '\r\n')
       [[ $encoded =~ ^[A-Za-z0-9+/]+=*$ && ${#encoded} -le 1048576 ]] ||
         fail 'Authenticated daily-journal receipt could not be represented as bounded base64.'
-      receipt_reference=$(scalar "WITH doc AS (
+      receipt_reference=$(scalar_large "WITH doc AS (
         SELECT convert_from(decode('$encoded','base64'),'UTF8')::jsonb AS value)
         SELECT coalesce(value->>'backupReference','') FROM doc;")
       [[ $receipt_reference == "$backup_reference" ]] || continue
       receipt_count=$((receipt_count+1))
-      receipt_valid=$(scalar "WITH source AS (
+      receipt_valid=$(scalar_large "WITH source AS (
           SELECT convert_from(decode('$encoded','base64'),'UTF8') AS text),
         doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source),
         segments AS (
@@ -3946,17 +4003,19 @@ EOF
         FROM doc;")
       relative=$receipt_relative
       receipt_sha=$(sha256_file "$receipt_file")
-      membership=$(scalar "WITH doc AS (
+      membership=$(scalar_large "WITH doc AS (
           SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
         SELECT count(*)=1 FROM doc, LATERAL jsonb_array_elements(value->'receipts') receipt
         WHERE receipt->>'path'='$relative' AND receipt->>'sha256'='$receipt_sha';")
       [[ $receipt_valid == t && $membership == t ]] || invalid_receipts=$((invalid_receipts+1))
       receipt_rows=$backup_work/receipt-segments-$receipt_count.txt
-      psql_admin --quiet --tuples-only --no-align --field-separator='|' --command "WITH doc AS (
-          SELECT convert_from(decode('$encoded','base64'),'UTF8')::jsonb AS value)
-        SELECT value->>'laneId',segment->>'name',segment->>'byteCount',segment->>'sha256'
-        FROM doc,LATERAL jsonb_array_elements(value->'sealedSegments') segment
-        ORDER BY segment->>'name';" >"$receipt_rows.with-lane"
+      psql_admin --quiet --tuples-only --no-align --field-separator='|' -f - <<SQL >"$receipt_rows.with-lane"
+WITH doc AS (
+  SELECT convert_from(decode('$encoded','base64'),'UTF8')::jsonb AS value)
+SELECT value->>'laneId',segment->>'name',segment->>'byteCount',segment->>'sha256'
+FROM doc,LATERAL jsonb_array_elements(value->'sealedSegments') segment
+ORDER BY segment->>'name';
+SQL
       receipt_lane=''; : >"$receipt_rows"
       while IFS='|' read -r lane_id segment_name segment_bytes segment_sha segment_extra; do
         [[ -z ${segment_extra:-} && $lane_id =~ ^urn:osh:system:lane:[A-Za-z0-9._-]{1,200}$ ]] || {
@@ -3969,12 +4028,13 @@ EOF
       if ((${#safe_lane} > 120)); then safe_lane=${safe_lane:0:120}; fi
       receipt_directory="$safe_lane-$(printf '%s' "$receipt_lane" | sha256sum | cut -c1-12)"
       verified_segments=$(verify_daily_receipt_backup_members "$root/oscar-state.tar.gz" \
-        "$state_listing" "$receipt_directory" "$receipt_day" "$receipt_rows" "$backup_work" || true)
+        "$journal_listing" "$receipt_directory" "$receipt_day" "$receipt_rows" "$backup_work" \
+        "$journal_extract_dir" || true)
       if [[ $verified_segments =~ ^[1-9][0-9]*$ ]]; then
         receipt_segments_verified=$((receipt_segments_verified+verified_segments))
       else invalid_receipts=$((invalid_receipts+1)); fi
     done <"$receipt_set_rows"
-    set_count=$(scalar "WITH doc AS (
+    set_count=$(scalar_large "WITH doc AS (
         SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
       SELECT (value->>'receiptCount')::bigint FROM doc;")
       [[ $set_count == "$receipt_count" ]] || invalid_receipts=$((invalid_receipts+1))
