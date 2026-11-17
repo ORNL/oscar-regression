@@ -296,6 +296,19 @@ test("resolveEffectiveEnduranceVehicleId preserves live OCR auto-fill and normal
 
   assert.equal(formatSpacedVehicleQueryVariant("CSQU3054383"), "csqu 305438-3");
   assert.equal(formatSpacedVehicleQueryVariant("TN8842B"), "tn-8842B");
+
+  assert.ok(ENDURANCE_RECURRING_VEHICLE_IDS.length >= 1000);
+  const distinctAcross500 = new Set<string>();
+  for (let c = 0; c < 500; c++) {
+    const p = buildCycleExecutionPlan({
+      cycleIndex: c,
+      runTag: "POOL500",
+      configuredViews: REQUIRED_OPERATIONAL_VIEW_KEYS,
+      scopedHoldCycles: 4,
+    });
+    distinctAcross500.add(p.normalizedVehicleId);
+  }
+  assert.ok(distinctAcross500.size >= 450);
 });
 
 test("parseUiEnduranceCliArgs defaults to 4 bounded cycles and supports continuous daemon flags", () => {

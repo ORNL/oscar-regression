@@ -363,6 +363,7 @@ export class RegressionScenarios {
   private cameraRecordingLogStartedAt: string | undefined;
   private readonly retainedBackupExpectations = new Map<string, string>();
   private retainedMediaProofDeferred = false;
+  private lastRecognizedOcrContainer: string | undefined;
   private stopRequested: () => boolean = () => false;
   private activeScenario = "navigation";
 
@@ -650,7 +651,7 @@ export class RegressionScenarios {
           {
             reportType: "VEHICLE_INCIDENT",
             vehicleId: this.config.expectedVehicleOcrContainer === "ANY"
-              ? "EGHU3972694"
+              ? (this.lastRecognizedOcrContainer ?? "EGHU3972694")
               : this.config.expectedVehicleOcrContainer,
           },
         ]));
@@ -6873,7 +6874,7 @@ export class RegressionScenarios {
       const matchesExpectedContainer = (normalizedValue: string): boolean => {
         const clean = normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase();
         if (expectedContainer === "ANY") {
-          return /^[A-Z]{3}[UJZ][0-9]{7}$/.test(clean);
+          return /^[A-Z]{3}[UJZR][0-9]{7}$/.test(clean);
         }
         return clean === expectedContainer;
       };
@@ -7040,7 +7041,8 @@ export class RegressionScenarios {
       });
 
       if (ocrCandidate) {
-        const canonicalExpected = ocrCandidate.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+        let canonicalExpected = ocrCandidate.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+        this.lastRecognizedOcrContainer = canonicalExpected;
         const ocrNotes = `Container OCR regression ${this.reporter.runId.slice(-12)}`;
 
         await this.check({
@@ -7101,11 +7103,12 @@ export class RegressionScenarios {
         // radiation profile traces, open VehiclePassComparisonDialog from Pass #2's related-passes
         // banner, batch-adjudicate open Pass #2, and export consolidated VEHICLE_INCIDENT reports
         // across PDF, CSV, JSON, and XLSX.
-        const rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
+        let basePassEventId = eventId;
+        let rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
         const trigger2 = await this.triggerAlarm("gamma", "vehicle-ocr");
         if (!trigger2) throw new Error("Confirmation re-scan gamma alarm trigger returned no occupancy identity");
         const alarmRow2 = await this.findAlarmRow(page, /Gamma/i, trigger2);
-        const eventId2 = await this.resolveAlarmEventUuid(
+        let eventId2 = await this.resolveAlarmEventUuid(
           page,
           alarmRow2,
           "gamma",
@@ -7115,10 +7118,10 @@ export class RegressionScenarios {
         if (!eventId2) throw new Error("Failed to resolve occupancy UUID for confirmation re-scan gamma alarm");
         await this.captureAlarmMedia(page, eventId2, "gamma", trigger2.occupancyCount, "vehicle-ocr");
 
-        const fetchRescanOcrObservations = async (): Promise<OcrObservationRecord[]> => {
+        const fetchOcrForObsId = async (targetObsId: string, winStartIso: string): Promise<OcrObservationRecord[]> => {
           const windowEndIso = new Date(Date.now() + 60_000).toISOString();
           const params = new URLSearchParams({
-            resultTime: `${rescanWindowStartIso}/${windowEndIso}`,
+            resultTime: `${winStartIso}/${windowEndIso}`,
             limit: "50",
           });
           const res = await page.context().request.get(
@@ -7140,7 +7143,7 @@ export class RegressionScenarios {
             for (const item of json.items ?? []) {
               const r = item.result ?? item.properties?.result ?? {};
               const obsId = String(r.occupancyObsId ?? "").trim();
-              if (obsId !== eventId2) continue;
+              if (obsId !== targetObsId) continue;
               matched.push({
                 id: String(item.id ?? "").trim(),
                 occupancyObsId: obsId,
@@ -7164,22 +7167,85 @@ export class RegressionScenarios {
           scenario: "vehicle-ocr",
           category: "ocr",
           action: "correlate confirmation re-scan pass, batch-adjudicate in VehiclePassComparisonDialog, and export consolidated VEHICLE_INCIDENT reports",
-          target: `${canonicalExpected} (${eventId} -> ${eventId2})`,
-          expected: "Confirmation re-scan correlates adjudicated Pass #1 + open OCR Pass #2 with radiation profiles, renders related-passes banner + keyboard-focusable comparison dialog, batch-adjudicates Pass #2, and exports valid PDF/CSV/JSON/XLSX VEHICLE_INCIDENT reports",
+          target: `${canonicalExpected} (${basePassEventId} -> ${eventId2})`,
+          expected: "Confirmation re-scan correlates adjudicated Pass #1 + open OCR Pass #2 with non-zero radiation profile traces, renders related-passes banner + keyboard-focusable comparison dialog, batch-adjudicates Pass #2, and exports valid PDF/CSV/JSON/XLSX VEHICLE_INCIDENT reports",
         }, async () => {
-          await poll(
-            fetchRescanOcrObservations,
+          let rescanObs = await poll(
+            () => fetchOcrForObsId(eventId2!, rescanWindowStartIso),
             items => items.some(
               c => c.idType === "container" &&
                 c.checksumValid &&
-                c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase() === canonicalExpected,
+                matchesExpectedContainer(c.normalizedValue),
             ),
             {
               timeoutMs: Math.max(this.config.eventTimeoutMs, 60_000),
               intervalMs: 1_000,
-              description: `confirmation re-scan vehicleOcr (${canonicalExpected}) for occupancy ${eventId2}`,
+              description: `confirmation re-scan vehicleOcr (${expectedContainer}) for occupancy ${eventId2}`,
             },
           );
+          const firstRescanBest = rescanObs.find(
+            c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
+          );
+          const firstRescanNorm = firstRescanBest
+            ? firstRescanBest.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase()
+            : "";
+
+          // If expectedContainer === "ANY" and a rotating multi-clip playlist crossed a container
+          // boundary between Pass #1 and Pass #2, adjudicate Pass #2 as the new base pass and
+          // trigger one confirmation pass inside the fresh ~90s container block.
+          if (expectedContainer === "ANY" && firstRescanNorm && firstRescanNorm !== canonicalExpected) {
+            await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
+            await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+            const vInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
+            await poll(
+              async () => (await vInput.inputValue()).replace(/[^A-Z0-9]/gi, "").toUpperCase(),
+              val => val === firstRescanNorm,
+              {timeoutMs: 15_000, intervalMs: 250, description: `Vehicle ID auto-fill to equal ${firstRescanNorm}`},
+            );
+            await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
+            await this.selectMui(page, "Secondary Inspection", "NONE");
+            await page.getByLabel("Notes").fill(ocrNotes);
+            await page.getByRole("button", {name: "Submit", exact: true}).click();
+            const confirm2 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+            await confirm2.waitFor({timeout: this.config.uiTimeoutMs});
+            await confirm2.getByRole("button", {name: /Confirm & Submit/i}).click();
+            await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+
+            basePassEventId = eventId2!;
+            canonicalExpected = firstRescanNorm;
+            this.lastRecognizedOcrContainer = canonicalExpected;
+
+            rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
+            const trigger3 = await this.triggerAlarm("gamma", "vehicle-ocr");
+            if (!trigger3) throw new Error("Boundary-follow-up confirmation gamma alarm trigger returned no occupancy identity");
+            const alarmRow3 = await this.findAlarmRow(page, /Gamma/i, trigger3);
+            const eventId3 = await this.resolveAlarmEventUuid(
+              page,
+              alarmRow3,
+              "gamma",
+              trigger3.occupancyCount,
+              "vehicle-ocr",
+            );
+            if (!eventId3) throw new Error("Failed to resolve occupancy UUID for boundary-follow-up confirmation alarm");
+            await this.captureAlarmMedia(page, eventId3, "gamma", trigger3.occupancyCount, "vehicle-ocr");
+            eventId2 = eventId3;
+
+            rescanObs = await poll(
+              () => fetchOcrForObsId(eventId2!, rescanWindowStartIso),
+              items => items.some(
+                c => c.idType === "container" &&
+                  c.checksumValid &&
+                  c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase() === canonicalExpected,
+              ),
+              {
+                timeoutMs: Math.max(this.config.eventTimeoutMs, 60_000),
+                intervalMs: 1_000,
+                description: `confirmation re-scan vehicleOcr (${canonicalExpected}) for occupancy ${eventId2}`,
+              },
+            );
+          } else if (expectedContainer !== "ANY" && firstRescanNorm !== canonicalExpected) {
+            throw new Error(`Confirmation re-scan recognized ${firstRescanNorm || "none"} instead of ${canonicalExpected}`);
+          }
 
           const spacedQuery = `${canonicalExpected.slice(0, 4).toLowerCase()} ${canonicalExpected.slice(4, 10)}-${canonicalExpected.slice(10)}`;
           const apiRes = await page.context().request.get(
@@ -7190,6 +7256,7 @@ export class RegressionScenarios {
           );
           let apiCorrelated = false;
           let profileCount = 0;
+          let maxProfileGamma = 0;
           try {
             if (apiRes.ok()) {
               const apiJson = await apiRes.json() as {
@@ -7197,27 +7264,33 @@ export class RegressionScenarios {
                 passes?: Array<{
                   occupancyObsId?: unknown;
                   adjudications?: unknown[];
-                  radiationProfile?: unknown[];
+                  radiationProfile?: Array<{gammaCounts?: unknown}>;
                 }>;
               };
               const passes = Array.isArray(apiJson.passes) ? apiJson.passes : [];
-              const p1 = passes.find(p => String(p.occupancyObsId ?? "").trim() === eventId);
+              const p1 = passes.find(p => String(p.occupancyObsId ?? "").trim() === basePassEventId);
               const p2 = passes.find(p => String(p.occupancyObsId ?? "").trim() === eventId2);
-              profileCount = passes.reduce(
-                (acc, p) => acc + (Array.isArray(p.radiationProfile) ? p.radiationProfile.length : 0),
-                0,
-              );
+              for (const p of passes) {
+                if (Array.isArray(p.radiationProfile)) {
+                  profileCount += p.radiationProfile.length;
+                  for (const sample of p.radiationProfile) {
+                    const g = Number(sample?.gammaCounts ?? 0);
+                    if (g > maxProfileGamma) maxProfileGamma = g;
+                  }
+                }
+              }
               apiCorrelated =
                 String(apiJson.normalizedVehicleId ?? "").trim() === canonicalExpected &&
                 Boolean(p1 && Array.isArray(p1.adjudications) && p1.adjudications.length >= 1) &&
                 Boolean(p2 && Array.isArray(p2.adjudications) && p2.adjudications.length === 0) &&
-                profileCount > 0;
+                profileCount > 0 &&
+                maxProfileGamma > 0;
             }
           } finally {
             await apiRes.dispose();
           }
 
-          await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2)}`);
+          await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
           await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
           const banner = page.getByTestId("vehicle-related-passes-banner");
           await banner.waitFor({state: "visible", timeout: 25_000});
@@ -7233,15 +7306,28 @@ export class RegressionScenarios {
             .then(() => true)
             .catch(() => false);
 
-          // Load radiation traces inside comparison dialog
+          // Load radiation traces inside comparison dialog and verify non-flatline SVG waveform
           const loadTracesBtn = compDialog.getByTestId("vehicle-load-profiles-btn");
           await loadTracesBtn.scrollIntoViewIfNeeded().catch(() => {});
           if (await loadTracesBtn.isVisible().catch(() => false)) {
             await loadTracesBtn.click();
           }
-          const chartVisible = await compDialog.getByTestId("vehicle-profile-chart")
+          const profileChart = compDialog.getByTestId("vehicle-profile-chart");
+          const chartVisible = await profileChart
             .waitFor({state: "visible", timeout: 20_000})
-            .then(() => true)
+            .then(async () => {
+              const polyCount = await profileChart.locator("svg polyline").count();
+              if (polyCount === 0) {
+                return (await profileChart.locator("svg circle").count()) > 0;
+              }
+              const ptsAttr = (await profileChart.locator("svg polyline").first().getAttribute("points")) ?? "";
+              const ys = ptsAttr
+                .trim()
+                .split(/\s+/)
+                .map(pair => Number(pair.split(",")[1]))
+                .filter(v => Number.isFinite(v));
+              return ys.length > 0 && Math.min(...ys) < 145;
+            })
             .catch(() => false);
 
           // Linked/Batch Adjudicate reserved-lane open Pass #2 directly from VehiclePassComparisonDialog

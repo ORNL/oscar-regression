@@ -1,6 +1,7 @@
 import {createHash, X509Certificate} from "node:crypto";
 import {isIP} from "node:net";
 import * as tls from "node:tls";
+import {EXPANDED_VEHICLE_ID_POOL} from "./container-id-pool.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS, type LaneConfigOracle} from "./lane-config.js";
 
 export const UI_ENDURANCE_PAGE_SIZE = 15;
@@ -29,19 +30,13 @@ export const INCIDENT_REPORT_FORMATS = ["PDF", "CSV", "JSON", "XLSX"] as const;
 export type IncidentReportFormat = (typeof INCIDENT_REPORT_FORMATS)[number];
 
 /**
- * Deterministic rotating fleet of recurring vehicle identifiers (ISO 6346 checksum-valid
- * containers plus tractor fleet plates, deliberately mixing uppercase/lowercase, spaces,
- * and hyphens) so continuous endurance cycles naturally accumulate multi-pass histories
- * under shared normalized vehicle IDs while exercising normalized matching end-to-end.
+ * Deterministic rotating fleet of 1,100 recurring vehicle identifiers (1,048 ISO 6346
+ * checksum-valid containers from the container-video dataset plus 52 tractor fleet plates,
+ * deliberately mixing uppercase/lowercase, spaces, and hyphens) so continuous endurance
+ * cycles distribute vehicle passings uniformly across the fleet while periodically pairing
+ * 2-pass confirmation re-scans without piling hundreds of passes onto a single ID.
  */
-export const ENDURANCE_RECURRING_VEHICLE_IDS = [
-  "EGHU3972694",
-  "eghu 397269-4",
-  "CSNU2164744",
-  "csnu 216474-4",
-  "JHSU2675475",
-  "TN-8842B",
-] as const;
+export const ENDURANCE_RECURRING_VEHICLE_IDS: readonly string[] = EXPANDED_VEHICLE_ID_POOL;
 
 export function normalizeEnduranceVehicleId(raw: string): string {
   const trimmed = raw.trim();
@@ -516,8 +511,11 @@ export function buildCycleExecutionPlan(params: {
     INCIDENT_REPORT_FORMATS[params.cycleIndex % INCIDENT_REPORT_FORMATS.length]!;
   const seq = String(params.cycleIndex + 1).padStart(5, "0");
   const safeTag = params.runTag.replace(/[^A-Za-z0-9-]/g, "").slice(-10) || "ENDURANCE";
-  const vehicleId =
-    ENDURANCE_RECURRING_VEHICLE_IDS[params.cycleIndex % ENDURANCE_RECURRING_VEHICLE_IDS.length]!;
+  const poolIndex =
+    params.cycleIndex >= 20 && params.cycleIndex % 20 === 19
+      ? (params.cycleIndex - 19) % ENDURANCE_RECURRING_VEHICLE_IDS.length
+      : params.cycleIndex % ENDURANCE_RECURRING_VEHICLE_IDS.length;
+  const vehicleId = ENDURANCE_RECURRING_VEHICLE_IDS[poolIndex]!;
   const normalizedVehicleId = normalizeEnduranceVehicleId(vehicleId);
   const scopeLabel = operatorViewKey ? `view=${operatorViewKey}` : "view=unscoped";
   const notes = `Nimo automated UI endurance (${workflow}, ${scopeLabel}, run=${safeTag}, cycle=${seq})`;
