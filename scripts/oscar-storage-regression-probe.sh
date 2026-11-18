@@ -572,24 +572,56 @@ media_metadata_health_json() {
       -print -quit >"$inventory_file"
     [ ! -s "$inventory_file" ] || exit 21
     find "$root" -xdev -mindepth 1 -printf "%y\t%P\n" >"$inventory_file"
-    inventory=$(awk -F "\t" "
-      BEGIN { total=0; regular=0; directories=0; manifests=0; jpegs=0;
-              legacy_processed=0; legacy_deleted=0; partials=0; unsafe=0 }
-      {
-        type=\$1; path=substr(\$0,index(\$0,\"\t\")+1); total++
-        if (type == \"f\") regular++
-        else if (type == \"d\") directories++
-        else unsafe++
-        if (path !~ /^[A-Za-z0-9._\/-]+$/) unsafe++
-        if (type == \"f\" && path ~ /(^|\/)[^\/]*[.](partial|tmp)([.-].*)?$/) partials++
-        if (type == \"f\" && path ~ /^events\/.+\/manifest[.]json$/) manifests++
-        if (type == \"f\" && path ~ /^events\/.+\/frame-0[1-5][.]jpg$/) jpegs++
-        if (type == \"f\" && path ~ /^retention-processed\/.+[.]json$/) legacy_processed++
-        if (type == \"f\" && path ~ /^events\/.+\/[.]deleted[.]json$/) legacy_deleted++
-      }
-      END { printf \"%d|%d|%d|%d|%d|%d|%d|%d|%d\", total, regular, directories,
-                   manifests, jpegs, legacy_processed, legacy_deleted, partials, unsafe }
-    " "$inventory_file")
+    if command -v perl >/dev/null 2>&1; then
+      inventory=$(perl - "$inventory_file" <<\OSCAR_PERL_INV
+  use strict;
+  use warnings;
+  my $inv = $ARGV[0];
+  open(my $fh, "<", $inv) or die "open inv: $!";
+  my ($total, $regular, $directories, $manifests, $jpegs, $legacy_processed, $legacy_deleted, $partials, $unsafe) = (0,0,0,0,0,0,0,0,0);
+  while (my $line = <$fh>) {
+    chomp $line;
+    my $tab_idx = index($line, "\t");
+    if ($tab_idx < 0) { $unsafe++; $total++; next; }
+    my $type = substr($line, 0, $tab_idx);
+    my $path = substr($line, $tab_idx + 1);
+    $total++;
+    if ($type eq "f") { $regular++; }
+    elsif ($type eq "d") { $directories++; }
+    else { $unsafe++; }
+    if ($path !~ /^[A-Za-z0-9._\/-]+$/) { $unsafe++; }
+    if ($type eq "f") {
+      if ($path =~ /(?:^|\/)[^\/]*\.(?:partial|tmp)(?:[.-].*)?$/) { $partials++; }
+      if ($path =~ /^events\/.+\/manifest\.json$/) { $manifests++; }
+      elsif ($path =~ /^events\/.+\/frame-0[1-5]\.jpg$/) { $jpegs++; }
+      elsif ($path =~ /^retention-processed\/.+\.json$/) { $legacy_processed++; }
+      elsif ($path =~ /^events\/.+\/\.deleted\.json$/) { $legacy_deleted++; }
+    }
+  }
+  close($fh);
+  printf "%d|%d|%d|%d|%d|%d|%d|%d|%d", $total, $regular, $directories, $manifests, $jpegs, $legacy_processed, $legacy_deleted, $partials, $unsafe;
+OSCAR_PERL_INV
+)
+    else
+      inventory=$(awk -F "\t" "
+        BEGIN { total=0; regular=0; directories=0; manifests=0; jpegs=0;
+                legacy_processed=0; legacy_deleted=0; partials=0; unsafe=0 }
+        {
+          type=\$1; path=substr(\$0,index(\$0,\"\t\")+1); total++
+          if (type == \"f\") regular++
+          else if (type == \"d\") directories++
+          else unsafe++
+          if (path !~ /^[A-Za-z0-9._\/-]+$/) unsafe++
+          if (type == \"f\" && path ~ /(^|\/)[^\/]*[.](partial|tmp)([.-].*)?$/) partials++
+          if (type == \"f\" && path ~ /^events\/.+\/manifest[.]json$/) manifests++
+          if (type == \"f\" && path ~ /^events\/.+\/frame-0[1-5][.]jpg$/) jpegs++
+          if (type == \"f\" && path ~ /^retention-processed\/.+[.]json$/) legacy_processed++
+          if (type == \"f\" && path ~ /^events\/.+\/[.]deleted[.]json$/) legacy_deleted++
+        }
+        END { printf \"%d|%d|%d|%d|%d|%d|%d|%d|%d\", total, regular, directories,
+                     manifests, jpegs, legacy_processed, legacy_deleted, partials, unsafe }
+      " "$inventory_file")
+    fi
     rm -f -- "$inventory_file"
     trap - EXIT HUP INT TERM
     IFS="|" read -r total_entries regular_files directories manifests jpegs legacy_processed \
@@ -605,20 +637,52 @@ EOF
     processed_root="$root/retention-processed-index"
     if [ -e "$processed_root" ] || [ -L "$processed_root" ]; then
       if [ ! -d "$processed_root" ] || [ -L "$processed_root" ]; then unsafe=$((unsafe+1)); else
-        while IFS= read -r index; do
-          [ "$index" ] || continue
-          name=${index##*/}; processed_files=$((processed_files+1))
-          size=$(stat -c %s -- "$index" 2>/dev/null || printf 0)
-          processed_bytes=$((processed_bytes+size))
-          header=$(od -An -tx1 -N16 -- "$index" 2>/dev/null | tr -d " [:space:]")
-          if ! printf "%s" "$name" | grep -Eq "^[0-9]{19}-(0[0-9]|1[01])[.]idx$" ||
-             [ "$size" -lt 16 ] || [ $(((size-16)%36)) -ne 0 ] ||
-             [ "$header" != 4f534341524d50490000000100000024 ]; then
-            format_failures=$((format_failures+1))
-          fi
-        done <<EOF
+        if command -v perl >/dev/null 2>&1; then
+          proc_summary=$(perl - "$processed_root" <<\OSCAR_PERL_PROC
+  use strict;
+  use warnings;
+  my $dir = $ARGV[0];
+  my $magic = pack("H*", "4f534341524d50490000000100000024");
+  my ($files, $bytes, $fails) = (0, 0, 0);
+  opendir(my $dh, $dir) or die "opendir: $!";
+  my @names = sort grep { $_ ne "." && $_ ne ".." && /\.idx$/ } readdir($dh);
+  closedir($dh);
+  for my $name (@names) {
+    my $path = "$dir/$name";
+    my @st = lstat($path);
+    next unless @st && -f _;
+    $files++;
+    my $sz = $st[7];
+    $bytes += $sz;
+    my $hdr = "";
+    if ($sz >= 16 && open(my $fh, "<:raw", $path)) { read($fh, $hdr, 16); close($fh); }
+    if ($name !~ /^[0-9]{19}-(0[0-9]|1[01])\.idx$/ || $sz < 16 || (($sz - 16) % 36) != 0 || $hdr ne $magic) {
+      $fails++;
+    }
+  }
+  printf "%d|%d|%d\n", $files, $bytes, $fails;
+OSCAR_PERL_PROC
+)
+          IFS="|" read -r processed_files processed_bytes proc_fails <<EOF
+$proc_summary
+EOF
+          format_failures=$((format_failures + proc_fails))
+        else
+          while IFS= read -r index; do
+            [ "$index" ] || continue
+            name=${index##*/}; processed_files=$((processed_files+1))
+            size=$(stat -c %s -- "$index" 2>/dev/null || printf 0)
+            processed_bytes=$((processed_bytes+size))
+            header=$(od -An -tx1 -N16 -- "$index" 2>/dev/null | tr -d " [:space:]")
+            if ! printf "%s" "$name" | grep -Eq "^[0-9]{19}-(0[0-9]|1[01])[.]idx$" ||
+               [ "$size" -lt 16 ] || [ $(((size-16)%36)) -ne 0 ] ||
+               [ "$header" != 4f534341524d50490000000100000024 ]; then
+              format_failures=$((format_failures+1))
+            fi
+          done <<EOF
 $(find "$processed_root" -mindepth 1 -maxdepth 1 -type f -name "*.idx" -print | LC_ALL=C sort)
 EOF
+        fi
         unexpected=$(find "$processed_root" -mindepth 1 -maxdepth 1 ! -type f -print | wc -l | tr -d "[:space:]")
         unexpected_files=$(find "$processed_root" -mindepth 1 -maxdepth 1 -type f ! -name "*.idx" ! -name ".index.lock" -print | wc -l | tr -d "[:space:]")
         unsafe=$((unsafe+unexpected+unexpected_files))
@@ -633,40 +697,95 @@ EOF
     deletion_root="$root/deletion-index"
     if [ -e "$deletion_root" ] || [ -L "$deletion_root" ]; then
       if [ ! -d "$deletion_root" ] || [ -L "$deletion_root" ]; then unsafe=$((unsafe+1)); else
-        while IFS= read -r index; do
-          [ "$index" ] || continue
-          relative=${index#"$deletion_root"/}; shard=${relative%%/*}; name=${relative##*/}
-          deletion_files=$((deletion_files+1))
-          size=$(stat -c %s -- "$index" 2>/dev/null || printf 0)
-          deletion_bytes=$((deletion_bytes+size))
-          header=$(od -An -tx1 -N16 -- "$index" 2>/dev/null | tr -d " [:space:]")
-          index_prefix=$(printf "%s" "${name%.idx}" | cut -c1-2)
-          if ! printf "%s/%s" "$shard" "$name" | grep -Eq "^[0-9a-f]{2}/[0-9a-f]{4}[.]idx$" ||
-             [ "$index_prefix" != "$shard" ]; then
-            format_failures=$((format_failures+1))
-          fi
-          if [ "$size" -lt 16 ] || [ $(((size-16)%36)) -ne 0 ] ||
-             [ "$header" != 4f534341524d44490000000100000024 ]; then
-            format_failures=$((format_failures+1))
-          fi
-        done <<EOF
+        if command -v perl >/dev/null 2>&1; then
+          del_summary=$(perl - "$deletion_root" <<\OSCAR_PERL_DEL
+  use strict;
+  use warnings;
+  my $root_dir = $ARGV[0];
+  my $magic = pack("H*", "4f534341524d44490000000100000024");
+  my ($files, $bytes, $fails, $bad_locks) = (0, 0, 0, 0);
+  opendir(my $rdh, $root_dir) or die "opendir: $!";
+  my @shards = sort grep { $_ ne "." && $_ ne ".." } readdir($rdh);
+  closedir($rdh);
+  for my $shard (@shards) {
+    my $sdir = "$root_dir/$shard";
+    my @sst = lstat($sdir);
+    next unless @sst && -d _;
+    opendir(my $sdh, $sdir) or die "opendir shard: $!";
+    my @entries = sort grep { $_ ne "." && $_ ne ".." } readdir($sdh);
+    closedir($sdh);
+    for my $name (@entries) {
+      my $path = "$sdir/$name";
+      my @st = lstat($path);
+      if ($name eq ".index.lock") {
+        if (!@st || -l _ || !-f _ || $st[7] != 0) { $bad_locks++; }
+        next;
+      }
+      next unless $name =~ /\.idx$/ && @st && -f _ && !-l _;
+      $files++;
+      my $sz = $st[7];
+      $bytes += $sz;
+      my $stem = $name; $stem =~ s/\.idx$//;
+      my $prefix = substr($stem, 0, 2);
+      if ("$shard/$name" !~ /^[0-9a-f]{2}\/[0-9a-f]{4}\.idx$/ || $prefix ne $shard) {
+        $fails++;
+      }
+      my $hdr = "";
+      if ($sz >= 16 && open(my $fh, "<:raw", $path)) { read($fh, $hdr, 16); close($fh); }
+      if ($sz < 16 || (($sz - 16) % 36) != 0 || $hdr ne $magic) {
+        $fails++;
+      }
+    }
+  }
+  printf "%d|%d|%d|%d\n", $files, $bytes, $fails, $bad_locks;
+OSCAR_PERL_DEL
+)
+          IFS="|" read -r deletion_files deletion_bytes del_fails invalid_locks <<EOF
+$del_summary
+EOF
+          format_failures=$((format_failures + del_fails))
+          unexpected=$(find "$deletion_root" -mindepth 1 -maxdepth 1 ! -type d -print | wc -l | tr -d "[:space:]")
+          invalid_shards=$(find "$deletion_root" -mindepth 1 -maxdepth 1 -type d ! -name "[0-9a-f][0-9a-f]" -print | wc -l | tr -d "[:space:]")
+          unexpected_files=$(find "$deletion_root" -mindepth 2 -maxdepth 2 -type f ! -name "*.idx" ! -name ".index.lock" -print | wc -l | tr -d "[:space:]")
+          unexpected_members=$(find "$deletion_root" -mindepth 2 -maxdepth 2 ! -type f -print | wc -l | tr -d "[:space:]")
+          unexpected_deep=$(find "$deletion_root" -mindepth 3 -print | wc -l | tr -d "[:space:]")
+          unsafe=$((unsafe+unexpected+invalid_shards+unexpected_files+unexpected_members+unexpected_deep+invalid_locks))
+        else
+          while IFS= read -r index; do
+            [ "$index" ] || continue
+            relative=${index#"$deletion_root"/}; shard=${relative%%/*}; name=${relative##*/}
+            deletion_files=$((deletion_files+1))
+            size=$(stat -c %s -- "$index" 2>/dev/null || printf 0)
+            deletion_bytes=$((deletion_bytes+size))
+            header=$(od -An -tx1 -N16 -- "$index" 2>/dev/null | tr -d " [:space:]")
+            index_prefix=$(printf "%s" "${name%.idx}" | cut -c1-2)
+            if ! printf "%s/%s" "$shard" "$name" | grep -Eq "^[0-9a-f]{2}/[0-9a-f]{4}[.]idx$" ||
+               [ "$index_prefix" != "$shard" ]; then
+              format_failures=$((format_failures+1))
+            fi
+            if [ "$size" -lt 16 ] || [ $(((size-16)%36)) -ne 0 ] ||
+               [ "$header" != 4f534341524d44490000000100000024 ]; then
+              format_failures=$((format_failures+1))
+            fi
+          done <<EOF
 $(find "$deletion_root" -mindepth 2 -maxdepth 2 -type f -name "*.idx" -print | LC_ALL=C sort)
 EOF
-        unexpected=$(find "$deletion_root" -mindepth 1 -maxdepth 1 ! -type d -print | wc -l | tr -d "[:space:]")
-        invalid_shards=$(find "$deletion_root" -mindepth 1 -maxdepth 1 -type d ! -name "[0-9a-f][0-9a-f]" -print | wc -l | tr -d "[:space:]")
-        unexpected_files=$(find "$deletion_root" -mindepth 2 -maxdepth 2 -type f ! -name "*.idx" ! -name ".index.lock" -print | wc -l | tr -d "[:space:]")
-        unexpected_members=$(find "$deletion_root" -mindepth 2 -maxdepth 2 ! -type f -print | wc -l | tr -d "[:space:]")
-        unexpected_deep=$(find "$deletion_root" -mindepth 3 -print | wc -l | tr -d "[:space:]")
-        invalid_locks=0
-        while IFS= read -r lock; do
-          [ "$lock" ] || continue
-          if [ ! -f "$lock" ] || [ -L "$lock" ] || [ "$(stat -c %s -- "$lock" 2>/dev/null || printf -1)" -ne 0 ]; then
-            invalid_locks=$((invalid_locks+1))
-          fi
-        done <<EOF
+          unexpected=$(find "$deletion_root" -mindepth 1 -maxdepth 1 ! -type d -print | wc -l | tr -d "[:space:]")
+          invalid_shards=$(find "$deletion_root" -mindepth 1 -maxdepth 1 -type d ! -name "[0-9a-f][0-9a-f]" -print | wc -l | tr -d "[:space:]")
+          unexpected_files=$(find "$deletion_root" -mindepth 2 -maxdepth 2 -type f ! -name "*.idx" ! -name ".index.lock" -print | wc -l | tr -d "[:space:]")
+          unexpected_members=$(find "$deletion_root" -mindepth 2 -maxdepth 2 ! -type f -print | wc -l | tr -d "[:space:]")
+          unexpected_deep=$(find "$deletion_root" -mindepth 3 -print | wc -l | tr -d "[:space:]")
+          invalid_locks=0
+          while IFS= read -r lock; do
+            [ "$lock" ] || continue
+            if [ ! -f "$lock" ] || [ -L "$lock" ] || [ "$(stat -c %s -- "$lock" 2>/dev/null || printf -1)" -ne 0 ]; then
+              invalid_locks=$((invalid_locks+1))
+            fi
+          done <<EOF
 $(find "$deletion_root" -mindepth 2 -maxdepth 2 -name ".index.lock" -print | LC_ALL=C sort)
 EOF
-        unsafe=$((unsafe+unexpected+invalid_shards+unexpected_files+unexpected_members+unexpected_deep+invalid_locks))
+          unsafe=$((unsafe+unexpected+invalid_shards+unexpected_files+unexpected_members+unexpected_deep+invalid_locks))
+        fi
       fi
     fi
     printf "{\"rootPresent\":true,\"checkpointPresent\":%s,\"checkpointValid\":%s,\"checkpointSchemaVersion\":%s,\"totalEntries\":%s,\"regularFiles\":%s,\"directories\":%s,\"processedIndexFiles\":%s,\"processedIndexBytes\":%s,\"deletionIndexFiles\":%s,\"deletionIndexBytes\":%s,\"retainedManifestFiles\":%s,\"retainedJpegFiles\":%s,\"legacyProcessedMarkerFiles\":%s,\"legacyDeletionTombstones\":%s,\"partialArtifacts\":%s,\"unsafeEntries\":%s,\"indexFormatFailures\":%s}\n" \
@@ -898,33 +1017,49 @@ append_quiesced_backup_member() {
   printf '%s|%s|%s|%s\n' "$kind" "$member" "$result_sha" "$result_bytes" >>"$inventory"
 }
 copy_quiesced_confirmation_member() {
-  local member=$1 destination=$2 image=$3 byte_limit=$4 actual_bytes
+  local member=$1 destination=$2 image=$3 byte_limit=$4 actual_bytes cached_rel cached_cur component
   [[ -n $image && $byte_limit =~ ^[1-9][0-9]*$ && $byte_limit -le 1048576 ]] ||
     fail 'Quiesced daily-journal confirmation copy has invalid bounds.'
   [[ $member =~ ^files/[.]dailyfile-journal/backup-confirmations/([.]sets/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}|[A-Za-z0-9._-]+/[0-9]{4}-[0-9]{2}-[0-9]{2})[.]json$ ]] ||
     fail 'Quiesced daily-journal confirmation member has an unsafe path.'
-  docker run --rm --network none --read-only --cap-drop ALL \
-    --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
-    --volume oscar_oscar_state:/state:ro "$image" -eu -c '
-      member=$1
-      limit=$2
-      path=/state/$member
-      current=/state
-      old_ifs=$IFS
-      IFS=/
-      set -- $member
-      IFS=$old_ifs
-      for component do
-        [ -n "$component" ] && [ "$component" != . ] && [ "$component" != .. ]
-        current=$current/$component
-        [ ! -L "$current" ]
-      done
-      [ -f "$path" ]
-      size=$(stat -c %s -- "$path")
-      [ "$size" -gt 0 ] && [ "$size" -le "$limit" ]
-      cat -- "$path"
-    ' live-journal-confirmation "$member" "$byte_limit" >"$destination" ||
-    fail "Required quiesced daily-journal confirmation member is missing or unsafe: $member"
+  if [[ -n ${quiesced_confirmations_dir:-} && -d $quiesced_confirmations_dir && ! -L $quiesced_confirmations_dir ]]; then
+    cached_rel=${member#files/.dailyfile-journal/backup-confirmations/}
+    cached_cur=$quiesced_confirmations_dir
+    IFS='/' read -r -a cached_parts <<<"$cached_rel"
+    for component in "${cached_parts[@]}"; do
+      [[ -n $component && $component != . && $component != .. ]] ||
+        fail "Required quiesced daily-journal confirmation member is missing or unsafe: $member"
+      cached_cur=$cached_cur/$component
+      [[ ! -L $cached_cur ]] ||
+        fail "Required quiesced daily-journal confirmation member is missing or unsafe: $member"
+    done
+    [[ -f $cached_cur ]] ||
+      fail "Required quiesced daily-journal confirmation member is missing or unsafe: $member"
+    cp -- "$cached_cur" "$destination"
+  else
+    docker run --rm --network none --read-only --cap-drop ALL \
+      --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+      --volume oscar_oscar_state:/state:ro "$image" -eu -c '
+        member=$1
+        limit=$2
+        path=/state/$member
+        current=/state
+        old_ifs=$IFS
+        IFS=/
+        set -- $member
+        IFS=$old_ifs
+        for component do
+          [ -n "$component" ] && [ "$component" != . ] && [ "$component" != .. ]
+          current=$current/$component
+          [ ! -L "$current" ]
+        done
+        [ -f "$path" ]
+        size=$(stat -c %s -- "$path")
+        [ "$size" -gt 0 ] && [ "$size" -le "$limit" ]
+        cat -- "$path"
+      ' live-journal-confirmation "$member" "$byte_limit" >"$destination" ||
+      fail "Required quiesced daily-journal confirmation member is missing or unsafe: $member"
+  fi
   [[ -f $destination && ! -L $destination ]] ||
     fail 'Quiesced daily-journal confirmation copy is not a regular file.'
   actual_bytes=$(file_size "$destination")
@@ -989,38 +1124,106 @@ verify_retained_backup_members() {
   [[ $(wc -l <"$verbose_list" | tr -d '[:space:]') == $(wc -l <"$raw_list" | tr -d '[:space:]') ]] ||
     fail 'Backup retained member verbose listing count mismatch'
   tar -C "$extract_dir" --no-same-owner -xzf "$archive" --files-from="$raw_list"
-  while IFS='|' read -r kind member expected_sha expected_bytes matches raw; do
-    member_file=$extract_dir/$member
-    [[ -f $member_file && ! -L $member_file ]] || fail "Backup retained member is not a regular file: $member"
-    actual_sha=$(sha256_file "$member_file")
-    actual_bytes=$(file_size "$member_file")
-    [[ $actual_sha == "$expected_sha" && $actual_bytes == "$expected_bytes" ]] ||
-      fail "Retained backup member hash or size changed: $member"
-    case $kind in
-      J)
-        header=$(od -An -tx1 -N2 -- "$member_file" | tr -d ' [:space:]')
-        [[ $header == ffd8 && $(tail -c 2 -- "$member_file" | od -An -tx1 | tr -d ' [:space:]') == ffd9 ]] ||
-          fail "Retained backup JPEG has an invalid content type: $member"
-        ;;
-      M|C)
-        grep -Eq '^[[:space:]]*[{]' "$member_file" && grep -Eq '[}][[:space:]]*$' "$member_file" ||
-          fail "Retained backup JSON has an invalid content type: $member"
-        ;;
-      P)
-        header=$(od -An -tx1 -N16 -- "$member_file" | tr -d ' [:space:]')
-        [[ $header == 4f534341524d50490000000100000024 && $actual_bytes -ge 16 &&
-           $(((actual_bytes-16)%36)) -eq 0 ]] ||
-          fail "Retained backup processed index has an invalid content type: $member"
-        ;;
-      D)
-        header=$(od -An -tx1 -N16 -- "$member_file" | tr -d ' [:space:]')
-        [[ $header == 4f534341524d44490000000100000024 && $actual_bytes -ge 16 &&
-           $(((actual_bytes-16)%36)) -eq 0 ]] ||
-          fail "Retained backup deletion index has an invalid content type: $member"
-        ;;
-    esac
-    verified=$((verified+1))
-  done <"$resolved_rows"
+  if command -v perl >/dev/null 2>&1; then
+    verified=$(perl -MDigest::SHA -e '
+      use strict;
+      use warnings;
+      my ($extract_dir, $resolved_rows) = @ARGV;
+      open my $fh, "<", $resolved_rows or die "ERROR: Retained backup verification inputs are missing or unsafe.\n";
+      my $count = 0;
+      while (my $line = <$fh>) {
+        chomp $line;
+        my ($kind, $member, $expected_sha, $expected_bytes) = split /\|/, $line, 5;
+        my $path = "$extract_dir/$member";
+        if (-l $path || !-f $path) {
+          print STDERR "ERROR: Backup retained member is not a regular file: $member\n";
+          exit 1;
+        }
+        my @st = lstat($path);
+        my $actual_bytes = $st[7];
+        my $sha = Digest::SHA->new(256);
+        $sha->addfile($path, "b");
+        my $actual_sha = $sha->hexdigest;
+        if ($actual_sha ne $expected_sha || $actual_bytes != $expected_bytes) {
+          print STDERR "ERROR: Retained backup member hash or size changed: $member\n";
+          exit 1;
+        }
+        open my $mf, "<:raw", $path or exit 1;
+        if ($kind eq "J") {
+          my ($head, $tail) = ("", "");
+          read($mf, $head, 2);
+          if ($actual_bytes >= 2) {
+            seek($mf, -2, 2);
+            read($mf, $tail, 2);
+          }
+          if ($actual_bytes < 4 || unpack("H4", $head) ne "ffd8" || unpack("H4", $tail) ne "ffd9") {
+            print STDERR "ERROR: Retained backup JPEG has an invalid content type: $member\n";
+            exit 1;
+          }
+        } elsif ($kind eq "M" || $kind eq "C") {
+          local $/;
+          my $body = <$mf>;
+          if (!defined($body) || $body !~ /^\s*\{/s || $body !~ /\}\s*\z/s) {
+            print STDERR "ERROR: Retained backup JSON has an invalid content type: $member\n";
+            exit 1;
+          }
+        } elsif ($kind eq "P") {
+          my $head = "";
+          read($mf, $head, 16);
+          if ($actual_bytes < 16 || (($actual_bytes - 16) % 36) != 0 ||
+              unpack("H32", $head) ne "4f534341524d50490000000100000024") {
+            print STDERR "ERROR: Retained backup processed index has an invalid content type: $member\n";
+            exit 1;
+          }
+        } elsif ($kind eq "D") {
+          my $head = "";
+          read($mf, $head, 16);
+          if ($actual_bytes < 16 || (($actual_bytes - 16) % 36) != 0 ||
+              unpack("H32", $head) ne "4f534341524d44490000000100000024") {
+            print STDERR "ERROR: Retained backup deletion index has an invalid content type: $member\n";
+            exit 1;
+          }
+        }
+        close $mf;
+        $count++;
+      }
+      close $fh;
+      print $count;
+    ' "$extract_dir" "$resolved_rows") || exit 1
+  else
+    while IFS='|' read -r kind member expected_sha expected_bytes matches raw; do
+      member_file=$extract_dir/$member
+      [[ -f $member_file && ! -L $member_file ]] || fail "Backup retained member is not a regular file: $member"
+      actual_sha=$(sha256_file "$member_file")
+      actual_bytes=$(file_size "$member_file")
+      [[ $actual_sha == "$expected_sha" && $actual_bytes == "$expected_bytes" ]] ||
+        fail "Retained backup member hash or size changed: $member"
+      case $kind in
+        J)
+          header=$(od -An -tx1 -N2 -- "$member_file" | tr -d ' [:space:]')
+          [[ $header == ffd8 && $(tail -c 2 -- "$member_file" | od -An -tx1 | tr -d ' [:space:]') == ffd9 ]] ||
+            fail "Retained backup JPEG has an invalid content type: $member"
+          ;;
+        M|C)
+          grep -Eq '^[[:space:]]*[{]' "$member_file" && grep -Eq '[}][[:space:]]*$' "$member_file" ||
+            fail "Retained backup JSON has an invalid content type: $member"
+          ;;
+        P)
+          header=$(od -An -tx1 -N16 -- "$member_file" | tr -d ' [:space:]')
+          [[ $header == 4f534341524d50490000000100000024 && $actual_bytes -ge 16 &&
+             $(((actual_bytes-16)%36)) -eq 0 ]] ||
+            fail "Retained backup processed index has an invalid content type: $member"
+          ;;
+        D)
+          header=$(od -An -tx1 -N16 -- "$member_file" | tr -d ' [:space:]')
+          [[ $header == 4f534341524d44490000000100000024 && $actual_bytes -ge 16 &&
+             $(((actual_bytes-16)%36)) -eq 0 ]] ||
+            fail "Retained backup deletion index has an invalid content type: $member"
+          ;;
+      esac
+      verified=$((verified+1))
+    done <"$resolved_rows"
+  fi
   rm -rf -- "$extract_dir"
   printf '%s' "$verified"
 }
@@ -2465,7 +2668,7 @@ COMMANDS
       segments_root="$journal/segments"
       [ -d "$segments_root" ] && [ ! -L "$segments_root" ] || exit 22
     total=$(find "$pubs" "$journal" -mindepth 1 -print | wc -l | tr -d "[:space:]")
-    [ "$total" -le 100000 ] || exit 21
+    [ "$total" -le 500000 ] || exit 21
     partial=$(find "$pubs" "$journal" -type f \( -name "*.partial" -o -name "*.partial.*" -o -name "*.partial-*" -o -name "*.tmp" -o -name "*.tmp.*" -o -name "*.tmp-*" \) -print | wc -l | tr -d "[:space:]")
     manifests=$(find "$pubs" -mindepth 1 -maxdepth 1 -type f -name "*.manifest.v1.json" -print | wc -l | tr -d "[:space:]")
     publications=$(find "$pubs" -mindepth 1 -maxdepth 1 -type f -name "*.csv" -print | wc -l | tr -d "[:space:]")
@@ -2530,7 +2733,7 @@ COMMANDS
       "$eligible_days" "$current_dirs" "$current_open" "$current_sealed" "$current_bytes" \
       "$journal_integrity_failures" "$total"
   ' journal-inventory "$journal_today") ||
-      fail 'Daily-file roots are missing, linked, malformed, or exceed the 100,000-entry safety bound.'
+      fail 'Daily-file roots are missing, linked, malformed, or exceed the 500,000-entry safety bound.'
     IFS='|' read -r publications manifests partial open segments unsafe_links unsafe_entries \
       eligible_prior_days current_day_directories current_day_open current_day_sealed current_day_bytes \
       journal_integrity_failures inventory_entries <<<"$inventory"
@@ -2542,10 +2745,46 @@ COMMANDS
     manifest_listing=$(compose exec -T oscar find /var/lib/oscar/files/dailyfiles \
       -mindepth 1 -maxdepth 1 -type f -name '*.manifest.v1.json' -print | LC_ALL=C sort)
     validated=0; failures=0
+    declare -A precomputed_manifest_size=()
+    declare -A precomputed_manifest_b64=()
+    declare -A precomputed_csv_sha=()
+    declare -A precomputed_csv_bytes=()
+    declare -A precomputed_csv_records=()
+    if [[ -n $manifest_listing ]]; then
+      while IFS='|' read -r m_path m_size m_b64 c_sha c_bytes c_records; do
+        [[ -n $m_path ]] || continue
+        precomputed_manifest_size[$m_path]=$m_size
+        precomputed_manifest_b64[$m_path]=$m_b64
+        precomputed_csv_sha[$m_path]=$c_sha
+        precomputed_csv_bytes[$m_path]=$c_bytes
+        precomputed_csv_records[$m_path]=$c_records
+      done < <(compose exec -T oscar sh -eu -c '
+        for manifest in /var/lib/oscar/files/dailyfiles/*.manifest.v1.json; do
+          [ -f "$manifest" ] && [ ! -L "$manifest" ] || continue
+          csv=${manifest%.manifest.v1.json}
+          m_size=$(stat -c %s -- "$manifest" 2>/dev/null || printf 0)
+          if [ "$m_size" -gt 0 ] && [ "$m_size" -le 1048576 ]; then
+            m_b64=$(openssl base64 -A -in "$manifest" | tr -d "\r\n")
+          else
+            m_b64=""
+          fi
+          if [ -f "$csv" ] && [ ! -L "$csv" ]; then
+            digest=$(sha256sum "$csv"); c_sha=${digest%% *}
+            c_bytes=$(wc -c <"$csv" | tr -d "[:space:]")
+            c_records=$(wc -l <"$csv" | tr -d "[:space:]")
+          else
+            c_sha=""; c_bytes=""; c_records=""
+          fi
+          printf "%s|%s|%s|%s|%s|%s\n" "$manifest" "$m_size" "$m_b64" "$c_sha" "$c_bytes" "$c_records"
+        done
+      ' journal-manifest-batch)
+    fi
     # Materialize the bounded listing before validation. docker compose exec
     # commands inside the loop may read stdin even with -T; a read-driven loop
     # would therefore lose every path after the first validation.
     mapfile -t manifest_paths <<<"$manifest_listing"
+    manifest_sql_batch=""
+    manifest_sql_count=0
     for manifest in "${manifest_paths[@]}"; do
       [[ -n $manifest ]] || continue
       if [[ ! $manifest =~ ^/var/lib/oscar/files/dailyfiles/[A-Za-z0-9._-]+-[0-9a-f]{12}_[0-9]{4}-[0-9]{2}-[0-9]{2}\.csv\.manifest\.v1\.json$ ]]; then
@@ -2557,30 +2796,25 @@ COMMANDS
       [[ $csv_day =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
         failures=$((failures+1)); continue;
       }
-      manifest_size=$(compose exec -T oscar stat -c %s -- "$manifest" 2>/dev/null || printf 0)
+      manifest_size=${precomputed_manifest_size[$manifest]:-0}
       [[ $manifest_size =~ ^[0-9]+$ && $manifest_size -gt 0 && $manifest_size -le 1048576 ]] || {
         failures=$((failures+1)); continue;
       }
-      manifest_encoded=$(compose exec -T oscar openssl base64 -A -in "$manifest" | tr -d '\r\n')
-      if [[ ! $manifest_encoded =~ ^[A-Za-z0-9+/]+=*$ || ${#manifest_encoded} -gt 1398104 ]]; then
+      manifest_encoded=${precomputed_manifest_b64[$manifest]:-}
+      if [[ -z $manifest_encoded || ! $manifest_encoded =~ ^[A-Za-z0-9+/]+=*$ || ${#manifest_encoded} -gt 1398104 ]]; then
         failures=$((failures+1)); continue
       fi
-      csv_stats=$(compose exec -T oscar sh -eu -c '
-        path=$1
-        [ -f "$path" ] && [ ! -L "$path" ] || exit 20
-        digest=$(sha256sum "$path"); digest=${digest%% *}
-        bytes=$(wc -c <"$path" | tr -d "[:space:]")
-        records=$(wc -l <"$path" | tr -d "[:space:]")
-        printf "%s|%s|%s\n" "$digest" "$bytes" "$records"
-      ' journal-csv "$csv" 2>/dev/null || true)
-      IFS='|' read -r actual_sha actual_bytes actual_records <<<"$csv_stats"
+      actual_sha=${precomputed_csv_sha[$manifest]:-}
+      actual_bytes=${precomputed_csv_bytes[$manifest]:-}
+      actual_records=${precomputed_csv_records[$manifest]:-}
       if [[ ! $actual_sha =~ ^[0-9a-f]{64}$ || ! $actual_bytes =~ ^[0-9]+$ || ! $actual_records =~ ^[0-9]+$ ]]; then
         failures=$((failures+1)); continue
       fi
-      manifest_valid=$(scalar "WITH source AS (
+      manifest_sql_count=$((manifest_sql_count+1))
+      manifest_sql_batch+="WITH source AS (
           SELECT convert_from(decode('$manifest_encoded','base64'),'UTF8') AS text),
         doc AS (SELECT text::json AS raw, text::jsonb AS value FROM source)
-        SELECT jsonb_typeof(value)='object'
+        SELECT (jsonb_typeof(value)='object'
           AND (SELECT count(*) FROM json_object_keys(raw))=12
           AND value ?& ARRAY['schemaVersion','format','laneId','zoneId','windowStartInclusive',
             'windowEndExclusive','recordCount','byteCount','checksumAlgorithm','sha256','dataFile','publishedAt']
@@ -2606,10 +2840,25 @@ COMMANDS
           AND value->>'publishedAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?Z$'
           AND (value->>'publishedAt')::timestamptz IS NOT NULL
           AND (value->>'publishedAt')::timestamptz >=
-            (value->>'windowEndExclusive')::timestamptz
-        FROM doc;")
-      if [[ $manifest_valid == t ]]; then validated=$((validated+1)); else failures=$((failures+1)); fi
+            (value->>'windowEndExclusive')::timestamptz)::text
+        FROM doc;"$'\n'
     done
+    if ((manifest_sql_count > 0)); then
+      manifest_sql_results=$(psql_admin --quiet --tuples-only --no-align -f - <<<"$manifest_sql_batch")
+      seen_sql_rows=0
+      while IFS= read -r manifest_valid; do
+        [[ -n $manifest_valid ]] || continue
+        seen_sql_rows=$((seen_sql_rows+1))
+        if [[ $manifest_valid == t || $manifest_valid == true ]]; then
+          validated=$((validated+1))
+        else
+          failures=$((failures+1))
+        fi
+      done <<<"$manifest_sql_results"
+      if ((seen_sql_rows != manifest_sql_count)); then
+        failures=$((failures + manifest_sql_count - seen_sql_rows))
+      fi
+    fi
     printf '{"publications":%s,"manifests":%s,"validatedManifests":%s,"manifestFailures":%s,"partialFiles":%s,"unsafeLinks":%s,"unsafeEntries":%s,"bounded":true,"inventoryEntries":%s,"zoneId":"%s","currentDate":"%s","eligiblePriorDayDirectories":%s,"currentDayDirectories":%s,"currentDayOpenSegments":%s,"currentDaySealedSegments":%s,"currentDayBytes":%s,"journalIntegrityFailures":%s,"openSegments":%s,"sealedSegments":%s}\n' \
       "$publications" "$manifests" "$validated" "$failures" "$partial" "$unsafe_links" "$unsafe_entries" \
       "$inventory_entries" "$journal_zone" "$journal_today" "$eligible_prior_days" \
@@ -2980,6 +3229,7 @@ EOF
         to_char(window_end AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
       FROM oscar_obs_stage_partition
       WHERE state='ATTACHED' AND window_end<=clock_timestamp()
+        AND window_end<=clock_timestamp()-interval '60 seconds'
         AND window_end>clock_timestamp()-make_interval(mins=>$archive_delay)
         AND window_end=window_start+make_interval(mins=>$stage_window)
         AND extract(epoch FROM window_start)::bigint % ($stage_window*60)=0
@@ -3707,27 +3957,109 @@ EOF
     ' retained-backup-metadata) || fail 'Required retained-media checkpoint/index metadata is missing or unsafe.'
     processed_expected=0
     deletion_expected=0
-    while IFS= read -r metadata_path; do
-      [[ -n $metadata_path && $metadata_path == /state/files/videos/retained-media/v1/* ]] ||
-        fail 'Retained-media metadata inventory escaped its expected root.'
-      metadata_member=${metadata_path#/state/}
-      case $metadata_member in
-        files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json)
-          append_quiesced_backup_member "$expected_inventory" C "$metadata_member" "$app_image"
-          ;;
-        files/videos/retained-media/v1/retention-processed-index/*.idx)
-          [[ ${metadata_member##*/} =~ ^[0-9]{19}-(0[0-9]|1[01])[.]idx$ ]] ||
-            fail 'Retained-media processed index has a noncanonical name.'
-          append_quiesced_backup_member "$expected_inventory" P "$metadata_member" "$app_image"
-          processed_expected=$((processed_expected+1))
-          ;;
-        files/videos/retained-media/v1/deletion-index/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f][0-9a-f][0-9a-f].idx)
-          append_quiesced_backup_member "$expected_inventory" D "$metadata_member" "$app_image"
-          deletion_expected=$((deletion_expected+1))
-          ;;
-        *) fail 'Retained-media metadata inventory contains an unexpected path.' ;;
-      esac
-    done <<<"$metadata_paths"
+    if command -v perl >/dev/null 2>&1; then
+      quiesced_meta_dir=$backup_work/quiesced-retained-meta
+      mkdir -p "$quiesced_meta_dir"
+      docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+        --volume oscar_oscar_state:/state:ro "$app_image" -eu -c '
+        root=/state/files/videos/retained-media/v1
+        [ -d "$root" ] && [ ! -L "$root" ]
+        [ -f "$root/.metadata-reclamation-checkpoint.json" ] && [ ! -L "$root/.metadata-reclamation-checkpoint.json" ]
+        [ -d "$root/retention-processed-index" ] && [ ! -L "$root/retention-processed-index" ]
+        [ -z "$(find "$root/retention-processed-index" -type l -print -quit)" ]
+        if [ -d "$root/deletion-index" ]; then
+          [ ! -L "$root/deletion-index" ]
+          [ -z "$(find "$root/deletion-index" -type l -print -quit)" ]
+          tar -C /state -cf - \
+            files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json \
+            files/videos/retained-media/v1/retention-processed-index \
+            files/videos/retained-media/v1/deletion-index
+        else
+          tar -C /state -cf - \
+            files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json \
+            files/videos/retained-media/v1/retention-processed-index
+        fi
+      ' retained-backup-meta-stream | tar -C "$quiesced_meta_dir" --no-same-owner -xf - ||
+        fail 'Required retained-media checkpoint/index metadata is missing or unsafe.'
+      metadata_paths_file=$backup_work/metadata-paths.txt
+      printf '%s\n' "$metadata_paths" >"$metadata_paths_file"
+      meta_counts=$(perl -MDigest::SHA -e '
+        use strict;
+        use warnings;
+        my ($paths_file, $meta_dir, $inv_file) = @ARGV;
+        open my $pf, "<", $paths_file or exit 1;
+        open my $out, ">>", $inv_file or exit 1;
+        my ($proc, $del) = (0, 0);
+        while (my $metadata_path = <$pf>) {
+          chomp $metadata_path;
+          if ($metadata_path !~ m{^/state/(files/videos/retained-media/v1/.+)\z}) {
+            print STDERR "ERROR: Retained-media metadata inventory escaped its expected root.\n";
+            exit 1;
+          }
+          my $member = $1;
+          my $kind;
+          if ($member eq "files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json") {
+            $kind = "C";
+          } elsif ($member =~ m{^files/videos/retained-media/v1/retention-processed-index/([^/]+\.idx)\z}) {
+            my $base = $1;
+            if ($base !~ /^[0-9]{19}-(0[0-9]|1[01])\.idx\z/) {
+              print STDERR "ERROR: Retained-media processed index has a noncanonical name.\n";
+              exit 1;
+            }
+            $kind = "P";
+            $proc++;
+          } elsif ($member =~ m{^files/videos/retained-media/v1/deletion-index/[0-9a-f]{2}/[0-9a-f]{4}\.idx\z}) {
+            $kind = "D";
+            $del++;
+          } else {
+            print STDERR "ERROR: Retained-media metadata inventory contains an unexpected path.\n";
+            exit 1;
+          }
+          my $local = "$meta_dir/$member";
+          if (-l $local || !-f $local) {
+            print STDERR "ERROR: Expected quiesced retained backup member is missing or unsafe: $member\n";
+            exit 1;
+          }
+          my @st = lstat($local);
+          my $size = $st[7];
+          if (!$size || $size <= 0) {
+            print STDERR "ERROR: Expected quiesced retained backup member is missing or unsafe: $member\n";
+            exit 1;
+          }
+          my $sha = Digest::SHA->new(256);
+          $sha->addfile($local, "b");
+          print $out "$kind|$member|" . $sha->hexdigest . "|$size\n";
+        }
+        close $out;
+        close $pf;
+        print "$proc|$del";
+      ' "$metadata_paths_file" "$quiesced_meta_dir" "$expected_inventory") || exit 1
+      rm -rf -- "$quiesced_meta_dir"
+      IFS='|' read -r processed_expected deletion_expected <<<"$meta_counts"
+    else
+      while IFS= read -r metadata_path; do
+        [[ -n $metadata_path && $metadata_path == /state/files/videos/retained-media/v1/* ]] ||
+          fail 'Retained-media metadata inventory escaped its expected root.'
+        metadata_member=${metadata_path#/state/}
+        case $metadata_member in
+          files/videos/retained-media/v1/.metadata-reclamation-checkpoint.json)
+            append_quiesced_backup_member "$expected_inventory" C "$metadata_member" "$app_image"
+            ;;
+          files/videos/retained-media/v1/retention-processed-index/*.idx)
+            [[ ${metadata_member##*/} =~ ^[0-9]{19}-(0[0-9]|1[01])[.]idx$ ]] ||
+              fail 'Retained-media processed index has a noncanonical name.'
+            append_quiesced_backup_member "$expected_inventory" P "$metadata_member" "$app_image"
+            processed_expected=$((processed_expected+1))
+            ;;
+          files/videos/retained-media/v1/deletion-index/[0-9a-f][0-9a-f]/[0-9a-f][0-9a-f][0-9a-f][0-9a-f].idx)
+            append_quiesced_backup_member "$expected_inventory" D "$metadata_member" "$app_image"
+            deletion_expected=$((deletion_expected+1))
+            ;;
+          *) fail 'Retained-media metadata inventory contains an unexpected path.' ;;
+        esac
+      done <<<"$metadata_paths"
+    fi
     expected_member_count=$(wc -l <"$expected_inventory" | tr -d '[:space:]')
     [[ $expected_member_count == $((expected_sets * 6 + 1 + processed_expected + deletion_expected)) ]] ||
       fail 'Retained backup expectation inventory has an inconsistent exact member count.'
@@ -3898,6 +4230,18 @@ EOF
         fi
         tar -C "$journal_extract_dir" --no-same-owner -xzf "$root/oscar-state.tar.gz" -- "$journal_tar_prefix"
       fi
+      quiesced_confirmations_dir=$backup_work/quiesced-confirmations
+      mkdir -p "$quiesced_confirmations_dir"
+      docker run --rm --network none --read-only --cap-drop ALL \
+        --security-opt no-new-privileges --workdir / --user 10001:10001 --entrypoint sh \
+        --volume oscar_oscar_state:/state:ro "$app_image" -eu -c '
+        [ ! -L /state/files ] && [ ! -L /state/files/.dailyfile-journal ]
+        root=/state/files/.dailyfile-journal/backup-confirmations
+        [ -d "$root" ] && [ ! -L "$root" ]
+        [ -z "$(find "$root" -type l -print -quit)" ]
+        tar -C "$root" -cf - .
+      ' live-journal-confirmations-stream | tar -C "$quiesced_confirmations_dir" --no-same-owner -xf - ||
+        fail 'Required quiesced daily-journal confirmation tree is missing or unsafe.'
       confirmation_set_file=$backup_work/confirmation-set.json
       copy_quiesced_confirmation_member "$confirmation_set_member" "$confirmation_set_file" \
         "$app_image" 786432
@@ -3938,7 +4282,7 @@ EOF
 WITH doc AS (
   SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
 SELECT receipt->>'path',receipt->>'sha256' FROM doc,
-  LATERAL jsonb_array_elements(value->'receipts') receipt ORDER BY receipt->>'path';
+  LATERAL jsonb_array_elements(doc.value->'receipts') AS receipt(receipt) ORDER BY receipt->>'path';
 SQL
     while IFS='|' read -r receipt_relative receipt_expected_sha receipt_extra; do
       [[ -z ${receipt_extra:-} &&
@@ -4005,15 +4349,15 @@ SQL
       receipt_sha=$(sha256_file "$receipt_file")
       membership=$(scalar_large "WITH doc AS (
           SELECT convert_from(decode('$set_encoded','base64'),'UTF8')::jsonb AS value)
-        SELECT count(*)=1 FROM doc, LATERAL jsonb_array_elements(value->'receipts') receipt
+        SELECT count(*)=1 FROM doc, LATERAL jsonb_array_elements(doc.value->'receipts') AS receipt(receipt)
         WHERE receipt->>'path'='$relative' AND receipt->>'sha256'='$receipt_sha';")
       [[ $receipt_valid == t && $membership == t ]] || invalid_receipts=$((invalid_receipts+1))
       receipt_rows=$backup_work/receipt-segments-$receipt_count.txt
       psql_admin --quiet --tuples-only --no-align --field-separator='|' -f - <<SQL >"$receipt_rows.with-lane"
 WITH doc AS (
   SELECT convert_from(decode('$encoded','base64'),'UTF8')::jsonb AS value)
-SELECT value->>'laneId',segment->>'name',segment->>'byteCount',segment->>'sha256'
-FROM doc,LATERAL jsonb_array_elements(value->'sealedSegments') segment
+SELECT doc.value->>'laneId',segment->>'name',segment->>'byteCount',segment->>'sha256'
+FROM doc,LATERAL jsonb_array_elements(doc.value->'sealedSegments') AS segment(segment)
 ORDER BY segment->>'name';
 SQL
       receipt_lane=''; : >"$receipt_rows"

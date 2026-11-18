@@ -27,12 +27,35 @@ export function isExpectedRetainedMediaMiss(
   }
 }
 
+export function isExpectedHistoricalClipMiss(
+  baseUrl: string,
+  method: string,
+  status: number,
+  responseUrl: string,
+  expectedClipDates: ReadonlySet<string>,
+): boolean {
+  if (method !== "GET" || status !== 404 || expectedClipDates.size === 0) return false;
+  try {
+    const expectedOrigin = new URL(baseUrl).origin;
+    const response = new URL(responseUrl);
+    if (response.origin !== expectedOrigin || response.hash !== "") return false;
+    const pathname = decodeURIComponent(response.pathname);
+    const match = /^\/sensorhub\/buckets\/videos\/clips\/[A-Za-z0-9._~-]+\/(\d{4}-\d{2}-\d{2})_[0-9A-Za-z._-]+\.mp4$/i.exec(
+      pathname,
+    );
+    return Boolean(match?.[1] && expectedClipDates.has(match[1]));
+  } catch {
+    return false;
+  }
+}
+
 export class BrowserHarness {
   private browser: Browser | undefined;
   private oscarContext: BrowserContext | undefined;
   private emulatorContext: BrowserContext | undefined;
   private scenario = "browser";
   private readonly expectedMissingObservationIds = new Set<string>();
+  private readonly expectedHistoricalClipDates = new Set<string>();
   private alarmTransferCameraFixtureValue: AlarmTransferCameraFixture | undefined;
 
   constructor(private readonly config: SuiteConfig, private readonly reporter: RunReporter) {}
@@ -280,7 +303,7 @@ export class BrowserHarness {
         await page.getByLabel("Password").fill(this.config.oscarPassword);
         await Promise.all([
           page.waitForURL((url) => !url.pathname.startsWith("/login"), {timeout: this.config.uiTimeoutMs}),
-          page.getByRole("button", {name: "Sign in"}).click(),
+          page.getByRole("button", {name: "Sign in", exact: true}).click(),
         ]);
       }
       const response = await this.oscarContext.request.get(`${this.config.oscarBaseUrl}/session`);
@@ -344,7 +367,15 @@ export class BrowserHarness {
             return false;
           }
         });
-        if (!expectedPreparingRequest && !expectedRetainedMediaMiss && !expectedMissingObservation) {
+        const expectedHistoricalClipMiss = isExpectedHistoricalClipMiss(
+          this.config.oscarBaseUrl,
+          response.request().method(),
+          response.status(),
+          url,
+          this.expectedHistoricalClipDates,
+        );
+        if (!expectedPreparingRequest && !expectedRetainedMediaMiss &&
+            !expectedMissingObservation && !expectedHistoricalClipMiss) {
           this.reporter.error(
             this.scenario,
             `${source}-http`,
@@ -482,6 +513,18 @@ export class BrowserHarness {
       return await operation();
     } finally {
       this.expectedMissingObservationIds.delete(observationId);
+    }
+  }
+
+  async withExpectedHistoricalClipDate<T>(isoTimestamp: string, operation: () => Promise<T>): Promise<T> {
+    const dateMatch = /^(\d{4}-\d{2}-\d{2})/.exec(isoTimestamp.trim());
+    const dateKey = dateMatch?.[1] ?? "";
+    if (!dateKey) return operation();
+    this.expectedHistoricalClipDates.add(dateKey);
+    try {
+      return await operation();
+    } finally {
+      this.expectedHistoricalClipDates.delete(dateKey);
     }
   }
 

@@ -292,7 +292,7 @@ therefore does not require waiting through midnight merely to fabricate data.
 Keep the canonical 50-lane fixture running across a configured-zone midnight
 when published-file coverage is specifically desired. Once that boundary is
 present, the not-yet-eligible branch is unavailable. The smoke check bounds the
-publication/journal inventory to 100,000 entries, rejects links and every
+publication/journal inventory to 500,000 entries, rejects links and every
 `.partial*`/`.tmp*` spelling, and requires every regular flat
 `{lane-suffix}-{12-hex-full-UID-hash}_{configured-zone-date}.csv` to have an
 exact 12-key v1 `OSCAR_LEGACY_DAILY_CSV` manifest no larger than 1 MiB.

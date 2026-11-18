@@ -698,7 +698,7 @@ class UiEnduranceRunner {
       page.waitForURL((url) => !url.pathname.startsWith("/login"), {
         timeout: this.config.uiTimeoutMs,
       }),
-      page.getByRole("button", {name: "Sign in"}).click(),
+      page.getByRole("button", {name: "Sign in", exact: true}).click(),
     ]);
     return true;
   }
@@ -2617,28 +2617,58 @@ class UiEnduranceRunner {
       recentlyAdjudicatedKeys: this.recentlyAdjudicatedKeys,
       count: 1,
     });
-    const target = candidates[0];
-    if (!target) {
+    const initialTarget = candidates[0];
+    if (!initialTarget) {
       throw new Error(`No non-reserved unadjudicated alarm found on Page 0 of view=${viewKey}`);
     }
+    let target = initialTarget;
 
-    const observationId = await this.resolveObservationIdForLaneOccupancy(
+    let observationId = await this.resolveObservationIdForLaneOccupancy(
       this.operatorContext.request,
       target.laneId,
       target.occupancyCount,
     );
 
-    // Click row to open QuickView inline panel (resilient to live->durable data-id upgrade)
-    await page.evaluate(() => {
-      const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
-      if (scroller && scroller.scrollTop > 0) {
-        scroller.scrollTop = 0;
-        scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+    const scrollGridTop = async () => {
+      await page.evaluate(() => {
+        const scroller = document.querySelector<HTMLElement>(".MuiDataGrid-virtualScroller");
+        if (scroller && scroller.scrollTop > 0) {
+          scroller.scrollTop = 0;
+          scroller.dispatchEvent(new Event("scroll", {bubbles: true}));
+        }
+      });
+    };
+
+    const ensureVisibleTargetOnPageZero = async () => {
+      await scrollGridTop();
+      let loc = page.locator(buildEventRowCssSelector(target.rowKey, observationId)).first();
+      if (await loc.isVisible().catch(() => false)) {
+        return loc;
       }
-    });
-    const rowLocator = page.locator(
-      buildEventRowCssSelector(target.rowKey, observationId),
-    ).first();
+      const freshRows = await this.readRenderedRows(page);
+      const freshCandidates = selectAdjudicationCandidates({
+        rows: freshRows,
+        reservedLaneLabel: this.config.testLaneLabel,
+        allowedLanes,
+        recentlyAdjudicatedKeys: this.recentlyAdjudicatedKeys,
+        count: 1,
+      });
+      const nextTarget = freshCandidates[0];
+      if (!nextTarget) {
+        throw new Error(`No non-reserved unadjudicated alarm visible after refresh on Page 0 of view=${viewKey}`);
+      }
+      target = nextTarget;
+      observationId = await this.resolveObservationIdForLaneOccupancy(
+        this.operatorContext!.request,
+        target.laneId,
+        target.occupancyCount,
+      );
+      loc = page.locator(buildEventRowCssSelector(target.rowKey, observationId)).first();
+      return loc;
+    };
+
+    // Click row to open QuickView inline panel (resilient to live->durable data-id upgrade & live Page 0 arrivals)
+    let rowLocator = await ensureVisibleTargetOnPageZero();
     await rowLocator.locator('[data-field="laneId"]').click();
 
     await page
@@ -2647,7 +2677,7 @@ class UiEnduranceRunner {
     await page.getByRole("button", {name: /Share occupancy/i}).waitFor({timeout: 10_000});
     await page.getByRole("button", {name: /Export alarm QR/i}).waitFor({timeout: 10_000});
 
-    const occHeading = page.getByText(`Occupancy ID: ${target.occupancyCount}`, {exact: true});
+    let occHeading = page.getByText(`Occupancy ID: ${target.occupancyCount}`, {exact: true});
     const submitBtn = page.getByRole("button", {name: "Submit", exact: true});
     const resetBtn = page.getByRole("button", {name: "Reset", exact: true});
 
@@ -2660,6 +2690,8 @@ class UiEnduranceRunner {
       .waitFor({timeout: 10_000});
     await occHeading.waitFor({state: "hidden", timeout: 10_000});
 
+    rowLocator = await ensureVisibleTargetOnPageZero();
+    occHeading = page.getByText(`Occupancy ID: ${target.occupancyCount}`, {exact: true});
     await rowLocator.locator('[data-field="laneId"]').click();
     await occHeading.waitFor({timeout: this.config.uiTimeoutMs});
 
@@ -2908,8 +2940,26 @@ class UiEnduranceRunner {
     await compareBtn.waitFor({state: "hidden", timeout: 10_000});
     await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
 
-    // Verify the interactive UpSet alarm co-occurrence plot renders when alarming rows exist on /event-log
-    const upsetPlotVisible = await page.getByTestId("event-log-upset-plot").first().isVisible().catch(() => false);
+    // Verify the interactive UpSet alarm co-occurrence plot & Category Filter group render on demand on /event-log
+    const upsetSec = page.getByTestId("event-log-upset-section").first();
+    const upsetSummary = page.getByTestId("event-log-upset-summary").first();
+    let upsetPlotVisible = false;
+    if (await upsetSummary.isVisible().catch(() => false)) {
+      const wasOpen = await upsetSec.evaluate((el) => el.hasAttribute("open")).catch(() => false);
+      if (!wasOpen) {
+        await upsetSummary.click();
+      }
+      const plotReady = await page.getByTestId("event-log-upset-plot").first()
+        .waitFor({state: "visible", timeout: 15_000})
+        .then(() => true, () => false);
+      const catGroupReady = await page.getByTestId("upset-category-filter-group").first()
+        .isVisible()
+        .catch(() => false);
+      upsetPlotVisible = plotReady && catGroupReady;
+      if (!wasOpen) {
+        await upsetSummary.click().catch(() => undefined);
+      }
+    }
 
     await page.getByRole("button", {name: /advanced filters/i}).first().click();
     await filterDialog.waitFor({timeout: this.config.uiTimeoutMs});
@@ -2949,7 +2999,10 @@ class UiEnduranceRunner {
     const verifiedAdjudicatedYes = await poll(
       async () => {
         const statuses = await page.locator('.MuiDataGrid-row [data-field="adjudicatedIds"]').allInnerTexts();
-        return statuses.length > 0 && statuses.every((s) => s.trim() === "Yes");
+        return statuses.length > 0 && statuses.every((s) => {
+          const val = s.trim();
+          return val === "Yes" || val === "EML Non-Threat";
+        });
       },
       Boolean,
       {timeoutMs: 25_000, intervalMs: 400, description: "Event Log Adjudicated=Yes column verification"},

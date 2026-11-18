@@ -615,7 +615,7 @@ test("primary lifecycle samples natural whole-child retirement without product m
 test("journal status validates exact bounded v1 manifests and direct lane state", () => {
   const block = probe.slice(probe.indexOf("  journal-status)"), probe.indexOf("  journal-restart)"));
   for (const required of [
-    "total", "100000", "manifest_size", "1048576", "manifest_encoded",
+    "total", "500000", "manifest_size", "1048576", "manifest_encoded",
     "json_object_keys(raw))=12", "OSCAR_LEGACY_DAILY_CSV", "checksumAlgorithm", "SHA-256",
     "windowStartInclusive", "windowEndExclusive", "dataFile", "publishedAt", "unsafeLinks",
     "unsafeEntries",

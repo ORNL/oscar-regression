@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {isExpectedRetainedMediaMiss} from "../src/browser.js";
+import {isExpectedHistoricalClipMiss, isExpectedRetainedMediaMiss} from "../src/browser.js";
 
 const baseUrl = "https://oscar.local";
 
@@ -31,4 +31,15 @@ test("does not suppress failures outside the retained-media fallback contract", 
     "https://oscar.local/sensorhub/buckets/videos/media/%2e%2e%2fadmin"), false);
   assert.equal(isExpectedRetainedMediaMiss(baseUrl, "GET", 404,
     "https://oscar.local/sensorhub/buckets/videos/media/"), false);
+});
+
+test("accepts only scoped historical clip GET 404 matching the active date key", () => {
+  const activeDates = new Set(["2026-10-26"]);
+  const clipUrl = "https://oscar.local/sensorhub/buckets/videos/clips/urn-osh-sensor-ffmpeg-lane-lane-02-0/2026-10-26_01-43-05_530-g1.mp4";
+  assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 404, clipUrl, activeDates), true);
+  assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 404, clipUrl, new Set()), false);
+  assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 404, clipUrl, new Set(["2026-11-18"])), false);
+  assert.equal(isExpectedHistoricalClipMiss(baseUrl, "POST", 404, clipUrl, activeDates), false);
+  assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 500, clipUrl, activeDates), false);
+  assert.equal(isExpectedHistoricalClipMiss("https://other.local", "GET", 404, clipUrl, activeDates), false);
 });

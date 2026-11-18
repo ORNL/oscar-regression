@@ -1079,6 +1079,84 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "viewer-navigation",
+        category: "viewer",
+        action: "verify UpSet populated-first main Category Filter buttons, interactive category filtering, and Clear Filter",
+        target: "/event-log",
+        expected: "UpSet Category Filter buttons list populated categories (count > 0) ahead of disabled zero-count (0) categories, and clicking a populated category filters Event Log rows with aria-pressed='true' and resets via Clear Filter",
+      }, async () => {
+        const plotVisible = await page.getByTestId("event-log-upset-plot").isVisible().catch(() => false);
+        if (!plotVisible) {
+          return {
+            passed: true,
+            observed: "skipped UpSet category filter check (no alarming occupancies in window)",
+            evidence: "",
+          };
+        }
+        const catGroup = page.getByTestId("upset-category-filter-group").first();
+        await catGroup.waitFor({state: "visible", timeout: 10_000});
+
+        const buttonMeta = await catGroup.evaluate((groupEl) => {
+          const btns = Array.from(groupEl.querySelectorAll<HTMLButtonElement>("button"));
+          return btns.map((b) => {
+            const text = (b.textContent ?? "").trim();
+            const m = /\(([\d,]+)\)\s*$/.exec(text);
+            const count = m?.[1] ? Number(m[1].replace(/,/g, "")) : 0;
+            return {
+              text,
+              count,
+              disabled: b.disabled,
+              ariaPressed: b.getAttribute("aria-pressed"),
+            };
+          });
+        });
+
+        let seenZero = false;
+        let populatedFirst = buttonMeta.length === 7;
+        let disabledMatchesZero = buttonMeta.length === 7;
+        for (const bm of buttonMeta) {
+          if (bm.count === 0) {
+            seenZero = true;
+            if (!bm.disabled) disabledMatchesZero = false;
+          } else {
+            if (seenZero) populatedFirst = false;
+            if (bm.disabled) disabledMatchesZero = false;
+          }
+        }
+
+        const firstEnabledBtn = catGroup.locator("button:not([disabled])").first();
+        let toggleVerified = true;
+        if ((await firstEnabledBtn.count()) > 0) {
+          await firstEnabledBtn.click();
+          const pressedTrue = await poll(
+            async () => (await firstEnabledBtn.getAttribute("aria-pressed")) === "true",
+            Boolean,
+            {timeoutMs: 5_000, intervalMs: 100, description: "UpSet category button aria-pressed=true"},
+          ).then(() => true, () => false);
+          const clearBtn = page.getByTestId("upset-clear-filter-chip").first();
+          const clearVisible = await clearBtn.waitFor({state: "visible", timeout: 5_000}).then(() => true, () => false);
+          if (clearVisible) {
+            await clearBtn.click();
+          }
+          const resetFalse = await poll(
+            async () => (await firstEnabledBtn.getAttribute("aria-pressed")) === "false",
+            Boolean,
+            {timeoutMs: 5_000, intervalMs: 100, description: "UpSet category button aria-pressed=false after Clear Filter"},
+          ).then(() => true, () => false);
+          toggleVerified = pressedTrue && clearVisible && resetFalse;
+        }
+
+        const passed = populatedFirst && disabledMatchesZero && toggleVerified;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "upset-category-filters-failed");
+        return {
+          passed,
+          observed: `buttons=${buttonMeta.map((b) => `${b.text}[disabled=${b.disabled}]`).join(", ")}; ` +
+            `populatedFirst=${populatedFirst}; disabledMatchesZero=${disabledMatchesZero}; toggleVerified=${toggleVerified}`,
+          evidence,
+        };
+      });
+
+      await this.check({
+        scenario: "viewer-navigation",
         category: "performance",
         action: "save Events query bookmark, drill into Event Details, and return to cached filtered query with zero observation round-trips",
         target: "/event-log and /event-details",
@@ -1450,18 +1528,20 @@ export class RegressionScenarios {
 
         let detailsVerified = true;
         if (earliestAlarmId) {
-          await this.goto(page, `/event-details?eventId=${encodeURIComponent(earliestAlarmId)}`);
-          const uuidVisible = await page.getByTestId("event-uuid-value")
-            .waitFor({timeout: this.config.eventTimeoutMs})
-            .then(() => true)
-            .catch(() => false);
-          const canvasVisible = await page.locator("div.chart-view-event-detail canvas").first()
-            .waitFor({timeout: this.config.uiTimeoutMs})
-            .then(() => true)
-            .catch(() => false);
-          await page.waitForTimeout(1_500);
-          const bodyText = await page.locator("body").innerText();
-          detailsVerified = uuidVisible && canvasVisible && !/application error|internal server error/i.test(bodyText);
+          await this.browser.withExpectedHistoricalClipDate(earliestStartTime, async () => {
+            await this.goto(page, `/event-details?eventId=${encodeURIComponent(earliestAlarmId)}`);
+            const uuidVisible = await page.getByTestId("event-uuid-value")
+              .waitFor({timeout: this.config.eventTimeoutMs})
+              .then(() => true)
+              .catch(() => false);
+            const canvasVisible = await page.locator("div.chart-view-event-detail canvas").first()
+              .waitFor({timeout: this.config.uiTimeoutMs})
+              .then(() => true)
+              .catch(() => false);
+            await page.waitForTimeout(1_500);
+            const bodyText = await page.locator("body").innerText();
+            detailsVerified = uuidVisible && canvasVisible && !/application error|internal server error/i.test(bodyText);
+          });
         }
 
         await this.goto(page, "/event-log");
@@ -1497,6 +1577,37 @@ export class RegressionScenarios {
   private async mapNationalServers(): Promise<void> {
     const page = await this.browser.oscarPage();
     try {
+      let expectedNodeName = "Local Node";
+      try {
+        const sysRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/api/systems?format=application%2Fjson&limit=200"),
+        );
+        if (sysRes.ok()) {
+          const sysPayload = await sysRes.json() as {
+            items?: Array<{
+              uid?: string;
+              name?: string;
+              validTime?: string[];
+              properties?: {uid?: string; name?: string; validTime?: string[]};
+            }>;
+          };
+          const oscarSystems = (sysPayload.items ?? []).filter((item) =>
+            String(item?.uid ?? item?.properties?.uid ?? "").includes("urn:ornl:oscar:system:"),
+          );
+          oscarSystems.sort((a, b) => {
+            const va = String(a?.validTime?.[0] ?? a?.properties?.validTime?.[0] ?? "");
+            const vb = String(b?.validTime?.[0] ?? b?.properties?.validTime?.[0] ?? "");
+            return vb.localeCompare(va);
+          });
+          const rawName = String(oscarSystems[0]?.name ?? oscarSystems[0]?.properties?.name ?? "").trim();
+          if (rawName && rawName !== "OSCAR System") {
+            expectedNodeName = rawName;
+          }
+        }
+        await sysRes.dispose();
+      } catch {
+        // Default to "Local Node" if systems metadata lookup is unavailable
+      }
       await this.check({
         scenario: "map-national-servers", category: "map", action: "render site map",
         target: "/map", expected: "interactive map container renders at non-zero size",
@@ -1623,7 +1734,7 @@ export class RegressionScenarios {
 
           const rendered = await poll(async () => {
             const localRow = page.locator(".MuiDataGrid-row").filter({
-              has: page.locator('[data-field="site"]', {hasText: "Local Node"}),
+              has: page.locator('[data-field="site"]', {hasText: expectedNodeName}),
             }).first();
             await localRow.waitFor({timeout: this.config.uiTimeoutMs});
             const values = {} as Record<NationalStatisticsField, string>;
@@ -1663,14 +1774,106 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "map-national-servers", category: "configuration", action: "inspect server management",
-        target: "/servers", expected: "Nodes list and Add Server form render without changing configuration",
+        target: "/servers", expected: "Nodes list and Add Server form render with authoritative node name and authentication badge without changing configuration",
       }, async () => {
         await this.goto(page, "/servers");
         const nodes = page.getByRole("heading", {name: "Nodes", exact: true});
         const addServer = page.getByRole("heading", {name: "Add a New Server", exact: true});
         await Promise.all([nodes.waitFor(), addServer.waitFor()]);
         const body = await page.locator("body").innerText();
-        return {passed: /Local Node/i.test(body), observed: `Local Node listed=${/Local Node/i.test(body)}`};
+        const nodeListed = body.includes(expectedNodeName) || /Local Node/i.test(body);
+        const sessionBadge = /Browser Session/i.test(body);
+        const quickFedBtn = await page.getByTestId("switch-to-federation-token-btn").isVisible().catch(() => false);
+        const passed = nodeListed && sessionBadge && quickFedBtn;
+        return {
+          passed,
+          observed: `expectedNode=${expectedNodeName}; listed=${nodeListed}; sessionBadge=${sessionBadge}; quickFedBtn=${quickFedBtn}`,
+          evidence: passed ? "" : await this.screenshotOnFailure(page, "servers-page-inspection-failed"),
+        };
+      });
+
+      await this.check({
+        scenario: "map-national-servers",
+        category: "security",
+        action: "verify Users & Access (/users), Octelium password separation guidance, Federation Token mint/revoke, and /servers?auth=bearer deep link",
+        target: "/users and /servers?auth=bearer",
+        expected: "Users & Access renders persistent session status + Octelium password independence note, mints a temporary Federation Service Token, opens /servers?auth=bearer in Federation Service Token HTTPS 443 mode, and revokes the probe token cleanly",
+      }, async () => {
+        const probeLabel = `Regression Fed Probe ${this.reporter.runId}`;
+        let createdTokenId = "";
+        try {
+          await this.goto(page, "/users");
+          await page.getByRole("heading", {name: /Users, Passkeys & Access Control/i}).waitFor({timeout: this.config.uiTimeoutMs});
+          await page.getByText(/Signed-In Account Summary/i).first().waitFor({timeout: this.config.uiTimeoutMs});
+          const accountBody = await page.locator("body").innerText();
+          const hasStaySignedIn = /Stays signed in until you click Log Out|Idle\s+\d+\s*m/i.test(accountBody);
+          const hasOcteliumNote = /Octelium/i.test(accountBody) && /does NOT require changing/i.test(accountBody);
+
+          await page.getByRole("tab", {name: /Federation Tokens/i}).click();
+          const howToCardVisible = await page.getByTestId("fed-token-how-to-use-card")
+            .waitFor({state: "visible", timeout: 10_000})
+            .then(() => true, () => false);
+
+          await page.getByLabel(/Remote Organization \/ Node Label/i).first().fill(probeLabel);
+          const createResPromise = page.waitForResponse(
+            (res) => res.request().method() === "POST" && res.url().includes("/sensorhub/session/admin/federation-tokens"),
+            {timeout: 15_000},
+          );
+          await page.getByRole("button", {name: /Create Federation Token/i}).first().click();
+          const createRes = await createResPromise;
+          if (createRes.ok()) {
+            const payload = await createRes.json() as {record?: {id?: string}; token?: string};
+            createdTokenId = String(payload?.record?.id ?? "");
+          }
+
+          const openServersBtn = page.getByTestId("new-fed-token-open-servers-btn");
+          const openBtnVisible = await openServersBtn.waitFor({state: "visible", timeout: 10_000}).then(() => true, () => false);
+          await openServersBtn.click();
+
+          const tokenInput = page.getByTestId("node-federation-token-input");
+          const tokenInputVisible = await tokenInput.waitFor({state: "visible", timeout: 15_000}).then(() => true, () => false);
+          const portVal = await page.getByLabel(/^Port$/i).first().inputValue().catch(() => "");
+          const httpsChecked = await page.getByLabel(/Use a secure connection/i).first().isChecked().catch(() => false);
+
+          if (createdTokenId) {
+            const delRes = await page.context().request.delete(
+              this.viewerUrl(`/sensorhub/session/admin/federation-tokens/${encodeURIComponent(createdTokenId)}`),
+              {data: {}},
+            );
+            await delRes.dispose();
+            createdTokenId = "";
+          }
+
+          const ovRes = await page.context().request.get(this.viewerUrl("/sensorhub/session/admin/overview"));
+          let probeCleaned = false;
+          if (ovRes.ok()) {
+            const ovJson = await ovRes.json() as {federationTokens?: Array<{label?: string}>};
+            probeCleaned = !(ovJson.federationTokens ?? []).some((t) => t.label === probeLabel);
+          }
+          await ovRes.dispose();
+
+          const passed = hasStaySignedIn &&
+            hasOcteliumNote &&
+            howToCardVisible &&
+            openBtnVisible &&
+            tokenInputVisible &&
+            portVal === "443" &&
+            httpsChecked &&
+            probeCleaned;
+          return {
+            passed,
+            observed: `staySignedIn=${hasStaySignedIn}; octeliumNote=${hasOcteliumNote}; howToCard=${howToCardVisible}; ` +
+              `openServersBtn=${openBtnVisible}; tokenInput=${tokenInputVisible}; port=${portVal}; https=${httpsChecked}; probeCleaned=${probeCleaned}`,
+            evidence: passed ? "" : await this.screenshotOnFailure(page, "users-federation-servers-flow-failed"),
+          };
+        } finally {
+          if (createdTokenId) {
+            await page.context().request.delete(
+              this.viewerUrl(`/sensorhub/session/admin/federation-tokens/${encodeURIComponent(createdTokenId)}`),
+              {data: {}},
+            ).then((r) => r.dispose()).catch(() => undefined);
+          }
+        }
       });
     } finally { await page.close(); }
   }
@@ -3477,8 +3680,15 @@ export class RegressionScenarios {
             const parsedJson = JSON.parse(jsonText) as {
               upSetCoOccurrence?: {
                 totalOccupancies?: unknown;
-                sets?: unknown[];
-                intersections?: unknown[];
+                sets?: Array<{name?: string; count?: number}>;
+                intersections?: Array<{
+                  sets?: string[];
+                  activeSets?: string[];
+                  categories?: string[];
+                  snmPresent?: boolean;
+                  count?: number;
+                  mask?: number;
+                }>;
               };
             };
             const upset = parsedJson.upSetCoOccurrence;
@@ -3488,6 +3698,24 @@ export class RegressionScenarios {
               upset.sets.length === 7 &&
               Array.isArray(upset.intersections),
             );
+            let populatedSetsFirst = true;
+            let snmIntersectionSumExact = true;
+            if (hasStructure && upset) {
+              let seenZeroSet = false;
+              for (const s of upset.sets ?? []) {
+                const c = Number(s?.count ?? 0);
+                if (c === 0) seenZeroSet = true;
+                else if (seenZeroSet) populatedSetsFirst = false;
+              }
+              const snmSetCount = Number((upset.sets ?? []).find((s) => s?.name === "SNM")?.count ?? 0);
+              const snmIntersectionsSum = (upset.intersections ?? [])
+                .filter((ix) => {
+                  const cats = ix?.sets ?? ix?.activeSets ?? ix?.categories ?? [];
+                  return Boolean(ix?.snmPresent) || (Array.isArray(cats) && cats.includes("SNM"));
+                })
+                .reduce((acc, ix) => acc + Number(ix?.count ?? 0), 0);
+              snmIntersectionSumExact = snmSetCount === snmIntersectionsSum;
+            }
             const totalOccs = Number(upset?.totalOccupancies ?? 0);
             let svgRendered = true;
             if (totalOccs > 0) {
@@ -3495,11 +3723,11 @@ export class RegressionScenarios {
                 .waitFor({state: "visible", timeout: 10_000})
                 .then(() => true, () => false);
             }
-            const passed = hasStructure && svgRendered;
+            const passed = hasStructure && populatedSetsFirst && snmIntersectionSumExact && svgRendered;
             const evidence = passed ? "" : await this.screenshotOnFailure(page, `report-upset-${reportType.toLowerCase()}-failed`);
             return {
               passed,
-              observed: `hasStructure=${hasStructure}; totalOccupancies=${totalOccs}; intersections=${upset?.intersections?.length ?? 0}; svgRendered=${svgRendered}`,
+              observed: `hasStructure=${hasStructure}; populatedSetsFirst=${populatedSetsFirst}; snmSumExact=${snmIntersectionSumExact}; totalOccupancies=${totalOccs}; intersections=${upset?.intersections?.length ?? 0}; svgRendered=${svgRendered}`,
               evidence,
             };
           });
@@ -5580,20 +5808,6 @@ export class RegressionScenarios {
         const oldReAdjVehicleId = `REG-OLD2-${this.reporter.runId.slice(-12)}`;
         const oldReAdjNotes = `Old alarm re-adj ${this.reporter.runId.slice(-12)}`;
 
-        await this.goto(page, `/event-details?eventId=${encodeURIComponent(oldAlarm.obsId)}`);
-        await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
-
-        await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(oldVehicleId);
-        await this.selectMui(page, "Adjudicate", "Code 6: Physical Inspection Negative");
-        await this.selectMui(page, "Secondary Inspection", "NONE");
-        await page.getByLabel("Notes").fill(oldNotes);
-        await page.getByRole("button", {name: "Submit", exact: true}).click();
-        const confirm1 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
-        await confirm1.waitFor();
-        await confirm1.getByRole("button", {name: /Confirm & Submit/i}).click();
-        await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
-        await page.getByText("Logged Adjudications", {exact: true}).waitFor();
-
         const queryDatastreamFilter = async (cql: string): Promise<string[]> => {
           const params = new URLSearchParams({
             phenomenonTime: `${oldAlarm.phenomenonTime}/${oldAlarm.phenomenonTime}`,
@@ -5615,49 +5829,67 @@ export class RegressionScenarios {
           }
         };
 
-        const afterFirstObsState = await poll(
-          () => readObservationAdjudicatedIds(oldAlarm.obsId),
-          (state) => state.count >= 1 && state.ids.includes("code:6"),
-          {timeoutMs: 15_000, intervalMs: 500, description: "old alarm code:6 overlay"},
-        ).catch(() => readObservationAdjudicatedIds(oldAlarm.obsId));
+        let firstStepPassed = false;
+        let body = "";
+        await this.browser.withExpectedHistoricalClipDate(oldAlarm.phenomenonTime, async () => {
+          await this.goto(page, `/event-details?eventId=${encodeURIComponent(oldAlarm.obsId)}`);
+          await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
 
-        const unadjIdsAfterFirst = await queryDatastreamFilter(
-          "(gammaAlarm=true OR neutronAlarm=true) AND adjudicatedIdsCount=0",
-        );
-        const code6IdsAfterFirst = await queryDatastreamFilter(
-          "adjudicatedIdsCount>0 AND adjudicatedIds='code:6'",
-        );
-        const firstStepPassed =
-          afterFirstObsState.count >= 1 &&
-          afterFirstObsState.ids.includes("code:6") &&
-          !unadjIdsAfterFirst.includes(oldAlarm.obsId) &&
-          code6IdsAfterFirst.includes(oldAlarm.obsId);
+          await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(oldVehicleId);
+          await this.selectMui(page, "Adjudicate", "Code 6: Physical Inspection Negative");
+          await this.selectMui(page, "Secondary Inspection", "NONE");
+          await page.getByLabel("Notes").fill(oldNotes);
+          await page.getByRole("button", {name: "Submit", exact: true}).click();
+          const confirm1 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+          await confirm1.waitFor();
+          await confirm1.getByRole("button", {name: /Confirm & Submit/i}).click();
+          await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+          await page.getByText("Logged Adjudications", {exact: true}).waitFor();
 
-        // Now re-adjudicate that same old alarm with Code 3 and Secondary Inspection = COMPLETED
-        await page.reload({waitUntil: "domcontentloaded"});
-        await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
-        await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(oldReAdjVehicleId);
-        await this.selectMui(page, "Adjudicate", "Code 3: Medical Isotope Found");
-        await this.selectMui(page, "Secondary Inspection", "COMPLETED");
-        await page.getByLabel("Notes").fill(oldReAdjNotes);
-        await page.getByRole("button", {name: "Submit", exact: true}).click();
-        const confirm2 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
-        await confirm2.waitFor();
-        await confirm2.getByRole("button", {name: /Confirm & Submit/i}).click();
-        await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
-        await page.getByText("Logged Adjudications", {exact: true}).waitFor();
+          const afterFirstObsState = await poll(
+            () => readObservationAdjudicatedIds(oldAlarm.obsId),
+            (state) => state.count >= 1 && state.ids.includes("code:6"),
+            {timeoutMs: 15_000, intervalMs: 500, description: "old alarm code:6 overlay"},
+          ).catch(() => readObservationAdjudicatedIds(oldAlarm.obsId));
 
-        await page.reload({waitUntil: "domcontentloaded"});
-        await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
-        const body = await poll(
-          () => page.locator("body").innerText(),
-          (value) =>
-            value.includes(oldVehicleId) &&
-            value.includes(oldNotes) &&
-            value.includes(oldReAdjVehicleId) &&
-            value.includes(oldReAdjNotes),
-          {timeoutMs: 30_000, intervalMs: 500, description: "old alarm initial and re-adjudication entries"},
-        ).catch(() => page.locator("body").innerText());
+          const unadjIdsAfterFirst = await queryDatastreamFilter(
+            "(gammaAlarm=true OR neutronAlarm=true) AND adjudicatedIdsCount=0",
+          );
+          const code6IdsAfterFirst = await queryDatastreamFilter(
+            "adjudicatedIdsCount>0 AND adjudicatedIds='code:6'",
+          );
+          firstStepPassed =
+            afterFirstObsState.count >= 1 &&
+            afterFirstObsState.ids.includes("code:6") &&
+            !unadjIdsAfterFirst.includes(oldAlarm.obsId) &&
+            code6IdsAfterFirst.includes(oldAlarm.obsId);
+
+          // Now re-adjudicate that same old alarm with Code 3 and Secondary Inspection = COMPLETED
+          await page.reload({waitUntil: "domcontentloaded"});
+          await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+          await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(oldReAdjVehicleId);
+          await this.selectMui(page, "Adjudicate", "Code 3: Medical Isotope Found");
+          await this.selectMui(page, "Secondary Inspection", "COMPLETED");
+          await page.getByLabel("Notes").fill(oldReAdjNotes);
+          await page.getByRole("button", {name: "Submit", exact: true}).click();
+          const confirm2 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+          await confirm2.waitFor();
+          await confirm2.getByRole("button", {name: /Confirm & Submit/i}).click();
+          await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+          await page.getByText("Logged Adjudications", {exact: true}).waitFor();
+
+          await page.reload({waitUntil: "domcontentloaded"});
+          await page.getByText("Logged Adjudications", {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+          body = await poll(
+            () => page.locator("body").innerText(),
+            (value) =>
+              value.includes(oldVehicleId) &&
+              value.includes(oldNotes) &&
+              value.includes(oldReAdjVehicleId) &&
+              value.includes(oldReAdjNotes),
+            {timeoutMs: 30_000, intervalMs: 500, description: "old alarm initial and re-adjudication entries"},
+          ).catch(() => page.locator("body").innerText());
+        });
 
         const afterSecondObsState = await poll(
           () => readObservationAdjudicatedIds(oldAlarm.obsId),
@@ -6856,18 +7088,19 @@ export class RegressionScenarios {
       await sleep(2_500);
 
       const triggerWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-      const trigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+      let trigger = await this.triggerAlarm("gamma", "vehicle-ocr");
       if (!trigger) throw new Error("Container-transit gamma alarm trigger returned no occupancy identity");
 
       const alarmRow = await this.findAlarmRow(page, /Gamma/i, trigger);
-      const eventId = await this.resolveAlarmEventUuid(
+      const initialEventId = await this.resolveAlarmEventUuid(
         page,
         alarmRow,
         "gamma",
         trigger.occupancyCount,
         "vehicle-ocr",
       );
-      if (!eventId) throw new Error("Failed to resolve occupancy UUID for container-transit gamma alarm");
+      if (!initialEventId) throw new Error("Failed to resolve occupancy UUID for container-transit gamma alarm");
+      let eventId: string = initialEventId;
       await this.captureAlarmMedia(page, eventId, "gamma", trigger.occupancyCount, "vehicle-ocr");
 
       const expectedContainer = this.config.expectedVehicleOcrContainer;
@@ -6892,7 +7125,7 @@ export class RegressionScenarios {
         evidenceImagePath: string;
       }
 
-      const fetchMatchingOcrObservations = async (): Promise<OcrObservationRecord[]> => {
+      const fetchMatchingOcrObservationsFor = async (targetEventId: string): Promise<OcrObservationRecord[]> => {
         const windowEndIso = new Date(Date.now() + 60_000).toISOString();
         const params = new URLSearchParams({
           resultTime: `${triggerWindowStartIso}/${windowEndIso}`,
@@ -6917,7 +7150,7 @@ export class RegressionScenarios {
           for (const item of json.items ?? []) {
             const r = item.result ?? item.properties?.result ?? {};
             const obsId = String(r.occupancyObsId ?? "").trim();
-            if (obsId !== eventId) continue;
+            if (obsId !== targetEventId) continue;
             matched.push({
               id: String(item.id ?? "").trim(),
               occupancyObsId: obsId,
@@ -6942,21 +7175,50 @@ export class RegressionScenarios {
         category: "ocr",
         action: "recognize ISO 6346 container ID and store JPEG evidence crop on alarm clip",
         target: `${this.config.testLaneLabel}:${trigger.occupancyCount}`,
-        expected: `vehicleOcr publishes checksum-valid container candidate (${expectedContainer}) correlated to occupancy ${eventId} with a valid JPEG crop in /sensorhub/buckets/ocr/crops`,
+        expected: `vehicleOcr publishes checksum-valid container candidate (${expectedContainer}) correlated to occupancy with a valid JPEG crop in /sensorhub/buckets/ocr/crops`,
       }, async () => {
-        const candidates = await poll(
-          fetchMatchingOcrObservations,
-          items => items.some(c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue)),
-          {
-            timeoutMs: Math.max(this.config.eventTimeoutMs, 60_000),
-            intervalMs: 1_000,
-            description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancy ${eventId}`,
-          },
-        ).catch(() => fetchMatchingOcrObservations());
+        let candidates: OcrObservationRecord[] = [];
+        let best: OcrObservationRecord | undefined;
+        // Free-running container-transit RTSP loops contain brief empty-roadway gaps between passes;
+        // allow up to 3 phase-shifted 9s alarm triggers to capture a container body in frame.
+        for (let passAttempt = 0; passAttempt < 3; passAttempt++) {
+          if (passAttempt > 0) {
+            await sleep(3_500);
+            const nextTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+            if (!nextTrigger) break;
+            const nextRow = await this.findAlarmRow(page, /Gamma/i, nextTrigger);
+            const nextEventId = await this.resolveAlarmEventUuid(
+              page,
+              nextRow,
+              "gamma",
+              nextTrigger.occupancyCount,
+              "vehicle-ocr",
+            );
+            if (!nextEventId) break;
+            await this.captureAlarmMedia(page, nextEventId, "gamma", nextTrigger.occupancyCount, "vehicle-ocr");
+            trigger = nextTrigger;
+            eventId = nextEventId;
+          }
+          const currentEventId = eventId!;
+          candidates = await poll(
+            () => fetchMatchingOcrObservationsFor(currentEventId),
+            items => items.some(c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue)),
+            {
+              timeoutMs: passAttempt < 2 ? 28_000 : Math.max(this.config.eventTimeoutMs, 45_000),
+              intervalMs: 1_000,
+              description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancy ${currentEventId}`,
+            },
+          ).catch(() => fetchMatchingOcrObservationsFor(currentEventId));
 
-        const best = candidates.find(
-          c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
-        ) ?? candidates[0];
+          const validContainer = candidates.find(
+            c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
+          );
+          if (validContainer) {
+            best = validContainer;
+            break;
+          }
+          best = candidates[0] ?? best;
+        }
 
         if (!best) {
           return {
@@ -7170,18 +7432,48 @@ export class RegressionScenarios {
           target: `${canonicalExpected} (${basePassEventId} -> ${eventId2})`,
           expected: "Confirmation re-scan correlates adjudicated Pass #1 + open OCR Pass #2 with non-zero radiation profile traces, renders related-passes banner + keyboard-focusable comparison dialog, batch-adjudicates Pass #2, and exports valid PDF/CSV/JSON/XLSX VEHICLE_INCIDENT reports",
         }, async () => {
-          let rescanObs = await poll(
-            () => fetchOcrForObsId(eventId2!, rescanWindowStartIso),
-            items => items.some(
-              c => c.idType === "container" &&
-                c.checksumValid &&
-                matchesExpectedContainer(c.normalizedValue),
-            ),
-            {
-              timeoutMs: Math.max(this.config.eventTimeoutMs, 60_000),
-              intervalMs: 1_000,
-              description: `confirmation re-scan vehicleOcr (${expectedContainer}) for occupancy ${eventId2}`,
-            },
+          const pollOrRetriggerRescan = async (
+            predicate: (c: OcrObservationRecord) => boolean,
+            label: string,
+          ): Promise<OcrObservationRecord[]> => {
+            for (let attempt = 0; attempt < 3; attempt++) {
+              if (attempt > 0) {
+                await sleep(3_500);
+                rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
+                const retryTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+                if (!retryTrigger) break;
+                const retryRow = await this.findAlarmRow(page, /Gamma/i, retryTrigger);
+                const retryEventId = await this.resolveAlarmEventUuid(
+                  page,
+                  retryRow,
+                  "gamma",
+                  retryTrigger.occupancyCount,
+                  "vehicle-ocr",
+                );
+                if (!retryEventId) break;
+                await this.captureAlarmMedia(page, retryEventId, "gamma", retryTrigger.occupancyCount, "vehicle-ocr");
+                eventId2 = retryEventId;
+              }
+              const currentId = eventId2!;
+              const found = await poll(
+                () => fetchOcrForObsId(currentId, rescanWindowStartIso),
+                items => items.some(predicate),
+                {
+                  timeoutMs: attempt < 2 ? 28_000 : Math.max(this.config.eventTimeoutMs, 45_000),
+                  intervalMs: 1_000,
+                  description: `${label} for occupancy ${currentId}`,
+                },
+              ).catch(() => fetchOcrForObsId(currentId, rescanWindowStartIso));
+              if (found.some(predicate)) return found;
+            }
+            return fetchOcrForObsId(eventId2!, rescanWindowStartIso);
+          };
+
+          let rescanObs = await pollOrRetriggerRescan(
+            c => c.idType === "container" &&
+              c.checksumValid &&
+              matchesExpectedContainer(c.normalizedValue),
+            `confirmation re-scan vehicleOcr (${expectedContainer})`,
           );
           const firstRescanBest = rescanObs.find(
             c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
@@ -7230,18 +7522,11 @@ export class RegressionScenarios {
             await this.captureAlarmMedia(page, eventId3, "gamma", trigger3.occupancyCount, "vehicle-ocr");
             eventId2 = eventId3;
 
-            rescanObs = await poll(
-              () => fetchOcrForObsId(eventId2!, rescanWindowStartIso),
-              items => items.some(
-                c => c.idType === "container" &&
-                  c.checksumValid &&
-                  c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase() === canonicalExpected,
-              ),
-              {
-                timeoutMs: Math.max(this.config.eventTimeoutMs, 60_000),
-                intervalMs: 1_000,
-                description: `confirmation re-scan vehicleOcr (${canonicalExpected}) for occupancy ${eventId2}`,
-              },
+            rescanObs = await pollOrRetriggerRescan(
+              c => c.idType === "container" &&
+                c.checksumValid &&
+                c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase() === canonicalExpected,
+              `confirmation re-scan vehicleOcr (${canonicalExpected})`,
             );
           } else if (expectedContainer !== "ANY" && firstRescanNorm !== canonicalExpected) {
             throw new Error(`Confirmation re-scan recognized ${firstRescanNorm || "none"} instead of ${canonicalExpected}`);
@@ -8651,19 +8936,26 @@ export class RegressionScenarios {
           await sleep(REGRESSION_MEDIA_RETENTION.queryPeriodMinutes * 60_000 + 15_000);
           let stableMetadataSignature = "";
           let stableMetadataSamples = 0;
+          let previousManifestFiles = -1;
           const mediaBeforeBackup = await poll(
             async () => assessMediaMetadataHealth(
               await probe.runJson("media-metadata-health"),
             ),
             (value) => {
-              const signature = [value.processedIndexFiles, value.deletionIndexFiles,
-                value.retainedManifestFiles, value.retainedJpegFiles].join(":");
-              stableMetadataSamples = signature === stableMetadataSignature
+              // Stabilize processed/deletion index buckets across 3 clean samples while allowing
+              // live non-reserved lanes to monotonically append complete 5-JPEG manifest sets.
+              const signature = [value.processedIndexFiles, value.deletionIndexFiles].join(":");
+              const manifestsMonotonic = previousManifestFiles < 0 ||
+                value.retainedManifestFiles >= previousManifestFiles;
+              const fiveFrameParity = value.retainedJpegFiles === value.retainedManifestFiles * 5;
+              previousManifestFiles = value.retainedManifestFiles;
+              stableMetadataSamples = signature === stableMetadataSignature &&
+                  manifestsMonotonic && fiveFrameParity
                 ? stableMetadataSamples + 1 : 1;
               stableMetadataSignature = signature;
               return mediaMetadataHealthIsSafe(value, true) && stableMetadataSamples >= 3;
             },
-            {timeoutMs: 120_000, intervalMs: 2_000,
+            {timeoutMs: 240_000, intervalMs: 2_000,
               description: "retained-media indexes to repopulate and stabilize after restart"},
           );
           const retainedExpectations = [...this.retainedBackupExpectations.values()].sort().slice(-8);

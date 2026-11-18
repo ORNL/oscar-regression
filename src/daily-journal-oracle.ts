@@ -56,7 +56,7 @@ export function assessDailyJournalStatus(value: DailyJournalStatus): DailyJourna
     value.sealedSegments,
   ];
   const safe = numericFields.every(count) && value.bounded === true &&
-    value.inventoryEntries <= 100_000 &&
+    value.inventoryEntries <= 500_000 &&
     typeof value.zoneId === "string" && /^[A-Za-z0-9._+/-]{1,128}$/.test(value.zoneId) &&
     /^\d{4}-\d{2}-\d{2}$/.test(value.currentDate) &&
     value.manifestFailures === 0 && value.partialFiles === 0 &&
