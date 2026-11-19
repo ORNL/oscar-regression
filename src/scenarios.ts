@@ -33,6 +33,13 @@ import {
   guardDashboardHealthFixtureRoute,
   parseHealthObservationBatch,
 } from "./dashboard-health.js";
+
+function scopedViewIndicatorLocator(page: Page, viewKey: string): Locator {
+  return page
+    .locator('[data-testid="navbar-scoped-view-select"]', {hasText: viewKey})
+    .or(page.getByText(`View: ${viewKey}`, {exact: true}))
+    .first();
+}
 import {
   ADVANCED_DATE_FILTER_MAX_BYTES,
   assessAdvancedDateFilterResponses,
@@ -3355,7 +3362,7 @@ export class RegressionScenarios {
     try {
       const firstKey = configuredViewKeys[0] ?? "east-gate";
       await this.goto(page, `/?view=${firstKey}`);
-      const capabilityAvailable = await page.getByText(`View: ${firstKey}`, {exact: true})
+      const capabilityAvailable = await scopedViewIndicatorLocator(page, firstKey)
         .waitFor({timeout: this.config.uiTimeoutMs})
         .then(() => true, () => false);
       if (!capabilityAvailable) {
@@ -3421,7 +3428,7 @@ export class RegressionScenarios {
           expected: `Dashboard cards and Status of Health retain view=${key} and list exactly ${expectedLaneNames.join(";")}`,
         }, async () => {
           await this.goto(page, `/?view=${encodeURIComponent(key)}`);
-          await page.getByText(`View: ${key}`, {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+          await scopedViewIndicatorLocator(page, key).waitFor({timeout: this.config.uiTimeoutMs});
 
           const dashboardCards = page.locator('[data-testid^="lane-health-card-"]');
           const readDashboardCards = async () => (await dashboardCards.evaluateAll((elements) => elements.map((element) => ({
@@ -3482,7 +3489,7 @@ export class RegressionScenarios {
           ]);
           await page.getByRole("heading", {name: "Status of Health", exact: true})
             .waitFor({timeout: this.config.uiTimeoutMs});
-          await page.getByText(`View: ${key}`, {exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+          await scopedViewIndicatorLocator(page, key).waitFor({timeout: this.config.uiTimeoutMs});
 
           const rows = page.locator('[data-testid^="health-lane-"]');
           const readLaneNames = async () => (await rows.evaluateAll((elements) => elements
@@ -5054,7 +5061,7 @@ export class RegressionScenarios {
           const capabilityPage = await this.browser.oscarPage();
           try {
             await this.goto(capabilityPage, `/?view=${encodeURIComponent(detectionView)}`);
-            scopedLookupAvailable = await capabilityPage.getByText(`View: ${detectionView}`, {exact: true})
+            scopedLookupAvailable = await scopedViewIndicatorLocator(capabilityPage, detectionView)
               .waitFor({timeout: this.config.uiTimeoutMs})
               .then(() => true, () => false);
           } finally {
@@ -5089,7 +5096,7 @@ export class RegressionScenarios {
           const scopedPage = await this.browser.oscarPage();
           try {
             await this.goto(scopedPage, `/event-log?view=${encodeURIComponent(assignedView)}`);
-            await scopedPage.getByText(`View: ${assignedView}`, {exact: true})
+            await scopedViewIndicatorLocator(scopedPage, assignedView)
               .waitFor({timeout: this.config.uiTimeoutMs});
             await scopedPage.getByTestId("event-uuid-search-input").locator("input").fill(eventUuid);
             const navigation = scopedPage.waitForURL(
@@ -5136,7 +5143,7 @@ export class RegressionScenarios {
           try {
             return await this.browser.withExpectedMissingObservation(eventUuid, async () => {
               await this.goto(scopedPage, `/event-log?view=${encodeURIComponent(nonMemberView)}`);
-              await scopedPage.getByText(`View: ${nonMemberView}`, {exact: true})
+              await scopedViewIndicatorLocator(scopedPage, nonMemberView)
                 .waitFor({timeout: this.config.uiTimeoutMs});
               await scopedPage.getByTestId("event-uuid-search-input").locator("input").fill(eventUuid);
               const navigation = scopedPage.waitForURL(

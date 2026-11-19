@@ -1265,6 +1265,13 @@ class UiEnduranceRunner {
     });
   }
 
+  private scopedViewIndicator(page: Page, viewKey: string) {
+    return page
+      .locator('[data-testid="navbar-scoped-view-select"]', {hasText: viewKey})
+      .or(page.getByText(`View: ${viewKey}`, {exact: true}))
+      .first();
+  }
+
   private async purgePriorScopedNotifications(page: Page, activeScopedViewKey: string): Promise<void> {
     const notifications = await this.readPwaNotifications(page).catch(() => []);
     const staleTags = notifications
@@ -1478,7 +1485,7 @@ class UiEnduranceRunner {
       this.viewerUrl(`/?view=${encodeURIComponent(viewKey)}`),
       expectedLanes.length,
     );
-    await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
+    await this.scopedViewIndicator(page, viewKey).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
     // Also purge any in-flight notification emitted by the outgoing view during navigation
@@ -2392,7 +2399,7 @@ class UiEnduranceRunner {
 
     await this.gotoOperator(page, scopePath);
     if (plan.operatorViewKey) {
-      await page.getByText(`View: ${plan.operatorViewKey}`, {exact: true}).waitFor({
+      await this.scopedViewIndicator(page, plan.operatorViewKey).waitFor({
         timeout: this.config.uiTimeoutMs,
       });
     }
@@ -2539,7 +2546,7 @@ class UiEnduranceRunner {
     ]);
 
     if (plan.operatorViewKey) {
-      await page.getByText(`View: ${plan.operatorViewKey}`, {exact: true}).waitFor({
+      await this.scopedViewIndicator(page, plan.operatorViewKey).waitFor({
         timeout: this.config.uiTimeoutMs,
       });
     }
@@ -2583,7 +2590,7 @@ class UiEnduranceRunner {
     const allowedLanes = new Set(this.config.laneConfigOracle?.lanesByView.get(viewKey) ?? []);
 
     await this.gotoOperator(page, `/?view=${encodeURIComponent(viewKey)}`);
-    await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
+    await this.scopedViewIndicator(page, viewKey).waitFor({
       timeout: this.config.uiTimeoutMs,
     });
     const renderedCards = await poll(
@@ -2797,7 +2804,7 @@ class UiEnduranceRunner {
       : "/event-log";
     await this.gotoOperator(page, eventLogPath);
     if (viewKey) {
-      await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
+      await this.scopedViewIndicator(page, viewKey).waitFor({
         timeout: this.config.uiTimeoutMs,
       });
     }
@@ -3043,7 +3050,7 @@ class UiEnduranceRunner {
 
     await this.gotoOperator(page, dashPath);
     if (viewKey) {
-      await page.getByText(`View: ${viewKey}`, {exact: true}).waitFor({
+      await this.scopedViewIndicator(page, viewKey).waitFor({
         timeout: this.config.uiTimeoutMs,
       });
     }
@@ -3295,64 +3302,69 @@ class UiEnduranceRunner {
     const executablePath = this.config.browserExecutablePath ??
       (existsSync("/usr/bin/google-chrome") ? "/usr/bin/google-chrome" : undefined);
 
-    this.browser = await chromium.launch({
-      headless: this.config.headless,
-      ...(executablePath ? {executablePath} : {}),
-      args: [
-        ...(spkiHashes.length > 0
-          ? [`--ignore-certificate-errors-spki-list=${spkiHashes.join(",")}`]
-          : []),
-      ],
-    });
+    let anyFailure = false;
 
-    this.wallboardContext = await this.browser.newContext({
-      ignoreHTTPSErrors: true,
-      permissions: ["notifications"],
-      httpCredentials: {
-        username: this.config.oscarUsername,
-        password: this.config.oscarPassword,
-      },
-      viewport: {width: 1600, height: 1000},
-      locale: "en-US",
-    });
-    this.wallboardContext.setDefaultTimeout(this.config.uiTimeoutMs);
-    this.wallboardContext.setDefaultNavigationTimeout(this.config.uiTimeoutMs);
-    await this.authenticateContext(this.wallboardContext);
-    this.wallboardAuthRefreshedAtMs = Date.now();
+    try {
+      this.browser = await chromium.launch({
+        headless: this.config.headless,
+        ...(executablePath ? {executablePath} : {}),
+        args: [
+          ...(spkiHashes.length > 0
+            ? [`--ignore-certificate-errors-spki-list=${spkiHashes.join(",")}`]
+            : []),
+        ],
+      });
 
-    this.catalog = await this.discoverOccupancyCatalog(this.wallboardContext.request);
-
-    if (!this.options.readOnlyWallboard) {
-      this.operatorContext = await this.browser.newContext({
+      this.wallboardContext = await this.browser.newContext({
         ignoreHTTPSErrors: true,
-        permissions: ["notifications", "clipboard-read", "clipboard-write"],
+        permissions: ["notifications"],
         httpCredentials: {
           username: this.config.oscarUsername,
           password: this.config.oscarPassword,
         },
-        acceptDownloads: true,
         viewport: {width: 1600, height: 1000},
         locale: "en-US",
       });
-      this.operatorContext.setDefaultTimeout(this.config.uiTimeoutMs);
-      this.operatorContext.setDefaultNavigationTimeout(this.config.uiTimeoutMs);
-      await installDeterministicQrCamera(this.operatorContext, createSpectroscopicCameraFixture());
-      await this.authenticateContext(this.operatorContext);
-      this.operatorAuthRefreshedAtMs = Date.now();
-      this.operatorPage = await this.operatorContext.newPage();
-      this.attachPageTelemetry(this.operatorPage, "operator");
-    }
+      this.wallboardContext.setDefaultTimeout(this.config.uiTimeoutMs);
+      this.wallboardContext.setDefaultNavigationTimeout(this.config.uiTimeoutMs);
+      await this.authenticateContext(this.wallboardContext);
+      this.wallboardAuthRefreshedAtMs = Date.now();
 
-    await this.openUnscopedWallboard();
-    this.lastAlarmPollIso = new Date().toISOString();
+      this.catalog = await this.discoverOccupancyCatalog(this.wallboardContext.request);
 
-    const configuredViews = this.config.laneConfigOracle
-      ? [...REQUIRED_OPERATIONAL_VIEW_KEYS]
-      : ["east-gate"];
+      if (!this.options.readOnlyWallboard) {
+        this.operatorContext = await this.browser.newContext({
+          ignoreHTTPSErrors: true,
+          permissions: ["notifications", "clipboard-read", "clipboard-write"],
+          httpCredentials: {
+            username: this.config.oscarUsername,
+            password: this.config.oscarPassword,
+          },
+          acceptDownloads: true,
+          viewport: {width: 1600, height: 1000},
+          locale: "en-US",
+        });
+        this.operatorContext.setDefaultTimeout(this.config.uiTimeoutMs);
+        this.operatorContext.setDefaultNavigationTimeout(this.config.uiTimeoutMs);
+        await installDeterministicQrCamera(this.operatorContext, createSpectroscopicCameraFixture());
+        await this.authenticateContext(this.operatorContext);
+        this.operatorAuthRefreshedAtMs = Date.now();
+        this.operatorPage = await this.operatorContext.newPage();
+        this.attachPageTelemetry(this.operatorPage, "operator");
+      }
 
-    let anyFailure = false;
+      await this.openUnscopedWallboard();
+      this.lastAlarmPollIso = new Date().toISOString();
 
-    try {
+      const nonEmptyOracleViews = this.config.laneConfigOracle
+        ? [...this.config.laneConfigOracle.lanesByView.entries()]
+            .filter(([, lanes]) => lanes.length > 0)
+            .map(([key]) => key)
+        : [];
+      const configuredViews = nonEmptyOracleViews.length > 0
+        ? nonEmptyOracleViews
+        : ["east-gate"];
+
       for (let cycleIndex = 0; !this.stopRequested; cycleIndex++) {
         if (this.options.maxCycles !== undefined && cycleIndex >= this.options.maxCycles) break;
         if (
@@ -3546,5 +3558,5 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   console.error(`[ui-endurance] fatal: ${describeError(error)}`);
-  process.exitCode = 1;
+  process.exit(1);
 });
