@@ -82,7 +82,7 @@ source review before the suite can certify that version.
   Health-navigation query persistence, and malformed/unassigned inputs failing closed
 - runner and OSCAR container CPU, memory, PID, restart, OOM, load, and available
   host-memory samples
-- OSCAR 3.9.2 exact-five retained JPEG API/gallery, including generated-alarm
+- OSCAR 3.11.0 exact-five retained JPEG API/gallery, including generated-alarm
   self-seeding by exact public observation ID in a full run, manifest/source binding,
   one-attempt successful retention ledgers, and
   run-baselined orphan/partial rejection; bounded catalog/frame
@@ -106,6 +106,11 @@ source review before the suite can certify that version.
   isolated one-shot base-backup wiring, exact-row activation under a
   controlled source-change race, PostgreSQL checksums, `pg_stat_statements`, and
   observation batch/resource counters
+- asynchronous per-lane PP-OCRv3 container and license-plate recognition (`vehicle-ocr`),
+  ISO 6346 check-digit auto-fill, Multi-Pass Vehicle Comparison (`Compare Passes`),
+  cross-pass Linked Adjudication, and consolidated `VEHICLE_INCIDENT` PDF/JSON/XLSX reporting
+- external EML VM-250 `.jar` plugin upload, per-lane EML enablement, and automated
+  `Code 9999: EML Non-Threat` disposition verification (`eml-auto-adjudication`)
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.
@@ -170,8 +175,8 @@ the release resolves back to the running OSCAR container, and never changes
 restore acknowledgements or secrets:
 
 ```bash
-./scripts/rebind-active-release.sh --build-label 3.9.2-EXACT-ARTIFACT
-./scripts/rebind-active-release.sh --apply --build-label 3.9.2-EXACT-ARTIFACT
+./scripts/rebind-active-release.sh --build-label 3.11.0-EXACT-ARTIFACT
+./scripts/rebind-active-release.sh --apply --build-label 3.11.0-EXACT-ARTIFACT
 ```
 
 Review the preview before applying it. This explicit rebind preserves the
@@ -215,15 +220,15 @@ product restore; inspect the preserved failure evidence instead. A malformed,
 linked, or incorrectly permissioned control file is deliberately nonterminal
 and retains the remote lease for operator investigation.
 
-For final 3.9.2 certification, set every workflow to `required`, set the target's
+For final 3.11.0 certification, set every workflow to `required`, set the target's
 exact `OSCAR_BACKUP_MODE`, and set an exact `OSCAR_BUILD_LABEL`. The default
 `disabled` mode is a complete valid release configuration and needs no restore
 evidence. For optional `single` mode, first preserve the complete PASS directory
 from an unfiltered `restore-drill` and point
-`OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` at it. Then run the unfiltered release profile:
+`OSCAR_3_11_0_RESTORE_EVIDENCE_DIR` at it. Then run the unfiltered release profile:
 
 ```bash
-npm run test:3.9.2-release
+npm run test:3.11.0-release
 ```
 
 This mode rejects scenario filters, missing/skipped gates, a live backup mode
@@ -237,12 +242,32 @@ untracked changes are refused; Git-ignored `.env` and `results/` remain allowed.
 Run one or more named scenarios with a comma-separated filter:
 
 ```bash
-npm run test:full -- --scenario rpm-faults,adjudication
-npm run test:smoke -- --scenario dashboard-health
+npm run test:full -- --scenario rpm-faults,adjudication,vehicle-ocr
+npm run test:smoke -- --scenario dashboard-health,reporting
 ```
 
 The reserved lane is still isolated and restored when a full-profile scenario
-filter is used.
+filter is used. For continuous never-reloaded 24/7 Wallboard + PWA notification +
+adjudication endurance testing, run:
+
+```bash
+./scripts/run-ui-endurance.sh
+```
+
+### Profiles and selectable `--scenario` identifiers
+
+| Execution Profile / Helper | Command | Purpose |
+| --- | --- | --- |
+| `smoke` | `npm run test:smoke` (or `./scripts/run-regression.sh smoke`) | Non-fault-injecting baseline across all 13 read-only/reporting/storage-health scenarios |
+| `full` | `npm run test:full` (or `./scripts/run-regression.sh full`) | Runs all 13 `smoke` scenarios plus all 10 reserved-lane fault/alarm/adjudication/OCR/lifecycle scenarios (`23` scenarios total) |
+| `3.11.0-release` | `npm run test:3.11.0-release` | Unfiltered release-certification gate (forbids `--scenario` filters and skipped required gates) |
+| `restore-drill` | `npm run test:restore-drill` | Destructive isolated single-snapshot backup, multi-plane canary mutation, and timeline-promotion restore proof (`storage-restore-drill`) |
+| `ui-endurance` | `./scripts/run-ui-endurance.sh` (`npm run test:ui-endurance`) | Continuous never-reloaded Wallboard Watcher + PWA Service Worker + scoped/unscoped adjudication loop |
+| `rebind-active-release` | `./scripts/rebind-active-release.sh [--apply] --build-label <label>` | Preview or rebind `OSCAR_RELEASE_DIR`, `OSCAR_STORAGE_TARGET_ACK`, and `OSCAR_BUILD_LABEL` to the running Compose release |
+
+Selectable `--scenario <name[,name...]>` identifiers:
+- **Smoke phase (`13`):** `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`, `status-of-health`, `dashboard-health`, `lane-video`, `event-filtering`, `operational-views`, `reporting`, `alarm-transfer`, `alarm-transfer-camera`, `storage-health`.
+- **Full phase (`10`, wrapped by `reserved-lane-setup`):** `rpm-connection`, `rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `eml-auto-adjudication`, `vehicle-ocr`, `extended-occupancy`, `adjudication-report`, `storage-lifecycle`.
 
 ## Configuration
 
@@ -259,15 +284,17 @@ Start from [.env.example](.env.example). Required values are:
 | `OSCAR_LANE_CONFIG_PATH` | current-schema lane CSV used both to provision the test site and as the membership oracle |
 | `EVENT_UUID_WORKFLOW` | `auto` for backward-compatible detection, `required` for a release gate, or `disabled` |
 | `ALARM_TRANSFER_CAMERA_WORKFLOW` | `auto` for backward-compatible camera-control detection, `required` for a release gate, or `disabled` |
+| `EML_WORKFLOW` / `OSCAR_EML_PLUGIN_PATH` | `auto` (default) exercises external EML VM-250 `.jar` upload and `Code 9999` auto-adjudication when `OSCAR_EML_PLUGIN_PATH` is set; `required` fails if absent; `disabled` skips |
 | `SPECTROSCOPIC_WORKFLOW` | `auto` (default) exercises real secondary-inspection `.spe` / `.n42` upload, OSCAR `N42 Report`, Sandia WebID, and operator isotope selection when local files exist in `spectroscopic-files/` or `OSCAR_SPECTRA_DIR`; `required` fails if no spectra are supplied; `disabled` skips |
 | `OSCAR_SPECTRA_DIR` | optional path to an external folder of `.spe` / `.n42` secondary-inspection files (defaults to `<repo>/spectroscopic-files`; never commit spectroscopic data to Git — see [`spectroscopic-files/README.md`](spectroscopic-files/README.md)) |
-| `STORAGE_WORKFLOW` | `required` (default), explicit legacy `auto`, or `disabled` for the OSCAR 3.9.2 storage profile |
+| `VEHICLE_OCR_WORKFLOW` / `EXPECTED_VEHICLE_OCR_CONTAINER` | `auto` (default), `required`, or `disabled` for asynchronous container/plate OCR auto-fill, Multi-Pass Vehicle Comparison, Linked Adjudication, and `VEHICLE_INCIDENT` report verification (`EXPECTED_VEHICLE_OCR_CONTAINER=EGHU3972694` or `ANY`) |
+| `STORAGE_WORKFLOW` | `required` (default), explicit legacy `auto`, or `disabled` for the OSCAR 3.11.0 storage profile |
 | `OSCAR_BACKUP_MODE` | exact product policy to certify: `disabled` (default) or optional `single` |
 | `STORAGE_BACKUP_WORKFLOW` | `required` validates the selected mode, `auto` follows configured coverage, and `disabled` skips its mode-specific gate |
 | `OSCAR_RELEASE_DIR` | absolute release path on the disposable OSCAR SSH target |
 | `OSCAR_STORAGE_TARGET_ACK` | exact `<viewer-host>|<ssh-target>|<canonical-release-dir>|DISPOSABLE-STORAGE` interlock for every storage probe, including smoke |
-| `OSCAR_BUILD_LABEL` | exact artifact/component identity; mandatory for `3.9.2-release` |
-| `OSCAR_3_9_2_RESTORE_EVIDENCE_DIR` | complete PASS directory from the matching unfiltered restore drill; mandatory only for single-mode `3.9.2-release` certification |
+| `OSCAR_BUILD_LABEL` | exact artifact/component identity; mandatory for `3.11.0-release` |
+| `OSCAR_3_11_0_RESTORE_EVIDENCE_DIR` | complete PASS directory from the matching unfiltered restore drill; mandatory only for single-mode `3.11.0-release` certification |
 | `EXTENDED_OCCUPANCY_SECONDS` | deterministic emulator occupancy duration; default/minimum 150 seconds reserves OSCAR's 60-second reconnect allowance and a 30-second Health/Dashboard observation window beyond the strict one-minute threshold |
 
 Before any storage command or probe upload, the runner resolves
