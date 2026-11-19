@@ -258,15 +258,15 @@ adjudication endurance testing, run:
 
 | Execution Profile / Helper | Command | Purpose |
 | --- | --- | --- |
-| `smoke` | `npm run test:smoke` (or `./scripts/run-regression.sh smoke`) | Non-fault-injecting baseline across all 13 read-only/reporting/storage-health scenarios |
-| `full` | `npm run test:full` (or `./scripts/run-regression.sh full`) | Runs all 13 `smoke` scenarios plus all 10 reserved-lane fault/alarm/adjudication/OCR/lifecycle scenarios (`23` scenarios total) |
+| `smoke` | `npm run test:smoke` (or `./scripts/run-regression.sh smoke`) | Non-fault-injecting baseline across all 14 read-only/reporting/extensions/storage-health scenarios |
+| `full` | `npm run test:full` (or `./scripts/run-regression.sh full`) | Runs all 14 `smoke` scenarios plus all 10 reserved-lane fault/alarm/adjudication/OCR/lifecycle scenarios (`24` scenarios total) |
 | `3.11.0-release` | `npm run test:3.11.0-release` | Unfiltered release-certification gate (forbids `--scenario` filters and skipped required gates) |
 | `restore-drill` | `npm run test:restore-drill` | Destructive isolated single-snapshot backup, multi-plane canary mutation, and timeline-promotion restore proof (`storage-restore-drill`) |
 | `ui-endurance` | `./scripts/run-ui-endurance.sh` (`npm run test:ui-endurance`) | Continuous never-reloaded Wallboard Watcher + PWA Service Worker + scoped/unscoped adjudication loop |
 | `rebind-active-release` | `./scripts/rebind-active-release.sh [--apply] --build-label <label>` | Preview or rebind `OSCAR_RELEASE_DIR`, `OSCAR_STORAGE_TARGET_ACK`, and `OSCAR_BUILD_LABEL` to the running Compose release |
 
 Selectable `--scenario <name[,name...]>` identifiers:
-- **Smoke phase (`13`):** `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`, `status-of-health`, `dashboard-health`, `lane-video`, `event-filtering`, `operational-views`, `reporting`, `alarm-transfer`, `alarm-transfer-camera`, `storage-health`.
+- **Smoke phase (`14`):** `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`, `status-of-health`, `dashboard-health`, `lane-video`, `event-filtering`, `operational-views`, `reporting`, `alarm-transfer`, `alarm-transfer-camera`, `runtime-extensions`, `storage-health`.
 - **Full phase (`10`, wrapped by `reserved-lane-setup`):** `rpm-connection`, `rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `eml-auto-adjudication`, `vehicle-ocr`, `extended-occupancy`, `adjudication-report`, `storage-lifecycle`.
 
 ## Configuration

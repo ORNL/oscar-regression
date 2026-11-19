@@ -290,6 +290,9 @@ test("remote suite lease covers full, restore, and every configured storage muta
     assert.equal(requiresRemoteSuiteLease(
       loadConfig(["--profile", "smoke", "--scenario", "lane-video"]),
     ), true);
+    assert.equal(requiresRemoteSuiteLease(
+      loadConfig(["--profile", "smoke", "--scenario", "runtime-extensions"]),
+    ), true);
     assert.throws(
       () => assertMutationAllowed(loadConfig([
         "--profile", "smoke", "--scenario", "map-national-servers",

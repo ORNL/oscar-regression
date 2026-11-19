@@ -214,6 +214,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
     "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "extended-occupancy", "adjudication-report",
+    "runtime-extensions",
     "storage-health", "storage-lifecycle",
     "storage-restore-drill",
   ]);
@@ -523,7 +524,7 @@ export function assertMutationAllowed(config: SuiteConfig): void {
 export function requiresRemoteSuiteLease(config: SuiteConfig): boolean {
   if (["full", "3.9.2-release", "3.11.0-release", "restore-drill"].includes(config.profile)) return true;
   if (config.scenarioFilter.size === 0) return true;
-  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication", "vehicle-ocr"].some(
+  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication", "vehicle-ocr", "runtime-extensions"].some(
     name => config.scenarioFilter.has(name),
   )) {
     return true;

@@ -637,6 +637,7 @@ export class RegressionScenarios {
     ]));
     await this.scenario("alarm-transfer", () => this.alarmTransferValidation());
     await this.scenario("alarm-transfer-camera", () => this.alarmTransferCamera());
+    await this.scenario("runtime-extensions", () => this.runtimeExtensions());
     await this.scenario("storage-health", () => this.storageHealth());
   }
 
@@ -810,6 +811,9 @@ export class RegressionScenarios {
       ["/alarm-transfer", "Alarm Transfer"],
       ["/map", "Map"],
       ["/national-view", "National"],
+      ["/users", "Users, Passkeys & Access Control"],
+      ["/usb-backups", "Continual & Occasional USB NVMe Backups"],
+      ["/extensions", "Pluggable Runtime Extensions & Regional Packs"],
       ["/servers", "Nodes"],
     ] as const;
     const page = await this.browser.oscarPage();
@@ -9365,5 +9369,401 @@ export class RegressionScenarios {
       unboundedWindowNonArchivedMs: windowNa.ms,
       fiftyLaneBurstMs,
     };
+  }
+
+  private async runtimeExtensions(): Promise<void> {
+    const page = await this.browser.oscarPage();
+    const extHeaders = {"X-Requested-With": "OSCAR-Viewer"};
+    const mapFileName = "regression-region.pmtiles";
+    const certFileName = "regression-ephemeral-ca.pem";
+    let preOcrCustom = false;
+    let preMapsCustom = false;
+    let preSpecCustom = false;
+    let preTrustCustom = false;
+    let prePolicyCustom = false;
+
+    try {
+      await this.check({
+        scenario: "runtime-extensions",
+        category: "security",
+        action: "reject unauthenticated runtime extensions API access",
+        target: "/sensorhub/oscar/extensions/status",
+        expected: "anonymous request returns HTTP 401",
+      }, async () => {
+        const res = await this.browser.unauthenticatedOscarGet("/sensorhub/oscar/extensions/status");
+        return {
+          passed: res.status === 401,
+          observed: `HTTP ${res.status}`,
+        };
+      });
+
+      await this.check({
+        scenario: "runtime-extensions",
+        category: "viewer",
+        action: "render /extensions accessible tabs and starter templates",
+        target: "/extensions",
+        expected: "visible Pluggable Runtime Extensions & Regional Packs heading, ARIA tablist across 6 domains, and downloadable OCR starter template ZIP",
+      }, async () => {
+        const status = await this.goto(page, "/extensions");
+        const headingVisible = await page
+          .getByRole("heading", {name: "Pluggable Runtime Extensions & Regional Packs", exact: true})
+          .first()
+          .waitFor({timeout: this.config.uiTimeoutMs})
+          .then(() => true)
+          .catch(() => false);
+        const tabCount = await page.locator('[role="tablist"] [role="tab"]').count();
+        const tplRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/oscar/extensions/templates/ocr-pack.zip"),
+        );
+        const tplBytes = tplRes.ok() ? (await tplRes.body()).length : 0;
+        await tplRes.dispose();
+        const passed = status >= 200 && status < 400 && headingVisible && tabCount === 6 && tplBytes > 100;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "runtime-extensions-ui-failed");
+        return {
+          passed,
+          observed: `HTTP ${status}; heading=${headingVisible}; tabs=${tabCount}; templateZipBytes=${tplBytes}`,
+          evidence,
+        };
+      });
+
+      const initialRes = await page.context().request.get(
+        this.viewerUrl("/sensorhub/oscar/extensions/status"),
+        {headers: {Accept: "application/json"}},
+      );
+      const initialStatus = initialRes.ok()
+        ? (await initialRes.json()) as Record<string, Record<string, unknown>>
+        : {};
+      await initialRes.dispose();
+      preOcrCustom = Boolean(initialStatus.ocr?.customActive);
+      preMapsCustom = Boolean(initialStatus.maps?.customActive);
+      preSpecCustom = Boolean(initialStatus.spectroscopy?.customActive);
+      preTrustCustom = Boolean(initialStatus.trustedCerts?.customActive);
+      prePolicyCustom = Boolean(initialStatus.policyPacks?.customActive);
+
+      await this.check({
+        scenario: "runtime-extensions",
+        category: "ocr",
+        action: "upload regional OCR plate-rules pack and verify live OcrRuntimeRegistry activation",
+        target: "/sensorhub/oscar/extensions/ocr/upload",
+        expected: "HTTP 200 with ocr.customActive=true and plateRuleSetId=regression-gcc-rules-v1",
+      }, async () => {
+        if (preOcrCustom) {
+          return {passed: true, observed: "preserved pre-existing custom OCR override"};
+        }
+        const payload = Buffer.from(JSON.stringify({
+          ruleSetId: "regression-gcc-rules-v1",
+          description: "Regression Numeric & Multilingual Plate Rules",
+          minLength: 3,
+          maxLength: 10,
+          asciiOnly: false,
+          requireLetter: false,
+          requireDigit: true,
+        }), "utf8");
+        const upRes = await page.context().request.post(
+          this.viewerUrl("/sensorhub/oscar/extensions/ocr/upload?filename=regression-plate-rules.json"),
+          {
+            headers: {...extHeaders, "Content-Type": "application/octet-stream"},
+            data: payload,
+          },
+        );
+        const body = upRes.ok() ? (await upRes.json()) as {ocr?: {customActive?: boolean; plateRuleSetId?: string}} : {};
+        const status = upRes.status();
+        await upRes.dispose();
+        const passed = status === 200 && body.ocr?.customActive === true &&
+          body.ocr?.plateRuleSetId === "regression-gcc-rules-v1";
+        return {
+          passed,
+          observed: `HTTP ${status}; customActive=${String(body.ocr?.customActive)}; ruleSetId=${String(body.ocr?.plateRuleSetId)}`,
+        };
+      });
+
+      await this.check({
+        scenario: "runtime-extensions",
+        category: "maps",
+        action: "upload PMTiles v3 regional basemap, verify HTTP 206 byte-range serving, and render /map",
+        target: "/sensorhub/oscar/extensions/maps/tiles/regression-region.pmtiles",
+        expected: "HTTP 200 upload, HTTP 206 Partial Content (127-byte header range), and error-free /map render",
+      }, async () => {
+        if (preMapsCustom) {
+          return {passed: true, observed: "preserved pre-existing custom offline map override"};
+        }
+        const pmBuf = Buffer.alloc(256, 0);
+        pmBuf.write("PMTiles", 0, "ascii");
+        pmBuf[7] = 3;
+        pmBuf.writeBigUInt64LE(127n, 8);
+        pmBuf.writeBigUInt64LE(1n, 16);
+        pmBuf.writeBigUInt64LE(128n, 24);
+        pmBuf.writeBigUInt64LE(2n, 32);
+        pmBuf.writeBigUInt64LE(130n, 40);
+        pmBuf.writeBigUInt64LE(130n, 56);
+        pmBuf[96] = 1;
+        pmBuf[97] = 1;
+        pmBuf[98] = 1;
+        pmBuf[99] = 1;
+        pmBuf[100] = 0;
+        pmBuf[101] = 14;
+        pmBuf.writeInt32LE(-844000000, 102);
+        pmBuf.writeInt32LE(359000000, 106);
+        pmBuf.writeInt32LE(-842000000, 110);
+        pmBuf.writeInt32LE(360500000, 114);
+        pmBuf[118] = 10;
+        pmBuf.writeInt32LE(-843000000, 119);
+        pmBuf.writeInt32LE(359750000, 123);
+        pmBuf.write("{}", 128, "utf8");
+
+        const upRes = await page.context().request.post(
+          this.viewerUrl(`/sensorhub/oscar/extensions/maps/upload?filename=${mapFileName}&displayName=Regression%20Offline%20Vector&defaultBasemap=true`),
+          {
+            headers: {...extHeaders, "Content-Type": "application/octet-stream"},
+            data: pmBuf,
+          },
+        );
+        const upStatus = upRes.status();
+        const upJson = upRes.ok() ? (await upRes.json()) as {maps?: {customActive?: boolean}} : {};
+        await upRes.dispose();
+
+        const rangeRes = await page.context().request.get(
+          this.viewerUrl(`/sensorhub/oscar/extensions/maps/tiles/${mapFileName}`),
+          {headers: {Range: "bytes=0-126"}},
+        );
+        const rangeStatus = rangeRes.status();
+        const rangeLen = (await rangeRes.body()).length;
+        const contentRange = rangeRes.headers()["content-range"] ?? "";
+        await rangeRes.dispose();
+
+        const mapNavStatus = await this.goto(page, "/map");
+        const leafletVisible = await page.locator(".leaflet-container").first()
+          .waitFor({timeout: this.config.uiTimeoutMs})
+          .then(() => true)
+          .catch(() => false);
+        const passed = upStatus === 200 && upJson.maps?.customActive === true &&
+          rangeStatus === 206 && rangeLen === 127 && contentRange === "bytes 0-126/256" &&
+          mapNavStatus >= 200 && mapNavStatus < 400 && leafletVisible;
+        return {
+          passed,
+          observed: `upload=${upStatus}; range=${rangeStatus} (${rangeLen}B, ${contentRange}); mapLeaflet=${leafletVisible}`,
+        };
+      });
+
+      await this.check({
+        scenario: "runtime-extensions",
+        category: "spectroscopy",
+        action: "upload custom photopeak isotope library and toggle fallback/override mode",
+        target: "/sensorhub/oscar/extensions/spectroscopy/upload",
+        expected: "HTTP 200 with spectroscopy.customActive=true and mode switch to override",
+      }, async () => {
+        if (preSpecCustom) {
+          return {passed: true, observed: "preserved pre-existing custom spectroscopy override"};
+        }
+        const libBuf = Buffer.from(JSON.stringify({
+          schemaVersion: 1,
+          libraryId: "regression-riid-v1",
+          version: "1.0.0",
+          isotopes: [
+            {name: "Cs-137", category: "Industrial", energiesKeV: [661.7], windowKeV: 20.0, minSnr: 3.5},
+            {name: "Co-60", category: "Industrial", energiesKeV: [1173.2, 1332.5], windowKeV: 24.0, minSnr: 3.5},
+          ],
+        }), "utf8");
+        const upRes = await page.context().request.post(
+          this.viewerUrl("/sensorhub/oscar/extensions/spectroscopy/upload?filename=regression-isotopes.json&executionMode=fallback"),
+          {
+            headers: {...extHeaders, "Content-Type": "application/octet-stream"},
+            data: libBuf,
+          },
+        );
+        const upStatus = upRes.status();
+        await upRes.dispose();
+
+        const modeRes = await page.context().request.post(
+          this.viewerUrl("/sensorhub/oscar/extensions/spectroscopy/action"),
+          {
+            headers: {...extHeaders, "Content-Type": "application/json"},
+            data: {action: "set-mode", executionMode: "override"},
+          },
+        );
+        const modeStatus = modeRes.status();
+        const modeJson = modeRes.ok()
+          ? (await modeRes.json()) as {spectroscopy?: {customActive?: boolean; executionMode?: string}}
+          : {};
+        await modeRes.dispose();
+        const passed = upStatus === 200 && modeStatus === 200 &&
+          modeJson.spectroscopy?.customActive === true &&
+          modeJson.spectroscopy?.executionMode === "override";
+        return {
+          passed,
+          observed: `upload=${upStatus}; mode=${modeStatus}; executionMode=${String(modeJson.spectroscopy?.executionMode)}`,
+        };
+      });
+
+      await this.check({
+        scenario: "runtime-extensions",
+        category: "trusted-certs",
+        action: "reject private-key material (HTTP 400) and hot-reload public X.509 CA certificate",
+        target: "/sensorhub/oscar/extensions/trusted-certs/upload",
+        expected: "HTTP 400 on private key upload and HTTP 200 on valid X.509 CA certificate upload",
+      }, async () => {
+        const fakeKey = ["-----BEGIN " + "PRIVATE KEY-----", "dGVzdA==", "-----END " + "PRIVATE KEY-----"].join("\n");
+        const badRes = await page.context().request.post(
+          this.viewerUrl("/sensorhub/oscar/extensions/trusted-certs/upload?filename=rejected-key.pem"),
+          {
+            headers: {...extHeaders, "Content-Type": "application/octet-stream"},
+            data: Buffer.from(fakeKey, "utf8"),
+          },
+        );
+        const badStatus = badRes.status();
+        await badRes.dispose();
+
+        const testCaCert = [
+          "-----BEGIN " + "CERTIFICATE-----",
+          "MIIB6DCCAY2gAwIBAgIUDu7BhMC7VJ2L5aY7wnQlr9cjy3owCgYIKoZIzj0EAwIw",
+          "STErMCkGA1UEAwwiT1NDQVIgUmVncmVzc2lvbiBFcGhlbWVyYWwgVGVzdCBDQTEa",
+          "MBgGA1UECgwRT1JOTCBUZXN0IEZpeHR1cmUwHhcNMjYxMTE5MTkyNTA0WhcNMzYx",
+          "MTE2MTkyNTA0WjBJMSswKQYDVQQDDCJPU0NBUiBSZWdyZXNzaW9uIEVwaGVtZXJh",
+          "bCBUZXN0IENBMRowGAYDVQQKDBFPUk5MIFRlc3QgRml4dHVyZTBZMBMGByqGSM49",
+          "AgEGCCqGSM49AwEHA0IABI+/9JGj86a2MjXJt6OfpMJzak0ImBKt6HJhINquNy1O",
+          "yNbV+mBrHnim/6w/BfG1CjpkGTTfIsVGhKQsA4iZoGyjUzBRMB0GA1UdDgQWBBQ8",
+          "5g23KIfKnsay6z9P8mcLuv68ejAfBgNVHSMEGDAWgBQ85g23KIfKnsay6z9P8mcL",
+          "uv68ejAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0kAMEYCIQDsKKITGSgj",
+          "RM6/swph2ag5mO/yv8qvWLLgEmMwfvWeEgIhAICvvV/YhZ7Pq3z3fPqtXOSkPY5G",
+          "yVbiYD94Kvx47zvG",
+          "-----END " + "CERTIFICATE-----",
+        ].join("\n");
+        const goodRes = await page.context().request.post(
+          this.viewerUrl(`/sensorhub/oscar/extensions/trusted-certs/upload?filename=${certFileName}`),
+          {
+            headers: {...extHeaders, "Content-Type": "application/octet-stream"},
+            data: Buffer.from(testCaCert, "utf8"),
+          },
+        );
+        const goodStatus = goodRes.status();
+        const goodJson = goodRes.ok() ? (await goodRes.json()) as {trustedCerts?: {customActive?: boolean}} : {};
+        await goodRes.dispose();
+        const passed = badStatus === 400 && goodStatus === 200 && goodJson.trustedCerts?.customActive === true;
+        return {
+          passed,
+          observed: `privateKeyRejectedStatus=${badStatus}; publicCaUploadStatus=${goodStatus}; customActive=${String(goodJson.trustedCerts?.customActive)}`,
+        };
+      });
+
+      await this.check({
+        scenario: "runtime-extensions",
+        category: "policy-packs",
+        action: "reject reserved disposition code override and activate/export valid policy pack",
+        target: "/sensorhub/oscar/extensions/policy-packs/upload",
+        expected: "HTTP 400 on reserved Code 1 override, HTTP 200 on Code 741 policy pack, and matching JSON export",
+      }, async () => {
+        if (prePolicyCustom) {
+          return {passed: true, observed: "preserved pre-existing custom policy pack override"};
+        }
+        const badPolicy = Buffer.from(JSON.stringify({
+          schemaVersion: 1,
+          packId: "bad-reserved",
+          version: "1.0.0",
+          codes: [{code: 1, label: "Illegal Reserved Override"}],
+        }), "utf8");
+        const badRes = await page.context().request.post(
+          this.viewerUrl("/sensorhub/oscar/extensions/policy-packs/upload?filename=bad-policy.json"),
+          {
+            headers: {...extHeaders, "Content-Type": "application/octet-stream"},
+            data: badPolicy,
+          },
+        );
+        const badStatus = badRes.status();
+        await badRes.dispose();
+
+        const validPolicy = Buffer.from(JSON.stringify({
+          schemaVersion: 1,
+          packId: "regression-policy-v1",
+          version: "1.0.0",
+          agencyName: "Regression Port Authority",
+          codes: [{code: 741, label: "Regression Verified Medical Permit"}],
+        }), "utf8");
+        const upRes = await page.context().request.post(
+          this.viewerUrl("/sensorhub/oscar/extensions/policy-packs/upload?filename=regression-policy.json"),
+          {
+            headers: {...extHeaders, "Content-Type": "application/octet-stream"},
+            data: validPolicy,
+          },
+        );
+        const upStatus = upRes.status();
+        const upJson = upRes.ok() ? (await upRes.json()) as {policyPacks?: {customActive?: boolean}} : {};
+        await upRes.dispose();
+
+        const expRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/oscar/extensions/policy-packs/export"),
+        );
+        const expStatus = expRes.status();
+        const expText = expRes.ok() ? await expRes.text() : "";
+        await expRes.dispose();
+        const passed = badStatus === 400 && upStatus === 200 &&
+          upJson.policyPacks?.customActive === true &&
+          expStatus === 200 && expText.includes("Regression Verified Medical Permit");
+        return {
+          passed,
+          observed: `reservedRejected=${badStatus}; upload=${upStatus}; export=${expStatus}`,
+        };
+      });
+    } finally {
+      if (!preOcrCustom) {
+        await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/ocr/action"), {
+          headers: {...extHeaders, "Content-Type": "application/json"},
+          data: {action: "reset"},
+        }).then(r => r.dispose()).catch(() => {});
+      }
+      if (!preMapsCustom) {
+        await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/maps/action"), {
+          headers: {...extHeaders, "Content-Type": "application/json"},
+          data: {action: "delete-pack", fileName: mapFileName},
+        }).then(r => r.dispose()).catch(() => {});
+        await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/maps/action"), {
+          headers: {...extHeaders, "Content-Type": "application/json"},
+          data: {action: "reset"},
+        }).then(r => r.dispose()).catch(() => {});
+      }
+      if (!preSpecCustom) {
+        await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/spectroscopy/action"), {
+          headers: {...extHeaders, "Content-Type": "application/json"},
+          data: {action: "reset"},
+        }).then(r => r.dispose()).catch(() => {});
+      }
+      await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/trusted-certs/action"), {
+        headers: {...extHeaders, "Content-Type": "application/json"},
+        data: preTrustCustom ? {action: "delete-cert", fileName: certFileName} : {action: "reset"},
+      }).then(r => r.dispose()).catch(() => {});
+      if (!prePolicyCustom) {
+        await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/policy-packs/action"), {
+          headers: {...extHeaders, "Content-Type": "application/json"},
+          data: {action: "reset"},
+        }).then(r => r.dispose()).catch(() => {});
+      }
+    }
+
+    await this.check({
+      scenario: "runtime-extensions",
+      category: "reset",
+      action: "restore shipped built-in defaults across modified extension domains",
+      target: "/sensorhub/oscar/extensions/status",
+      expected: "every domain modified by the regression scenario returns cleanly to customActive=false",
+    }, async () => {
+      const res = await page.context().request.get(
+        this.viewerUrl("/sensorhub/oscar/extensions/status"),
+        {headers: {Accept: "application/json"}},
+      );
+      const st = res.ok() ? (await res.json()) as Record<string, Record<string, unknown>> : {};
+      const code = res.status();
+      await res.dispose();
+      const ocrOk = preOcrCustom || st.ocr?.customActive === false;
+      const mapsOk = preMapsCustom || st.maps?.customActive === false;
+      const specOk = preSpecCustom || st.spectroscopy?.customActive === false;
+      const trustOk = preTrustCustom || st.trustedCerts?.customActive === false;
+      const polOk = prePolicyCustom || st.policyPacks?.customActive === false;
+      const passed = code === 200 && ocrOk && mapsOk && specOk && trustOk && polOk;
+      return {
+        passed,
+        observed: `HTTP ${code}; ocr=${String(st.ocr?.customActive)}; maps=${String(st.maps?.customActive)}; spec=${String(st.spectroscopy?.customActive)}; trust=${String(st.trustedCerts?.customActive)}; policy=${String(st.policyPacks?.customActive)}`,
+      };
+    });
+
+    await page.close();
   }
 }
