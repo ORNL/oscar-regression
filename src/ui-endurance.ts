@@ -1860,7 +1860,7 @@ class UiEnduranceRunner {
         name: keepFileName,
         mimeType: "text/plain",
         buffer: Buffer.from(
-          `OSCAR UI endurance diagnostic attachment\ncycle=${plan.cycleIndex + 1}\nvehicle=${plan.vehicleId}\n`,
+          `OSCAR UI endurance diagnostic attachment\ncycle=${plan.cycleIndex + 1}\nvehicleSource=ocr-only\n`,
           "utf8",
         ),
       },
@@ -2035,14 +2035,11 @@ class UiEnduranceRunner {
         `(source=${isotopeSource};cat=${disposition.category};code=${expectedCodePrefix};sec=COMPLETED)`;
     }
 
-    // 4. Preserve live OCR auto-fill when present on OCR-enabled lanes; otherwise use recurring fleet ID
+    // 4. Populate Vehicle ID ONLY when it comes from OCR (auto-fill or OCR suggestion chip);
+    //    never type or assign synthetic/random Vehicle IDs when OCR has no read for the occupancy.
     const vehicleInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
-    const autoFilledRaw = await vehicleInput.inputValue().catch(() => "");
-    const resolvedVehicle = resolveEffectiveEnduranceVehicleId(autoFilledRaw, plan.vehicleId);
+    const resolvedVehicle = await this.resolveFormOcrVehicleId(page, vehicleInput);
     const effectiveVehicleId = resolvedVehicle.vehicleId;
-    if (!resolvedVehicle.preservedOcr) {
-      await vehicleInput.fill(effectiveVehicleId);
-    }
 
     const adjLabel = page.locator("label").filter({hasText: /^Adjudicate$/}).first();
     await adjLabel.locator("xpath=..").locator(".MuiSelect-select").click();
@@ -2098,7 +2095,7 @@ class UiEnduranceRunner {
 
     const expectedFileCount = 1 + (specSample ? (specSample.companion ? 2 : 1) : 0);
     const expectedConfirmFragments = [
-      effectiveVehicleId,
+      ...(effectiveVehicleId ? [effectiveVehicleId] : []),
       expectedCodePrefix,
       plan.notes,
       keepFileName,
@@ -2145,7 +2142,9 @@ class UiEnduranceRunner {
     const bodyAfterReload = await poll(
       () => page.locator("body").innerText(),
       (text) =>
-        (text.includes(effectiveVehicleId) || normalizeEnduranceVehicleId(text).includes(resolvedVehicle.normalizedVehicleId)) &&
+        (!effectiveVehicleId ||
+          text.includes(effectiveVehicleId) ||
+          normalizeEnduranceVehicleId(text).includes(resolvedVehicle.normalizedVehicleId)) &&
         text.includes(notePrefix) &&
         codeReloadRe.test(text),
       {timeoutMs: 25_000, intervalMs: 500, description: "reloaded Logged Adjudications persistence"},
@@ -2155,8 +2154,8 @@ class UiEnduranceRunner {
     }
 
     const readMoreBtn = page
-      .locator("tr")
-      .filter({hasText: effectiveVehicleId})
+      .locator(".MuiDataGrid-row, tr")
+      .filter({hasText: notePrefix})
       .getByRole("button", {name: /^Read more$/i})
       .last();
     if (await readMoreBtn.isVisible().catch(() => false)) {
@@ -2189,14 +2188,17 @@ class UiEnduranceRunner {
 
     // 8. Exercise multi-pass correlation banner, VehiclePassComparisonDialog (radiation traces + linked
     // adjudication of at most one correlated non-reserved open alarm pass), and 1-click VEHICLE_INCIDENT
-    // report export whenever >= 2 in-scope passes share this normalized Vehicle ID.
-    let multiPassSummary = "multiPass=single";
-    try {
-      const searchRes = await page.context().request.get(
-        this.viewerUrl(
-          `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(effectiveVehicleId)}&matchMode=equals&limit=100`,
-        ),
-      );
+    // report export whenever OCR produced a Vehicle ID and >= 2 in-scope passes share it.
+    let multiPassSummary = resolvedVehicle.normalizedVehicleId.length >= 3
+      ? "multiPass=single"
+      : "multiPass=no-ocr-id";
+    if (resolvedVehicle.normalizedVehicleId.length >= 3) {
+      try {
+        const searchRes = await page.context().request.get(
+          this.viewerUrl(
+            `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(effectiveVehicleId)}&matchMode=equals&limit=100`,
+          ),
+        );
       if (searchRes.ok()) {
         const searchJson = (await searchRes.json()) as {
           summary?: {
@@ -2374,16 +2376,55 @@ class UiEnduranceRunner {
       await searchErrorCleanup(page);
       throw err;
     }
+    }
 
     return {
       evidenceSummary:
-        `file=${keepFileName}(persisted=${filePersisted}); ${specSummaryTag}; ocrPreserved=${resolvedVehicle.preservedOcr}; ` +
+        `file=${keepFileName}(persisted=${filePersisted}); ${specSummaryTag}; ocrSource=${resolvedVehicle.source}; ` +
         `${multiPassSummary}; qr=${plan.qrClearMode}`,
       consysVerified: consysVerified && filePersisted,
       effectiveVehicleId,
       effectiveSecondaryInspection,
       selectedIsotopesSummary,
     };
+  }
+
+  /**
+   * Resolves a Vehicle ID exclusively from OSCAR's live/historical OCR (`VehicleIdOcr.tsx`):
+   * 1. Waits briefly (`<= 3s`) for `<VehicleIdOcr />` to auto-fill `vehicleInput` or render a
+   *    `[data-testid^="ocr-chip-"]` suggestion chip (covering occupancies that closed moments ago).
+   * 2. Preserves auto-fill when present; otherwise clicks the top OCR suggestion chip if available.
+   * 3. Leaves `vehicleInput` empty (`""`) when OCR produced no read — never assigning random IDs.
+   */
+  private async resolveFormOcrVehicleId(
+    page: Page,
+    vehicleInput: Locator,
+  ): Promise<ReturnType<typeof resolveEffectiveEnduranceVehicleId>> {
+    const firstChip = page
+      .locator('[data-testid="vehicle-id-ocr-suggestions"] [data-testid^="ocr-chip-"]')
+      .first();
+    await poll(
+      async () => {
+        const current = await vehicleInput.inputValue().catch(() => "");
+        if (normalizeEnduranceVehicleId(current).length >= 4) return true;
+        return await firstChip.isVisible().catch(() => false);
+      },
+      Boolean,
+      {timeoutMs: 3_000, intervalMs: 250, description: "optional OCR Vehicle ID hydration"},
+    ).catch(() => false);
+
+    const autoFilledRaw = await vehicleInput.inputValue().catch(() => "");
+    if (normalizeEnduranceVehicleId(autoFilledRaw).length >= 4) {
+      return resolveEffectiveEnduranceVehicleId(autoFilledRaw);
+    }
+
+    if (await firstChip.isVisible().catch(() => false)) {
+      await firstChip.click().catch(() => undefined);
+      const chipFilledRaw = await vehicleInput.inputValue().catch(() => "");
+      return resolveEffectiveEnduranceVehicleId("", chipFilledRaw);
+    }
+
+    return resolveEffectiveEnduranceVehicleId("");
   }
 
   private async runWorkflowPwaNotificationDetail(plan: CycleExecutionPlan): Promise<AdjudicationRecord> {
@@ -2570,7 +2611,7 @@ class UiEnduranceRunner {
       laneId: targetNotification.laneId,
       occupancyCount: targetNotification.occupancyCount,
       observationId: targetNotification.eventId,
-      vehicleId: detailOutcome.effectiveVehicleId,
+      vehicleId: detailOutcome.effectiveVehicleId || "(none)",
       secondaryInspection: detailOutcome.effectiveSecondaryInspection,
       isotopes: detailOutcome.selectedIsotopesSummary,
       evidenceSummary: detailOutcome.evidenceSummary,
@@ -2703,7 +2744,7 @@ class UiEnduranceRunner {
     await occHeading.waitFor({timeout: this.config.uiTimeoutMs});
 
     const vehicleInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
-    await vehicleInput.fill(plan.vehicleId);
+    const resolvedVehicle = await this.resolveFormOcrVehicleId(page, vehicleInput);
     await this.selectMui(page, "Adjudicate", CODE_9_LABEL);
     await this.selectMui(page, "Secondary Inspection", plan.secondaryInspection);
     await page.getByLabel("Notes").fill(plan.notes);
@@ -2720,8 +2761,17 @@ class UiEnduranceRunner {
 
     const totalCountBefore = await this.readTotalRowCount(page);
 
-    // Re-fill and Submit
-    await vehicleInput.fill(plan.vehicleId);
+    // Re-fill ONLY an OCR-derived Vehicle ID (leaving Vehicle ID empty when OCR produced none) and Submit
+    if (resolvedVehicle.preservedOcr && resolvedVehicle.vehicleId) {
+      const ocrChip = page
+        .locator(`[data-testid="ocr-chip-${resolvedVehicle.normalizedVehicleId}"]`)
+        .first();
+      if (await ocrChip.isVisible().catch(() => false)) {
+        await ocrChip.click();
+      } else {
+        await vehicleInput.fill(resolvedVehicle.vehicleId);
+      }
+    }
     await this.selectMui(page, "Adjudicate", CODE_9_LABEL);
     await this.selectMui(page, "Secondary Inspection", plan.secondaryInspection);
     await page.getByLabel("Notes").fill(plan.notes);
@@ -2761,7 +2811,7 @@ class UiEnduranceRunner {
       laneId: target.laneId,
       occupancyCount: target.occupancyCount,
       observationId,
-      vehicleId: plan.vehicleId,
+      vehicleId: resolvedVehicle.vehicleId || "(none)",
       secondaryInspection: plan.secondaryInspection,
       isotopes: "none(quickview)",
       evidenceSummary: "quickview-reset-and-submit+share-qr-buttons-verified",
@@ -2925,27 +2975,72 @@ class UiEnduranceRunner {
       );
     }
 
-    const queryVariant = formatSpacedVehicleQueryVariant(detailOutcome.effectiveVehicleId);
-    await searchInput.fill(queryVariant);
-    await page.getByTestId("vehicle-id-search-submit").click();
-
-    const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
-    await compareBtn.waitFor({state: "visible", timeout: 25_000});
-    const compareText = (await compareBtn.innerText()).trim();
-    if (!/^Compare Passes \(\d+\)$/i.test(compareText)) {
-      throw new Error(`Unexpected Compare Passes button label '${compareText}'`);
+    let searchTargetVehicleId = detailOutcome.effectiveVehicleId;
+    let searchTargetHasAlarmPass = Boolean(detailOutcome.effectiveVehicleId);
+    if (!searchTargetVehicleId) {
+      try {
+        const catRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/buckets/adjudication/vehicle-search?limit=25"),
+        );
+        if (catRes.ok()) {
+          const catJson = (await catRes.json()) as {
+            passes?: Array<{
+              laneName?: unknown;
+              vehicleId?: unknown;
+              normalizedVehicleId?: unknown;
+              isAlarm?: unknown;
+              gammaAlarm?: unknown;
+              neutronAlarm?: unknown;
+            }>;
+          };
+          const inScopeOcrPass = (catJson.passes ?? []).find((p) => {
+            const lane = String(p.laneName ?? "").trim();
+            const vid = String(p.vehicleId ?? p.normalizedVehicleId ?? "").trim();
+            if (normalizeEnduranceVehicleId(vid).length < 4) return false;
+            return !allowedLanes || allowedLanes.has(lane);
+          });
+          if (inScopeOcrPass) {
+            searchTargetVehicleId = String(
+              inScopeOcrPass.vehicleId ?? inScopeOcrPass.normalizedVehicleId ?? "",
+            ).trim();
+            searchTargetHasAlarmPass = Boolean(
+              inScopeOcrPass.isAlarm || inScopeOcrPass.gammaAlarm || inScopeOcrPass.neutronAlarm,
+            );
+          }
+        }
+        await catRes.dispose();
+      } catch {
+        // Leave searchTargetVehicleId empty if catalog lookup fails
+      }
     }
-    await compareBtn.click();
-    const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
-    await compDialog.waitFor({state: "visible", timeout: 15_000});
-    await compDialog.getByTestId("vehicle-history-upset-plot").waitFor({state: "visible", timeout: 10_000});
-    await compDialog.getByTestId("vehicle-pass-table-region").waitFor({state: "visible", timeout: 15_000});
-    await compDialog.getByRole("button", {name: /^close$/i}).last().click();
-    await compDialog.waitFor({state: "hidden", timeout: 10_000});
 
-    await page.getByTestId("vehicle-id-search-clear").click();
-    await compareBtn.waitFor({state: "hidden", timeout: 10_000});
-    await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
+    let vehicleSearchBarSummary = "vehicleSearchBar=landmark-only(no-ocr-id)";
+    if (searchTargetVehicleId) {
+      const queryVariant = formatSpacedVehicleQueryVariant(searchTargetVehicleId);
+      await searchInput.fill(queryVariant);
+      await page.getByTestId("vehicle-id-search-submit").click();
+
+      const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
+      await compareBtn.waitFor({state: "visible", timeout: 25_000});
+      const compareText = (await compareBtn.innerText()).trim();
+      if (!/^Compare Passes \(\d+\)$/i.test(compareText)) {
+        throw new Error(`Unexpected Compare Passes button label '${compareText}'`);
+      }
+      await compareBtn.click();
+      const compDialog = page.getByTestId("vehicle-pass-comparison-dialog");
+      await compDialog.waitFor({state: "visible", timeout: 15_000});
+      if (searchTargetHasAlarmPass) {
+        await compDialog.getByTestId("vehicle-history-upset-plot").waitFor({state: "visible", timeout: 10_000});
+      }
+      await compDialog.getByTestId("vehicle-pass-table-region").waitFor({state: "visible", timeout: 15_000});
+      await compDialog.getByRole("button", {name: /^close$/i}).last().click();
+      await compDialog.waitFor({state: "hidden", timeout: 10_000});
+
+      await page.getByTestId("vehicle-id-search-clear").click();
+      await compareBtn.waitFor({state: "hidden", timeout: 10_000});
+      await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.eventTimeoutMs});
+      vehicleSearchBarSummary = "vehicleSearchBar=tested(ocr)";
+    }
 
     // Verify the interactive UpSet alarm co-occurrence plot & Category Filter group render on demand on /event-log
     const upsetSec = page.getByTestId("event-log-upset-section").first();
@@ -3026,10 +3121,10 @@ class UiEnduranceRunner {
       laneId: target.laneId,
       occupancyCount: target.occupancyCount,
       observationId: target.observationId,
-      vehicleId: detailOutcome.effectiveVehicleId,
+      vehicleId: detailOutcome.effectiveVehicleId || "(none)",
       secondaryInspection: detailOutcome.effectiveSecondaryInspection,
       isotopes: detailOutcome.selectedIsotopesSummary,
-      evidenceSummary: `${detailOutcome.evidenceSummary}; vehicleSearchBar=tested; upsetPlot=${upsetPlotVisible}; eventLogAdjudicatedYes=${verifiedAdjudicatedYes}`,
+      evidenceSummary: `${detailOutcome.evidenceSummary}; ${vehicleSearchBarSummary}; upsetPlot=${upsetPlotVisible}; eventLogAdjudicatedYes=${verifiedAdjudicatedYes}`,
       consysVerified: detailOutcome.consysVerified,
       uiRemovedLive: verifiedAdjudicatedYes,
       durationMs: Date.now() - started,
@@ -3151,7 +3246,8 @@ class UiEnduranceRunner {
 
     await this.selectMui(dialog, "Adjudicate", CODE_9_LABEL);
     await this.selectMui(dialog, "Secondary Inspection", plan.secondaryInspection);
-    await dialog.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill(plan.vehicleId);
+    // Leave Bulk Adjudication Vehicle ID empty so two separate occupancies are never stamped
+    // with a synthetic shared Vehicle ID and each occupancy preserves its own OCR Vehicle ID.
     await dialog.getByLabel("Notes").fill(plan.notes);
 
     const totalBeforeBulkSubmit = await this.readTotalRowCount(page);
@@ -3198,7 +3294,7 @@ class UiEnduranceRunner {
       laneId: `${first.laneId}+${second.laneId}`,
       occupancyCount: `${first.occupancyCount}+${second.occupancyCount}`,
       observationId: `${obsId1}+${obsId2}`,
-      vehicleId: plan.vehicleId,
+      vehicleId: "(preserve-ocr)",
       secondaryInspection: plan.secondaryInspection,
       isotopes: "none(bulk-2)",
       evidenceSummary: "clear-selection+bounded-bulk-2",
@@ -3426,7 +3522,7 @@ class UiEnduranceRunner {
               laneId: "-",
               occupancyCount: "-",
               observationId: "-",
-              vehicleId: plan.vehicleId,
+              vehicleId: "-",
               secondaryInspection: plan.secondaryInspection,
               isotopes: "-",
               evidenceSummary: "yielded-to-suite-lock",
@@ -3462,7 +3558,7 @@ class UiEnduranceRunner {
                 laneId: "-",
                 occupancyCount: "-",
                 observationId: "-",
-                vehicleId: plan.vehicleId,
+                vehicleId: "-",
                 secondaryInspection: plan.secondaryInspection,
                 isotopes: "-",
                 evidenceSummary: evidence,

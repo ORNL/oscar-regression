@@ -55,10 +55,17 @@ export function formatSpacedVehicleQueryVariant(normalizedOrRaw: string): string
   return normalizedOrRaw.trim();
 }
 
+export type ResolvedEnduranceVehicleIdSource = "ocr-autofill" | "ocr-chip" | "none";
+
 export function resolveEffectiveEnduranceVehicleId(
   autoFilledOcrValue: string,
-  plannedVehicleId: string,
-): {readonly vehicleId: string; readonly normalizedVehicleId: string; readonly preservedOcr: boolean} {
+  ocrSuggestionChipValue = "",
+): {
+  readonly vehicleId: string;
+  readonly normalizedVehicleId: string;
+  readonly preservedOcr: boolean;
+  readonly source: ResolvedEnduranceVehicleIdSource;
+} {
   const trimmedOcr = autoFilledOcrValue.trim();
   const normOcr = normalizeEnduranceVehicleId(trimmedOcr);
   if (normOcr.length >= 4) {
@@ -66,12 +73,24 @@ export function resolveEffectiveEnduranceVehicleId(
       vehicleId: trimmedOcr,
       normalizedVehicleId: normOcr,
       preservedOcr: true,
+      source: "ocr-autofill",
+    };
+  }
+  const trimmedChip = ocrSuggestionChipValue.trim();
+  const normChip = normalizeEnduranceVehicleId(trimmedChip);
+  if (normChip.length >= 4) {
+    return {
+      vehicleId: trimmedChip,
+      normalizedVehicleId: normChip,
+      preservedOcr: true,
+      source: "ocr-chip",
     };
   }
   return {
-    vehicleId: plannedVehicleId,
-    normalizedVehicleId: normalizeEnduranceVehicleId(plannedVehicleId),
+    vehicleId: "",
+    normalizedVehicleId: "",
     preservedOcr: false,
+    source: "none",
   };
 }
 
@@ -511,14 +530,12 @@ export function buildCycleExecutionPlan(params: {
     INCIDENT_REPORT_FORMATS[params.cycleIndex % INCIDENT_REPORT_FORMATS.length]!;
   const seq = String(params.cycleIndex + 1).padStart(5, "0");
   const safeTag = params.runTag.replace(/[^A-Za-z0-9-]/g, "").slice(-10) || "ENDURANCE";
-  const poolIndex =
-    params.cycleIndex >= 20 && params.cycleIndex % 20 === 19
-      ? (params.cycleIndex - 19) % ENDURANCE_RECURRING_VEHICLE_IDS.length
-      : params.cycleIndex % ENDURANCE_RECURRING_VEHICLE_IDS.length;
-  const vehicleId = ENDURANCE_RECURRING_VEHICLE_IDS[poolIndex]!;
-  const normalizedVehicleId = normalizeEnduranceVehicleId(vehicleId);
+  // Never assign synthetic/random Vehicle IDs: adjudication workflows populate Vehicle ID
+  // exclusively when an OCR auto-fill or OCR suggestion chip is present for the occupancy.
+  const vehicleId = "";
+  const normalizedVehicleId = "";
   const scopeLabel = operatorViewKey ? `view=${operatorViewKey}` : "view=unscoped";
-  const notes = `Nimo automated UI endurance (${workflow}, ${scopeLabel}, run=${safeTag}, cycle=${seq})`;
+  const notes = `OSCAR automated UI endurance (${workflow}, ${scopeLabel}, run=${safeTag}, cycle=${seq})`;
 
   return {
     cycleIndex: params.cycleIndex,

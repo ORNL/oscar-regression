@@ -264,10 +264,8 @@ test("buildCycleExecutionPlan rotates across all workflows, operational views, i
     if (plan.workflow === "pwa-notification-detail" || plan.workflow === "event-log-filter-detail") {
       detailQrModes.add(plan.qrClearMode);
     }
-    assert.ok(
-      (ENDURANCE_RECURRING_VEHICLE_IDS as readonly string[]).includes(plan.vehicleId),
-    );
-    assert.equal(plan.normalizedVehicleId, normalizeEnduranceVehicleId(plan.vehicleId));
+    assert.equal(plan.vehicleId, "");
+    assert.equal(plan.normalizedVehicleId, "");
     assert.ok((INCIDENT_REPORT_FORMATS as readonly string[]).includes(plan.incidentReportFormat));
     assert.match(plan.notes, /run=TEST01, cycle=\d{5}\)$/);
   }
@@ -279,36 +277,34 @@ test("buildCycleExecutionPlan rotates across all workflows, operational views, i
   assert.deepEqual([...detailQrModes].sort(), ["clear-all-in-dialog", "delete-in-form"]);
 });
 
-test("resolveEffectiveEnduranceVehicleId preserves live OCR auto-fill and normalizes recurring fleet variants", () => {
-  const fromOcr = resolveEffectiveEnduranceVehicleId("EGHU 967470 0", "TN-8842B");
+test("resolveEffectiveEnduranceVehicleId uses OCR auto-fill or OCR chip only and never assigns synthetic fleet IDs", () => {
+  const fromOcr = resolveEffectiveEnduranceVehicleId("EGHU 967470 0");
   assert.deepEqual(fromOcr, {
     vehicleId: "EGHU 967470 0",
     normalizedVehicleId: "EGHU9674700",
     preservedOcr: true,
+    source: "ocr-autofill",
   });
 
-  const fromFleet = resolveEffectiveEnduranceVehicleId("", "csqu 305438-3");
-  assert.deepEqual(fromFleet, {
+  const fromChip = resolveEffectiveEnduranceVehicleId("", "csqu 305438-3");
+  assert.deepEqual(fromChip, {
     vehicleId: "csqu 305438-3",
     normalizedVehicleId: "CSQU3054383",
+    preservedOcr: true,
+    source: "ocr-chip",
+  });
+
+  const noOcr = resolveEffectiveEnduranceVehicleId("", "");
+  assert.deepEqual(noOcr, {
+    vehicleId: "",
+    normalizedVehicleId: "",
     preservedOcr: false,
+    source: "none",
   });
 
   assert.equal(formatSpacedVehicleQueryVariant("CSQU3054383"), "csqu 305438-3");
   assert.equal(formatSpacedVehicleQueryVariant("TN8842B"), "tn-8842B");
-
   assert.ok(ENDURANCE_RECURRING_VEHICLE_IDS.length >= 1000);
-  const distinctAcross500 = new Set<string>();
-  for (let c = 0; c < 500; c++) {
-    const p = buildCycleExecutionPlan({
-      cycleIndex: c,
-      runTag: "POOL500",
-      configuredViews: REQUIRED_OPERATIONAL_VIEW_KEYS,
-      scopedHoldCycles: 4,
-    });
-    distinctAcross500.add(p.normalizedVehicleId);
-  }
-  assert.ok(distinctAcross500.size >= 450);
 });
 
 test("parseUiEnduranceCliArgs defaults to 4 bounded cycles and supports continuous daemon flags", () => {
