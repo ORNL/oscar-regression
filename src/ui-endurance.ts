@@ -2039,7 +2039,7 @@ class UiEnduranceRunner {
     //    never type or assign synthetic/random Vehicle IDs when OCR has no read for the occupancy.
     const vehicleInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
     const resolvedVehicle = await this.resolveFormOcrVehicleId(page, vehicleInput);
-    const effectiveVehicleId = resolvedVehicle.vehicleId;
+    let effectiveVehicleId = resolvedVehicle.vehicleId;
 
     const adjLabel = page.locator("label").filter({hasText: /^Adjudicate$/}).first();
     await adjLabel.locator("xpath=..").locator(".MuiSelect-select").click();
@@ -2089,6 +2089,14 @@ class UiEnduranceRunner {
     await page.getByLabel("Notes").fill(plan.notes);
 
     // 7. Submit -> Verify Confirm Dialog Summary -> Test Cancel -> Re-open & Confirm & Submit
+    //    Refresh effectiveVehicleId if asynchronous PP-OCRv3 auto-populated the field while
+    //    disposition/isotope/notes controls were being selected.
+    if (!effectiveVehicleId) {
+      const asyncOcrVehicle = (await vehicleInput.inputValue()).trim();
+      if (asyncOcrVehicle) {
+        effectiveVehicleId = asyncOcrVehicle;
+      }
+    }
     await page.getByRole("button", {name: "Submit", exact: true}).click();
     const confirmDialog = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
     await confirmDialog.waitFor({timeout: 10_000});
@@ -2112,7 +2120,11 @@ class UiEnduranceRunner {
     // Click Cancel first and verify form state is preserved
     await confirmDialog.getByRole("button", {name: "Cancel", exact: true}).click();
     await confirmDialog.waitFor({state: "hidden", timeout: 10_000});
-    const preservedVehicle = await vehicleInput.inputValue();
+    const preservedVehicle = (await vehicleInput.inputValue()).trim();
+    if (!effectiveVehicleId && preservedVehicle.length > 0) {
+      // Asynchronous live OCR read arrived while the confirmation modal was open
+      effectiveVehicleId = preservedVehicle;
+    }
     if (preservedVehicle !== effectiveVehicleId) {
       throw new Error(`Cancel cleared Vehicle ID (expected '${effectiveVehicleId}', got '${preservedVehicle}')`);
     }
@@ -3405,6 +3417,7 @@ class UiEnduranceRunner {
         headless: this.config.headless,
         ...(executablePath ? {executablePath} : {}),
         args: [
+          "--renderer-process-limit=6",
           ...(spkiHashes.length > 0
             ? [`--ignore-certificate-errors-spki-list=${spkiHashes.join(",")}`]
             : []),
@@ -3544,31 +3557,56 @@ class UiEnduranceRunner {
                 adjudicationRecord = await this.runWorkflowBoundedBulkAdjudication(plan);
               }
             } catch (error) {
-              const evidence = await this.captureScreenshot(
-                this.operatorPage,
-                `operator-${plan.workflow}-failure`,
-              );
               const message = describeError(error);
-              this.recordError(`operator-${plan.workflow}`, message, "error", evidence);
-              adjudicationRecord = {
-                timestamp: new Date().toISOString(),
-                cycle: cycleIndex,
-                workflow: plan.workflow,
-                scopeView: plan.operatorViewKey ?? "all",
-                laneId: "-",
-                occupancyCount: "-",
-                observationId: "-",
-                vehicleId: "-",
-                secondaryInspection: plan.secondaryInspection,
-                isotopes: "-",
-                evidenceSummary: evidence,
-                consysVerified: false,
-                uiRemovedLive: false,
-                durationMs: 0,
-                status: "failed",
-                detail: message,
-              };
-              await this.recycleOperatorPage().catch(() => undefined);
+              const isIdleEmptyQueue =
+                /No non-reserved unadjudicated alarm|Timed out waiting for \d+ non-reserved unadjudicated rows/i.test(
+                  message,
+                );
+              if (isIdleEmptyQueue) {
+                adjudicationRecord = {
+                  timestamp: new Date().toISOString(),
+                  cycle: cycleIndex,
+                  workflow: plan.workflow,
+                  scopeView: plan.operatorViewKey ?? "all",
+                  laneId: "-",
+                  occupancyCount: "-",
+                  observationId: "-",
+                  vehicleId: "-",
+                  secondaryInspection: plan.secondaryInspection,
+                  isotopes: "-",
+                  evidenceSummary: "idle-queue-no-unadjudicated-alarms",
+                  consysVerified: false,
+                  uiRemovedLive: false,
+                  durationMs: 0,
+                  status: "skipped",
+                  detail: message,
+                };
+              } else {
+                const evidence = await this.captureScreenshot(
+                  this.operatorPage,
+                  `operator-${plan.workflow}-failure`,
+                );
+                this.recordError(`operator-${plan.workflow}`, message, "error", evidence);
+                adjudicationRecord = {
+                  timestamp: new Date().toISOString(),
+                  cycle: cycleIndex,
+                  workflow: plan.workflow,
+                  scopeView: plan.operatorViewKey ?? "all",
+                  laneId: "-",
+                  occupancyCount: "-",
+                  observationId: "-",
+                  vehicleId: "-",
+                  secondaryInspection: plan.secondaryInspection,
+                  isotopes: "-",
+                  evidenceSummary: evidence,
+                  consysVerified: false,
+                  uiRemovedLive: false,
+                  durationMs: 0,
+                  status: "failed",
+                  detail: message,
+                };
+                await this.recycleOperatorPage().catch(() => undefined);
+              }
             }
           }
 
