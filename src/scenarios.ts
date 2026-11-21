@@ -1255,9 +1255,15 @@ export class RegressionScenarios {
         try {
           await backFilteredBtn.click();
           await page.locator(".MuiDataGrid-row").first().waitFor({state: "visible", timeout: 5_000});
+          restoredLaneMatch = await poll(
+            async () => {
+              const cells = await page.locator('.MuiDataGrid-row [data-field="laneId"] .alarm-cell-primary').allInnerTexts();
+              return cells.length > 0 && cells.every((c) => c.trim() === firstLaneText);
+            },
+            Boolean,
+            {timeoutMs: 1_000, intervalMs: 40, description: `cached filtered return to ${firstLaneText}`},
+          ).catch(() => false);
           returnRenderMs = Date.now() - returnStartedAt;
-          const cells = await page.locator('.MuiDataGrid-row [data-field="laneId"] .alarm-cell-primary').allInnerTexts();
-          restoredLaneMatch = cells.length > 0 && cells.every((c) => c.trim() === firstLaneText);
         } finally {
           page.off("request", onReturnReq);
         }
