@@ -1,7 +1,7 @@
 import {execFile} from "node:child_process";
 import {resolve} from "node:path";
 import {promisify} from "node:util";
-import type {SuiteConfig} from "./types.js";
+import type {SandboxIsolationSnapshot, SuiteConfig} from "./types.js";
 
 const execFileAsync = promisify(execFile);
 const TARGET_PATTERN = /^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9A-Fa-f:]+\])$/;
@@ -577,5 +577,71 @@ export class StorageProbeClient {
     await this.removeRemoteWorkspace();
     this.installed = false;
     this.alarmBaselineRuns.clear();
+  }
+
+  async sandboxIsolationSnapshot(): Promise<SandboxIsolationSnapshot> {
+    await this.verifyTargetBinding();
+    const script = [
+      "set -eu",
+      "cd \"$1\"",
+      "present=false",
+      "if [ -f oscar-sandbox.sh ] && [ -f compose.sandbox.yaml ]; then present=true; fi",
+      "state_mp=$(docker volume inspect --format '{{.Mountpoint}}' oscar_oscar_state)",
+      "cfg_sha=$(sha256sum \"$state_mp/config.json\" | awk '{print $1}')",
+      "ds_cnt=$(docker compose --project-name oscar --env-file .env --file compose.yaml exec -T postgres sh -eu -c 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password) PGOPTIONS=\"-csearch_path=oscar,public\" exec psql -tAq -U oscar_bootstrap -d gis -c \"SELECT count(*) FROM obs_datastreams WHERE lower(data::text) LIKE '\''%demolane%'\'' OR lower(data::text) LIKE '\''%demo-lane%'\'' OR lower(data::text) LIKE '\''%tutorial-lane%'\'';\"' </dev/null | tr -d '[:space:]')",
+      "obs_cnt=$(docker compose --project-name oscar --env-file .env --file compose.yaml exec -T postgres sh -eu -c 'PGPASSWORD=$(cat /run/secrets/postgres_bootstrap_password) PGOPTIONS=\"-csearch_path=oscar,public\" exec psql -tAq -U oscar_bootstrap -d gis -c \"SELECT count(*) FROM obs WHERE result::text LIKE '\''%MSCU5285725%'\'' OR result::text LIKE '\''%OSCU4829106%'\'' OR result::text LIKE '\''%TRAINING SANDBOX%'\'';\"' </dev/null | tr -d '[:space:]')",
+      "arch_dir=$(awk -F= '$1 == \"OSCAR_ARCHIVE_DIR\" { print substr($0, index($0, \"=\") + 1); exit }' .env)",
+      "case \"$arch_dir\" in /*) ;; *) arch_dir=\"$(pwd -P)/$arch_dir\" ;; esac",
+      "arch_sb_cnt=$(find \"$arch_dir\" -iname '*sandbox*' 2>/dev/null | wc -l | tr -d '[:space:]')",
+      "sb_c=$(docker ps -aq --filter label=com.docker.compose.project=oscar-sandbox | wc -l | tr -d '[:space:]')",
+      "sb_v=$(docker volume ls -q --filter name=^oscar_sandbox_ | wc -l | tr -d '[:space:]')",
+      "printf '{\"sandboxScriptPresent\":%s,\"stateConfigSha256\":\"%s\",\"postgresSandboxDatastreamCount\":%s,\"postgresSandboxObsCount\":%s,\"archiveSandboxFileCount\":%s,\"sandboxContainerCount\":%s,\"sandboxVolumeCount\":%s}\\n' \"$present\" \"$cfg_sha\" \"${ds_cnt:-0}\" \"${obs_cnt:-0}\" \"${arch_sb_cnt:-0}\" \"${sb_c:-0}\" \"${sb_v:-0}\"",
+    ].join("; ");
+    const command = ["sudo", "-n", "bash", "-ceu", script, "oscar-sandbox-snap", this.releaseDirectory]
+      .map(shellQuote)
+      .join(" ");
+    const {stdout} = await execFileAsync("ssh", [...this.commonOptions(), this.target, command], {
+      timeout: 45_000,
+      maxBuffer: 1024 * 1024,
+      encoding: "utf8",
+    });
+    const line = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
+    if (!line) throw new Error("sandboxIsolationSnapshot returned empty output");
+    return JSON.parse(line) as SandboxIsolationSnapshot;
+  }
+
+  async sandboxStart(port = 8444, ttlMinutes = 15): Promise<void> {
+    await this.verifyTargetBinding();
+    const script = [
+      "set -eu",
+      "cd \"$1\"",
+      "bash oscar.sh sandbox start --port \"$2\" --ttl-minutes \"$3\" --track operator --allow-low-memory >/dev/null",
+    ].join("; ");
+    const command = [
+      "sudo", "-n", "bash", "-ceu", script, "oscar-sandbox-start",
+      this.releaseDirectory, String(port), String(ttlMinutes),
+    ].map(shellQuote).join(" ");
+    await execFileAsync("ssh", [...this.commonOptions(), this.target, command], {
+      timeout: 240_000,
+      maxBuffer: 2 * 1024 * 1024,
+      encoding: "utf8",
+    });
+  }
+
+  async sandboxStop(): Promise<void> {
+    await this.verifyTargetBinding();
+    const script = [
+      "set -eu",
+      "cd \"$1\"",
+      "if [ -f oscar-sandbox.sh ]; then bash oscar.sh sandbox stop >/dev/null; fi",
+    ].join("; ");
+    const command = [
+      "sudo", "-n", "bash", "-ceu", script, "oscar-sandbox-stop", this.releaseDirectory,
+    ].map(shellQuote).join(" ");
+    await execFileAsync("ssh", [...this.commonOptions(), this.target, command], {
+      timeout: 60_000,
+      maxBuffer: 1024 * 1024,
+      encoding: "utf8",
+    });
   }
 }

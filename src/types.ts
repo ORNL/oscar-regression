@@ -6,6 +6,8 @@ export type CapabilityMode = "auto" | "required" | "disabled";
 
 export type BackupMode = "disabled" | "single";
 
+export type StorageExpectedRelease = "3.11.0" | "3.11.1" | "3.11.2" | "3.11.3";
+
 export type ResultStatus = "correct" | "incorrect" | "skipped";
 
 export const OSCAR_COMPOSE_SERVICES = ["gateway", "oscar", "postgres"] as const;
@@ -48,8 +50,16 @@ export interface SuiteConfig {
   spectraDirectory?: string;
   vehicleOcrWorkflow: CapabilityMode;
   expectedVehicleOcrContainer: string;
+  cargoUffWorkflow: CapabilityMode;
+  cargoUffSamplesDirectory: string;
+  cargoUffSmbShare?: string;
+  cargoUffSmbSubPath?: string;
+  cargoUffSmbDomain?: string;
+  cargoUffSmbUsername?: string;
+  cargoUffSmbPassword?: string;
+  trainingSandboxWorkflow: CapabilityMode;
   storageWorkflow: CapabilityMode;
-  storageExpectedRelease: "3.11.0";
+  storageExpectedRelease: StorageExpectedRelease;
   storageBackupWorkflow: CapabilityMode;
   storageBackupMode: BackupMode;
   storageTargetAcknowledgement: string;
@@ -219,8 +229,10 @@ export interface RunMetadata {
   spectroscopicWorkflow?: CapabilityMode;
   spectroscopicSampleCount?: number;
   vehicleOcrWorkflow?: CapabilityMode;
+  cargoUffWorkflow?: CapabilityMode;
+  cargoUffSmbConfigured?: boolean;
   storageWorkflow: CapabilityMode;
-  storageExpectedRelease: "3.11.0";
+  storageExpectedRelease: StorageExpectedRelease;
   storageBackupWorkflow: CapabilityMode;
   storageBackupMode: BackupMode;
   storageProbeTimeoutMs: number;
@@ -296,4 +308,14 @@ export interface RpmStatus {
   nh_fault: boolean;
   tamper_fault: boolean;
   occupancy_frequency_effective?: number;
+}
+
+export interface SandboxIsolationSnapshot {
+  sandboxScriptPresent: boolean;
+  stateConfigSha256: string;
+  postgresSandboxDatastreamCount: number;
+  postgresSandboxObsCount: number;
+  archiveSandboxFileCount: number;
+  sandboxContainerCount: number;
+  sandboxVolumeCount: number;
 }

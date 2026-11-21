@@ -528,3 +528,21 @@ test("configuration rejects embedded OSCAR and emulator URL credentials", () => 
     assert.throws(() => loadConfig([]), /RPM_EMULATOR_URL must not include embedded credentials/);
   });
 });
+
+test("configuration supports cargo-uff scenario filter and bundled uff-samples directory", () => {
+  withEnvironment(baseEnvironment, () => {
+    const cfg = loadConfig(["--profile", "full", "--scenario", "cargo-uff"]);
+    assert.equal(cfg.cargoUffWorkflow, "auto");
+    assert.ok(cfg.cargoUffSamplesDirectory.endsWith("uff-samples"));
+    assert.ok(cfg.scenarioFilter.has("cargo-uff"));
+  });
+});
+
+test("configuration supports training-sandbox scenario filter and STORAGE_EXPECTED_RELEASE=3.11.3", () => {
+  withEnvironment({...baseEnvironment, STORAGE_EXPECTED_RELEASE: "3.11.3", TRAINING_SANDBOX_WORKFLOW: "required"}, () => {
+    const cfg = loadConfig(["--profile", "full", "--scenario", "training-sandbox"]);
+    assert.equal(cfg.storageExpectedRelease, "3.11.3");
+    assert.equal(cfg.trainingSandboxWorkflow, "required");
+    assert.ok(cfg.scenarioFilter.has("training-sandbox"));
+  });
+});

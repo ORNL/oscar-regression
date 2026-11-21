@@ -1,6 +1,10 @@
+import {execFile} from "node:child_process";
 import {readFileSync, writeFileSync} from "node:fs";
 import {createHash, randomUUID} from "node:crypto";
 import {basename, join} from "node:path";
+import {promisify} from "node:util";
+
+const execFileAsync = promisify(execFile);
 import type {Locator, Page, Request, Response} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
@@ -393,7 +397,7 @@ export class RegressionScenarios {
   private fullRunCanSelfSeedRetainedMedia(): boolean {
     return ["full", "3.9.2-release", "3.11.0-release"].includes(this.config.profile) &&
       this.selected("storage-lifecycle") &&
-      ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr"].some(scenario => this.selected(scenario));
+      ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "cargo-uff"].some(scenario => this.selected(scenario));
   }
 
   private async check<T>(metadata: CheckMetadata, probe: () => Promise<ProbeResult<T>>): Promise<T | undefined> {
@@ -653,6 +657,8 @@ export class RegressionScenarios {
         await this.scenario("adjudication", () => this.adjudicationAndAlarmTransfer());
         await this.scenario("eml-auto-adjudication", () => this.emlAutoAdjudication());
         await this.scenario("vehicle-ocr", () => this.vehicleOcr());
+        await this.scenario("cargo-uff", () => this.cargoUffAdjudication());
+        await this.scenario("training-sandbox", () => this.trainingSandbox());
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([
           {reportType: "ADJUDICATION"},
@@ -1254,9 +1260,15 @@ export class RegressionScenarios {
         try {
           await backFilteredBtn.click();
           await page.locator(".MuiDataGrid-row").first().waitFor({state: "visible", timeout: 5_000});
+          restoredLaneMatch = await poll(
+            async () => {
+              const cells = await page.locator('.MuiDataGrid-row [data-field="laneId"] .alarm-cell-primary').allInnerTexts();
+              return cells.length > 0 && cells.every((c) => c.trim() === firstLaneText);
+            },
+            Boolean,
+            {timeoutMs: 1_000, intervalMs: 40, description: `cached filtered return to ${firstLaneText}`},
+          ).catch(() => false);
           returnRenderMs = Date.now() - returnStartedAt;
-          const cells = await page.locator('.MuiDataGrid-row [data-field="laneId"] .alarm-cell-primary').allInnerTexts();
-          restoredLaneMatch = cells.length > 0 && cells.every((c) => c.trim() === firstLaneText);
         } finally {
           page.off("request", onReturnReq);
         }
@@ -6776,17 +6788,58 @@ export class RegressionScenarios {
     const quiet = this.emulator.quietConfig(this.originalRpmConfig);
     const page = await this.browser.oscarPage();
     let ocrEnabledByScenario = false;
+    let restoreInitialReservedOcrEnabled = false;
 
-    const findLaneSystems = async (): Promise<{
+    const readConfiguredLiveOcrLaneNames = async (): Promise<Set<string> | null> => {
+      const sshTarget = this.config.oscarSshTarget?.trim() ?? "";
+      if (!sshTarget || !/^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9A-Fa-f:]+\])$/.test(sshTarget)) {
+        return null;
+      }
+      try {
+        const sshArgs = [
+          "-o", "BatchMode=yes",
+          "-o", "StrictHostKeyChecking=yes",
+          "-o", "ConnectTimeout=10",
+          ...(this.config.sshIdentityFile
+            ? ["-o", "IdentitiesOnly=yes", "-i", this.config.sshIdentityFile]
+            : []),
+          sshTarget,
+          "docker exec oscar-oscar-1 sh -c 'cat /var/lib/oscar/config.json 2>/dev/null || cat /var/lib/oscar/config/config.json'",
+        ];
+        const {stdout} = await execFileAsync("ssh", sshArgs, {maxBuffer: 16 * 1024 * 1024, timeout: 15_000});
+        const parsed = JSON.parse(stdout) as Array<{
+          moduleClass?: unknown;
+          name?: unknown;
+          ocrConfig?: {enabled?: unknown};
+          configuration?: {ocrConfig?: {enabled?: unknown}};
+        }>;
+        const enabledNames = new Set<string>();
+        for (const mod of Array.isArray(parsed) ? parsed : []) {
+          if (!String(mod?.moduleClass ?? "").includes("LaneSystem")) continue;
+          const isEnabled = Boolean(mod?.ocrConfig?.enabled ?? mod?.configuration?.ocrConfig?.enabled);
+          const lowerName = String(mod?.name ?? "").trim().toLowerCase();
+          if (isEnabled && lowerName) {
+            enabledNames.add(lowerName);
+            enabledNames.add(lowerName.replace(/^lane(\d+)$/, "lane-$1"));
+          }
+        }
+        return enabledNames;
+      } catch {
+        return null;
+      }
+    };
+
+    const findLaneSystems = async (liveOcrLaneNames: Set<string> | null): Promise<{
       reserved: {systemId: string; uid: string} | null;
       untouchedBaseline: {systemId: string; uid: string} | null;
+      liveOcrSystemIds: Set<string>;
     }> => {
       const res = await page.context().request.get(
         this.viewerUrl("/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500"),
         {headers: {Accept: "application/geo+json, application/json"}},
       );
       try {
-        if (!res.ok()) return {reserved: null, untouchedBaseline: null};
+        if (!res.ok()) return {reserved: null, untouchedBaseline: null, liveOcrSystemIds: new Set()};
         const json = await res.json() as {
           items?: Array<{
             id?: unknown;
@@ -6796,6 +6849,7 @@ export class RegressionScenarios {
         const expectedLower = this.config.testLaneLabel.toLowerCase();
         let reserved: {systemId: string; uid: string} | null = null;
         let untouchedBaseline: {systemId: string; uid: string} | null = null;
+        const liveOcrSystemIds = new Set<string>();
         for (const item of json.items ?? []) {
           const id = String(item.id ?? "").trim();
           const uid = String(item.properties?.uid ?? "").trim();
@@ -6803,13 +6857,20 @@ export class RegressionScenarios {
           if (!id || !uid.includes(":lane:")) continue;
           const lowerName = name.toLowerCase();
           const lowerUid = uid.toLowerCase();
+          const uidTail = lowerUid.split(":").pop() ?? "";
+          const isLiveOcr = liveOcrLaneNames
+            ? (liveOcrLaneNames.has(lowerName) || liveOcrLaneNames.has(uidTail))
+            : /:lane-4[1-9]$/i.test(lowerUid);
+          if (isLiveOcr) {
+            liveOcrSystemIds.add(id);
+          }
           if (lowerName === expectedLower || lowerUid.endsWith(`:${expectedLower}`)) {
             reserved = {systemId: id, uid};
-          } else if (!untouchedBaseline && (lowerName === "lane01" || lowerUid.endsWith(":lane-01"))) {
+          } else if (!untouchedBaseline && !isLiveOcr && (liveOcrLaneNames ? true : (lowerName === "lane01" || lowerUid.endsWith(":lane-01")))) {
             untouchedBaseline = {systemId: id, uid};
           }
         }
-        return {reserved, untouchedBaseline};
+        return {reserved, untouchedBaseline, liveOcrSystemIds};
       } finally {
         await res.dispose();
       }
@@ -7013,7 +7074,8 @@ export class RegressionScenarios {
     let laneSystem: {systemId: string; uid: string} | null = null;
     try {
       await this.ensureAlarmMediaBaseline("vehicle-ocr");
-      const discoveredLanes = await findLaneSystems();
+      const liveOcrLaneNames = await readConfiguredLiveOcrLaneNames();
+      const discoveredLanes = await findLaneSystems(liveOcrLaneNames);
       laneSystem = discoveredLanes.reserved;
       if (!laneSystem) {
         throw new Error(`Unable to resolve ConSys system ID for ${this.config.testLaneLabel}`);
@@ -7022,9 +7084,26 @@ export class RegressionScenarios {
 
       // Untouched lanes never register a vehicleOcr datastream; previously tested lanes retain historical
       // datastream metadata for archived observations while publishing zero new observations when disabled.
-      const untouchedLaneOcrStreams = discoveredLanes.untouchedBaseline
-        ? (await listLaneOcrDatastreams(discoveredLanes.untouchedBaseline.systemId, "latest")).length
-        : 0;
+      let untouchedLaneOcrStreams = 0;
+      if (discoveredLanes.untouchedBaseline) {
+        const baselineStreams = await listLaneOcrDatastreams(discoveredLanes.untouchedBaseline.systemId, "latest");
+        for (const bs of baselineStreams) {
+          const histRes = await page.context().request.get(
+            this.viewerUrl(`/sensorhub/api/datastreams/${encodeURIComponent(bs.id)}/observations?limit=1`),
+            {headers: {Accept: "application/om+json, application/json"}},
+          );
+          try {
+            if (histRes.ok()) {
+              const histJson = await histRes.json() as {items?: unknown[]};
+              if ((histJson.items ?? []).length === 0) {
+                untouchedLaneOcrStreams += 1;
+              }
+            }
+          } finally {
+            await histRes.dispose();
+          }
+        }
+      }
       const nonReservedOcrStreamIds: string[] = [];
       const allDsRes = await page.context().request.get(
         this.viewerUrl("/sensorhub/api/datastreams?validTime=latest&limit=2000"),
@@ -7046,9 +7125,10 @@ export class RegressionScenarios {
             const dsId = String(ds.id ?? "").trim();
             const sysId = String(ds["system@id"] ?? ds.system?.id ?? "").trim();
             const sysUid = String(ds["system@link"]?.uid ?? ds.system?.uid ?? "").trim();
-            // Container-transit lanes (lane-41..lane-49) may run continuous live OCR on background alarms;
-            // non-container lanes (lane-01..lane-40) stay disabled and must publish zero new OCR observations.
-            if (dsId && sysId && sysId !== targetLaneSystem.systemId && !/:lane-4[1-9]$/i.test(sysUid)) {
+            const isActiveBackgroundOcrLane = liveOcrLaneNames
+              ? discoveredLanes.liveOcrSystemIds.has(sysId)
+              : /:lane-4[1-9]$/i.test(sysUid);
+            if (dsId && sysId && sysId !== targetLaneSystem.systemId && !isActiveBackgroundOcrLane) {
               nonReservedOcrStreamIds.push(dsId);
             }
           }
@@ -7057,7 +7137,7 @@ export class RegressionScenarios {
         await allDsRes.dispose();
       }
 
-      const enableOutcome = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, true);
+      let enableOutcome = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, true);
       if (!enableOutcome.supported) {
         if (this.config.vehicleOcrWorkflow === "auto") {
           this.skip(adminMeta, "Vehicle OCR tab is not present on this build (auto detection)");
@@ -7069,6 +7149,13 @@ export class RegressionScenarios {
           );
         }
         return;
+      }
+      if (enableOutcome.initiallyChecked === true) {
+        // Host pre-enables Vehicle OCR on the reserved lane (e.g. 50-lane continuous OCR endurance topology):
+        // cycle false -> true to verify the full disable-to-enable transition and restore true on exit.
+        restoreInitialReservedOcrEnabled = true;
+        await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, false);
+        enableOutcome = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, true);
       }
       ocrEnabledByScenario = true;
 
@@ -7480,67 +7567,81 @@ export class RegressionScenarios {
             return fetchOcrForObsId(eventId2!, rescanWindowStartIso);
           };
 
-          let rescanObs = await pollOrRetriggerRescan(
-            c => c.idType === "container" &&
-              c.checksumValid &&
-              matchesExpectedContainer(c.normalizedValue),
-            `confirmation re-scan vehicleOcr (${expectedContainer})`,
-          );
-          const firstRescanBest = rescanObs.find(
-            c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
-          );
-          const firstRescanNorm = firstRescanBest
-            ? firstRescanBest.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase()
-            : "";
-
-          // If expectedContainer === "ANY" and a rotating multi-clip playlist crossed a container
-          // boundary between Pass #1 and Pass #2, adjudicate Pass #2 as the new base pass and
-          // trigger one confirmation pass inside the fresh ~90s container block.
-          if (expectedContainer === "ANY" && firstRescanNorm && firstRescanNorm !== canonicalExpected) {
-            await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
-            await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
-            const vInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
-            await poll(
-              async () => (await vInput.inputValue()).replace(/[^A-Z0-9]/gi, "").toUpperCase(),
-              val => val === firstRescanNorm,
-              {timeoutMs: 15_000, intervalMs: 250, description: `Vehicle ID auto-fill to equal ${firstRescanNorm}`},
-            );
-            await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
-            await this.selectMui(page, "Secondary Inspection", "NONE");
-            await page.getByLabel("Notes").fill(ocrNotes);
-            await page.getByRole("button", {name: "Submit", exact: true}).click();
-            const confirm2 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
-            await confirm2.waitFor({timeout: this.config.uiTimeoutMs});
-            await confirm2.getByRole("button", {name: /Confirm & Submit/i}).click();
-            await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
-
-            basePassEventId = eventId2!;
-            canonicalExpected = firstRescanNorm;
-            this.lastRecognizedOcrContainer = canonicalExpected;
-
-            rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-            const trigger3 = await this.triggerAlarm("gamma", "vehicle-ocr");
-            if (!trigger3) throw new Error("Boundary-follow-up confirmation gamma alarm trigger returned no occupancy identity");
-            const alarmRow3 = await this.findAlarmRow(page, /Gamma/i, trigger3);
-            const eventId3 = await this.resolveAlarmEventUuid(
-              page,
-              alarmRow3,
-              "gamma",
-              trigger3.occupancyCount,
-              "vehicle-ocr",
-            );
-            if (!eventId3) throw new Error("Failed to resolve occupancy UUID for boundary-follow-up confirmation alarm");
-            await this.captureAlarmMedia(page, eventId3, "gamma", trigger3.occupancyCount, "vehicle-ocr");
-            eventId2 = eventId3;
-
-            rescanObs = await pollOrRetriggerRescan(
+          // Track adjudicated base passes by normalized ISO 6346 container ID across rotating multi-clip
+          // RTSP playlists so the first container seen twice yields an exact adjudicated Pass #1 + open Pass #2 pair.
+          const adjudicatedByContainer = new Map<string, string>([[canonicalExpected, basePassEventId]]);
+          let matchedRescanPair = false;
+          for (let playlistStep = 0; playlistStep < 6; playlistStep++) {
+            const rescanObs = await pollOrRetriggerRescan(
               c => c.idType === "container" &&
                 c.checksumValid &&
-                c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase() === canonicalExpected,
-              `confirmation re-scan vehicleOcr (${canonicalExpected})`,
+                matchesExpectedContainer(c.normalizedValue),
+              `confirmation re-scan vehicleOcr (${expectedContainer})`,
             );
-          } else if (expectedContainer !== "ANY" && firstRescanNorm !== canonicalExpected) {
-            throw new Error(`Confirmation re-scan recognized ${firstRescanNorm || "none"} instead of ${canonicalExpected}`);
+            const validRescanContainers = rescanObs.filter(
+              c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
+            );
+            const repeated = validRescanContainers.find(
+              c => adjudicatedByContainer.has(c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase()),
+            );
+            if (repeated) {
+              const repeatedNorm = repeated.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+              canonicalExpected = repeatedNorm;
+              basePassEventId = adjudicatedByContainer.get(repeatedNorm)!;
+              this.lastRecognizedOcrContainer = canonicalExpected;
+              matchedRescanPair = true;
+              break;
+            }
+            const candidateBest = validRescanContainers[0];
+            const candidateNorm = candidateBest
+              ? candidateBest.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase()
+              : "";
+            if (expectedContainer !== "ANY") {
+              throw new Error(`Confirmation re-scan recognized ${candidateNorm || "none"} instead of ${canonicalExpected}`);
+            }
+            if (candidateNorm && playlistStep < 5) {
+              await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
+              await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+              const candChip = page.getByTestId(`ocr-chip-${candidateNorm}`);
+              if (await candChip.isVisible().catch(() => false)) {
+                await candChip.click().catch(() => {});
+              }
+              const vInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
+              await poll(
+                async () => (await vInput.inputValue()).replace(/[^A-Z0-9]/gi, "").toUpperCase(),
+                val => val === candidateNorm,
+                {timeoutMs: 15_000, intervalMs: 250, description: `Vehicle ID auto-fill to equal ${candidateNorm}`},
+              );
+              await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
+              await this.selectMui(page, "Secondary Inspection", "NONE");
+              await page.getByLabel("Notes").fill(ocrNotes);
+              await page.getByRole("button", {name: "Submit", exact: true}).click();
+              const confirmNext = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+              await confirmNext.waitFor({timeout: this.config.uiTimeoutMs});
+              await confirmNext.getByRole("button", {name: /Confirm & Submit/i}).click();
+              await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+              adjudicatedByContainer.set(candidateNorm, eventId2!);
+            }
+
+            if (playlistStep < 5) {
+              rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
+              const nextRescanTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+              if (!nextRescanTrigger) throw new Error("Playlist-follow-up confirmation gamma alarm trigger returned no occupancy identity");
+              const nextAlarmRow = await this.findAlarmRow(page, /Gamma/i, nextRescanTrigger);
+              const nextEventId = await this.resolveAlarmEventUuid(
+                page,
+                nextAlarmRow,
+                "gamma",
+                nextRescanTrigger.occupancyCount,
+                "vehicle-ocr",
+              );
+              if (!nextEventId) throw new Error("Failed to resolve occupancy UUID for playlist-follow-up confirmation alarm");
+              await this.captureAlarmMedia(page, nextEventId, "gamma", nextRescanTrigger.occupancyCount, "vehicle-ocr");
+              eventId2 = nextEventId;
+            }
+          }
+          if (!matchedRescanPair) {
+            throw new Error(`Did not observe a repeated checksum-valid container across confirmation re-scan passes (seen: ${[...adjudicatedByContainer.keys()].join(", ")})`);
           }
 
           const spacedQuery = `${canonicalExpected.slice(0, 4).toLowerCase()} ${canonicalExpected.slice(4, 10)}-${canonicalExpected.slice(10)}`;
@@ -7588,6 +7689,10 @@ export class RegressionScenarios {
 
           await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
           await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+          const rescanChip = page.getByTestId(`ocr-chip-${canonicalExpected}`);
+          if (await rescanChip.waitFor({timeout: 15_000}).then(() => true).catch(() => false)) {
+            await rescanChip.click().catch(() => {});
+          }
           const banner = page.getByTestId("vehicle-related-passes-banner");
           await banner.waitFor({state: "visible", timeout: 25_000});
           await page.getByTestId("open-vehicle-pass-comparison").click();
@@ -7784,6 +7889,11 @@ export class RegressionScenarios {
       if (ocrEnabledByScenario && laneSystem) {
         await setLaneVehicleOcrEnabled(laneSystem.systemId, false).catch(error =>
           this.reporter.error("vehicle-ocr", "restore-lane-ocr-disabled", error));
+      }
+      if (restoreInitialReservedOcrEnabled && laneSystem) {
+        await setLaneVehicleOcrEnabled(laneSystem.systemId, true)
+          .then(() => this.waitHealthRpmConnection(page, "online", 60_000))
+          .catch(error => this.reporter.error("vehicle-ocr", "restore-initial-lane-ocr-enabled", error));
       }
       await this.emulator.replaceConfig(this.config.testRpmId, quiet).catch(error =>
         this.reporter.error("vehicle-ocr", "restore-quiet-config", error));
@@ -9402,7 +9512,7 @@ export class RegressionScenarios {
         category: "viewer",
         action: "render /extensions accessible tabs and starter templates",
         target: "/extensions",
-        expected: "visible Pluggable Runtime Extensions & Regional Packs heading, ARIA tablist across 6 domains, and downloadable OCR starter template ZIP",
+        expected: "visible Pluggable Runtime Extensions & Regional Packs heading, ARIA tablist across 7 domains (including Cargo NII WCO UFF disabled by default), and downloadable OCR starter template ZIP",
       }, async () => {
         const status = await this.goto(page, "/extensions");
         const headingVisible = await page
@@ -9412,16 +9522,17 @@ export class RegressionScenarios {
           .then(() => true)
           .catch(() => false);
         const tabCount = await page.locator('[role="tablist"] [role="tab"]').count();
+        const uffTabVisible = await page.getByTestId("ext-tab-uff").isVisible().catch(() => false);
         const tplRes = await page.context().request.get(
           this.viewerUrl("/sensorhub/oscar/extensions/templates/ocr-pack.zip"),
         );
         const tplBytes = tplRes.ok() ? (await tplRes.body()).length : 0;
         await tplRes.dispose();
-        const passed = status >= 200 && status < 400 && headingVisible && tabCount === 6 && tplBytes > 100;
+        const passed = status >= 200 && status < 400 && headingVisible && tabCount === 7 && uffTabVisible && tplBytes > 100;
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "runtime-extensions-ui-failed");
         return {
           passed,
-          observed: `HTTP ${status}; heading=${headingVisible}; tabs=${tabCount}; templateZipBytes=${tplBytes}`,
+          observed: `HTTP ${status}; heading=${headingVisible}; tabs=${tabCount}; uffTab=${uffTabVisible}; templateZipBytes=${tplBytes}`,
           evidence,
         };
       });
@@ -9765,5 +9876,589 @@ export class RegressionScenarios {
     });
 
     await page.close();
+  }
+
+  private async cargoUffAdjudication(): Promise<void> {
+    const capabilityMeta: CheckMetadata = {
+      scenario: "cargo-uff",
+      category: "cargo-uff",
+      action: "detect Cargo NII (WCO UFF 2.0 & 3.0.0) runtime capability",
+      target: "/sensorhub/oscar/extensions/uff/active",
+      expected: "OSCAR 3.11.2+ Cargo UFF runtime endpoint responds HTTP 200",
+    };
+    if (this.config.cargoUffWorkflow === "disabled") {
+      this.skip(capabilityMeta, "CARGO_UFF_WORKFLOW=disabled");
+      return;
+    }
+
+    const page = await this.browser.oscarPage();
+    const extHeaders = {"X-Requested-With": "OSCAR-Viewer"};
+    let preUffEnabled = false;
+
+    try {
+      const activeRes = await page.context().request.get(
+        this.viewerUrl("/sensorhub/oscar/extensions/uff/active"),
+        {headers: {Accept: "application/json"}},
+      );
+      const activeStatus = activeRes.status();
+      const activeBody = activeRes.ok() ? (await activeRes.json()) as {enabled?: boolean} : {};
+      await activeRes.dispose();
+
+      if (activeStatus === 404) {
+        if (this.config.cargoUffWorkflow === "auto") {
+          this.skip(capabilityMeta, "Cargo UFF runtime endpoint is absent on pre-3.11.2 build (auto)");
+        } else {
+          this.reporter.outcome(
+            capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+            capabilityMeta.expected, `HTTP ${activeStatus}`, "incorrect", 0,
+          );
+        }
+        return;
+      }
+      this.reporter.outcome(
+        capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+        capabilityMeta.expected, `HTTP ${activeStatus} (enabled=${String(activeBody.enabled)})`,
+        activeStatus === 200 ? "correct" : "incorrect", 0,
+      );
+      if (activeStatus !== 200) return;
+      preUffEnabled = Boolean(activeBody.enabled);
+
+      if (preUffEnabled) {
+        await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/uff/action"), {
+          headers: {...extHeaders, "Content-Type": "application/json"},
+          data: {action: "reset"},
+        }).then((r) => r.dispose()).catch(() => {});
+      }
+
+      // Trigger a real 1s gamma alarm on the reserved test lane so Cargo UFF inspection & adjudication
+      // operate on a fresh, deterministic occupancy with real gamma/neutron telemetry.
+      if (this.originalRpmConfig) {
+        await this.emulator.replaceConfig(
+          this.config.testRpmId,
+          this.emulator.shortAlarmConfig(this.originalRpmConfig, 3),
+        );
+        await this.waitHealthRpmConnection(page, "online", 60_000);
+      }
+      const trigger = await this.triggerAlarm("gamma", "cargo-uff");
+      if (!trigger) throw new Error("Cargo UFF gamma alarm trigger returned no occupancy identity");
+      const alarmRow = await this.findAlarmRow(page, /Gamma/i, trigger);
+      const eventId = await this.resolveAlarmEventUuid(
+        page,
+        alarmRow,
+        "gamma",
+        trigger.occupancyCount,
+        "cargo-uff",
+      );
+      if (!eventId) throw new Error("Failed to resolve occupancy UUID for Cargo UFF gamma alarm");
+      await this.captureAlarmMedia(page, eventId, "gamma", trigger.occupancyCount, "cargo-uff");
+
+      // 1. Verify shipped disabled default: zero UI clutter on /event-details and bounded /event-log latency
+      await this.check({
+        scenario: "cargo-uff",
+        category: "zero-clutter",
+        action: "verify zero permanent UI clutter and fast Event Log load when Cargo UFF is disabled",
+        target: `/event-details?eventId=${eventId}`,
+        expected: `Event Log first row <= ${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}ms; Browse Cargo Share button and correlated UFF banner absent when disabled; Upload Files input attached`,
+      }, async () => {
+        const t0 = Date.now();
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.uiTimeoutMs});
+        const eventLogLoadMs = Date.now() - t0;
+
+        await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}`);
+        await page.getByTestId("adjudication-file-input").waitFor({state: "attached", timeout: this.config.uiTimeoutMs});
+        await sleep(350);
+        const pickerCount = await page.getByTestId("open-cargo-uff-picker-btn").count();
+        const bannerCount = await page.getByTestId("correlated-cargo-uff-banner").count();
+        const fileInputCount = await page.getByTestId("adjudication-file-input").count();
+        const passed = eventLogLoadMs <= EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS &&
+          pickerCount === 0 && bannerCount === 0 && fileInputCount === 1;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-zero-clutter-failed");
+        return {
+          passed,
+          observed: `eventLogLoadMs=${eventLogLoadMs}; pickerCount=${pickerCount}; bannerCount=${bannerCount}; fileInputCount=${fileInputCount}`,
+          evidence,
+        };
+      });
+
+      // 2. Upload bundled CC0-1.0 UFF 3.0.0 High-Z anomaly package from uff-samples/ and exercise 16-bit inspector
+      const bundledSuspectUff = join(
+        this.config.cargoUffSamplesDirectory,
+        "04-uff3-highz-shielded-anomaly-scfu8572724.uff",
+      );
+      await this.check({
+        scenario: "cargo-uff",
+        category: "local-uff",
+        action: "upload bundled CC0-1.0 UFF 3.0.0 package, auto-extract embedded .n42, and inspect 16-bit radiograph + HEMD + RPM alignment",
+        target: basename(bundledSuspectUff),
+        expected: "16-bit uint16 canvas decodes (2048x600), High-Z annotation box and RPM alignment strip render, W/L invert updates WebGL2/Canvas pixels, and embedded .n42 is staged",
+      }, async () => {
+        await page.getByTestId("adjudication-file-input").setInputFiles(bundledSuspectUff);
+        const inspectBtn = page.getByTestId("inspect-uploaded-uff-0");
+        await inspectBtn.waitFor({timeout: this.config.uiTimeoutMs});
+        const pageTextAfterUpload = await poll(
+          () => page.locator("body").innerText(),
+          (txt) => /\.n42/i.test(txt),
+          {timeoutMs: 15_000, intervalMs: 250, description: "auto-extracted .n42 attachment from uploaded .uff"},
+        );
+        const hasExtractedN42 = /\.n42/i.test(pageTextAfterUpload);
+
+        await inspectBtn.click();
+        await page.getByTestId("cargo-uff-viewer-dialog").waitFor({timeout: this.config.uiTimeoutMs});
+        const canvas = page.getByTestId("uff-16bit-xray-canvas");
+        await canvas.waitFor({timeout: this.config.uiTimeoutMs});
+        const dims = await poll(
+          () => canvas.evaluate((el) => {
+            const c = el as HTMLCanvasElement;
+            return {w: c.width, h: c.height, png: c.width > 0 && c.height > 0 ? c.toDataURL("image/png") : ""};
+          }),
+          (d) => d.w >= 2048 && d.h >= 600 && d.png.length > 1000,
+          {timeoutMs: 20_000, intervalMs: 250, description: "decoded 16-bit uint16 radiograph canvas"},
+        );
+
+        const annotVisible = await page.getByTestId("uff-annotation-box-0").isVisible().catch(() => false);
+        const rpmStripVisible = await poll(
+          () => page.getByTestId("uff-rpm-alignment-strip").count(),
+          (c) => c > 0,
+          {timeoutMs: 10_000, intervalMs: 250, description: "longitudinal RPM alignment strip"},
+        ).then((c) => c > 0).catch(() => false);
+
+        await page.getByTestId("uff-toggle-invert").click();
+        const invertedPng = await poll(
+          () => canvas.evaluate((el) => (el as HTMLCanvasElement).toDataURL("image/png")),
+          (png) => png.length > 1000 && png !== dims.png,
+          {timeoutMs: 8_000, intervalMs: 150, description: "16-bit LUT invert recomputation"},
+        );
+
+        await page.getByTestId("cargo-uff-viewer-close").click();
+        await page.getByTestId("cargo-uff-viewer-dialog").waitFor({state: "hidden", timeout: 10_000});
+
+        const passed = hasExtractedN42 && dims.w === 2048 && dims.h === 600 &&
+          annotVisible && rpmStripVisible && invertedPng !== dims.png;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-local-inspector-failed");
+        return {
+          passed,
+          observed: `n42=${hasExtractedN42}; canvas=${dims.w}x${dims.h}; annot=${annotVisible}; rpmStrip=${rpmStripVisible}; lutChanged=${invertedPng !== dims.png}`,
+          evidence,
+        };
+      });
+
+      // 3. Live SMBv2/SMBv3 Commercial Operator Workflow (when CARGO_UFF_SMB_SHARE is configured in local .env)
+      if (this.config.cargoUffSmbShare) {
+        await this.check({
+          scenario: "cargo-uff",
+          category: "smb-share",
+          action: "connect SMBv2/SMBv3 Cargo UFF share in Runtime Extensions, verify secret redaction, and index .uff archives",
+          target: "/extensions",
+          expected: "Test Connection and Save & Apply succeed with indexedCount >= 1 and password redacted from /extensions/status",
+        }, async () => {
+          await this.goto(page, "/extensions");
+          const uffTab = page.getByTestId("ext-tab-uff");
+          await uffTab.waitFor({timeout: this.config.uiTimeoutMs});
+          await uffTab.click();
+
+          const enabledInput = page.getByTestId("uff-ext-enabled-checkbox").locator('input[type="checkbox"]');
+          if (!(await enabledInput.isChecked())) {
+            await page.getByTestId("uff-ext-enabled-checkbox").click();
+          }
+          await page.getByTestId("uff-ext-share-url").fill(this.config.cargoUffSmbShare ?? "");
+          await page.getByTestId("uff-ext-subpath").fill(this.config.cargoUffSmbSubPath ?? "");
+          await page.getByTestId("uff-ext-domain").fill(this.config.cargoUffSmbDomain ?? "WORKGROUP");
+          await page.getByTestId("uff-ext-username").fill(this.config.cargoUffSmbUsername ?? "");
+          if (this.config.cargoUffSmbPassword) {
+            await page.getByTestId("uff-ext-password").fill(this.config.cargoUffSmbPassword);
+          }
+
+          await page.getByTestId("uff-ext-test-btn").click();
+          await page.getByTestId("uff-ext-test-result").waitFor({timeout: 25_000});
+
+          await page.getByTestId("uff-ext-save-btn").click();
+          await page.getByTestId("uff-ext-active-summary").waitFor({timeout: 30_000});
+          const indexedCount = await poll(
+            async () => Number((await page.getByTestId("uff-ext-indexed-count").innerText().catch(() => "0")).trim()),
+            (n) => Number.isFinite(n) && n >= 1,
+            {timeoutMs: 25_000, intervalMs: 250, description: "indexed SMB Cargo UFF count >= 1"},
+          );
+
+          const stRes = await page.context().request.get(
+            this.viewerUrl("/sensorhub/oscar/extensions/status"),
+            {headers: {Accept: "application/json"}},
+          );
+          const stText = await stRes.text();
+          const stJson = stRes.ok() ? JSON.parse(stText) as {uff?: Record<string, unknown>} : {};
+          await stRes.dispose();
+          const secretRedacted = !("password" in (stJson.uff ?? {})) &&
+            (!this.config.cargoUffSmbPassword || !stText.includes(this.config.cargoUffSmbPassword));
+
+          const passed = indexedCount >= 1 && secretRedacted;
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-smb-connect-failed");
+          return {
+            passed,
+            observed: `indexedCount=${indexedCount}; secretRedacted=${secretRedacted}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "cargo-uff",
+          category: "event-log-omnibox",
+          action: "open sparse unlabelled UFF 2.0 package directly from Event Log omnibox by UFF UUID",
+          target: "/event-log",
+          expected: "pasting Tier-1 UFF UUID surfaces Open Cargo X-Ray match chip and opens CargoUffViewerDialog with UFF 2.0 radiograph",
+        }, async () => {
+          await this.goto(page, "/event-log");
+          const vInput = page.getByTestId("vehicle-id-search-input");
+          await vInput.waitFor({timeout: this.config.uiTimeoutMs});
+          await vInput.fill("3889134c-dd1f-4d03-9399-0ca25f6f01b8");
+          await page.getByTestId("vehicle-id-search-submit").click();
+          const openUffBtn = page.getByTestId("event-log-open-uff-btn");
+          const matchChipVisible = await openUffBtn.waitFor({timeout: 15_000}).then(() => true).catch(() => false);
+          if (matchChipVisible) {
+            await openUffBtn.click();
+          }
+          const dialog = page.getByTestId("cargo-uff-viewer-dialog");
+          const opened = matchChipVisible && await dialog.waitFor({timeout: 20_000}).then(() => true).catch(() => false);
+          const verText = opened
+            ? await page.getByTestId("uff-viewer-version-chip").innerText().catch(() => "")
+            : "";
+          if (opened) {
+            await page.getByTestId("cargo-uff-viewer-close").click();
+            await dialog.waitFor({state: "hidden", timeout: 10_000});
+          }
+          const passed = opened && /UFF\s*2/i.test(verText);
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-omnibox-failed");
+          return {
+            passed,
+            observed: `matchChip=${matchChipVisible}; dialogOpened=${opened}; versionChip=${verText}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "cargo-uff",
+          category: "smb-adjudication",
+          action: "browse Cargo SMB share with 1-char fuzzy OCR matching and submit zero-download .uffref.json adjudication",
+          target: `/event-details?eventId=${eventId}`,
+          expected: "CargoUffSmbPickerDialog finds exact + 1-Char OCR Match for EGHU3972694, stages .uffref.json without full archive copy, and records Code 9 adjudication",
+        }, async () => {
+          await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}`);
+          const pickerBtn = page.getByTestId("open-cargo-uff-picker-btn");
+          await pickerBtn.waitFor({timeout: this.config.uiTimeoutMs});
+          await pickerBtn.click();
+
+          const picker = page.getByTestId("cargo-uff-smb-picker-dialog");
+          await picker.waitFor({timeout: this.config.uiTimeoutMs});
+          await page.getByTestId("uff-smb-picker-window-select").click();
+          await page.getByRole("option", {name: /All Indexed Scans/i}).first().click();
+
+          await page.getByTestId("uff-smb-picker-search-input").fill("EGHU3972694");
+          await page.getByTestId("uff-smb-picker-submit").click();
+          const resultsText = await poll(
+            () => page.getByTestId("uff-smb-picker-results").innerText().catch(() => ""),
+            (txt) => txt.includes("EGHU3972G94") && /1-Char OCR Match/i.test(txt),
+            {timeoutMs: 15_000, intervalMs: 250, description: "1-Char OCR fuzzy match EGHU3972G94"},
+          );
+          const fuzzyVerified = resultsText.includes("EGHU3972G94");
+
+          await page.getByTestId("uff-smb-picker-search-input").fill("dfb985c4-eb26-41ab-938b-ad2a1f5966d4");
+          await page.getByTestId("uff-smb-picker-submit").click();
+          const linkBtn = page.getByTestId("uff-smb-link-dfb985c4-eb26-41ab-938b-ad2a1f5966d4");
+          await linkBtn.waitFor({timeout: 15_000});
+          await linkBtn.click();
+          await picker.waitFor({state: "hidden", timeout: 20_000});
+
+          const uffNotes = `Cargo UFF SMB regression ${this.reporter.runId.slice(-10)}`;
+          await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill("SCFU8572724");
+          await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
+          await this.selectMui(page, "Secondary Inspection", "NONE");
+          await page.getByLabel("Notes").fill(uffNotes);
+          await page.getByRole("button", {name: "Submit", exact: true}).click();
+          const confirm = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+          await confirm.waitFor({timeout: 15_000});
+          await confirm.getByRole("button", {name: /Confirm & Submit/i}).click();
+          await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+
+          await page.reload({waitUntil: "domcontentloaded"});
+          const reloadedBody = await poll(
+            () => page.locator("body").innerText(),
+            (txt) => txt.includes(uffNotes) && txt.includes(".uffref.json"),
+            {timeoutMs: 30_000, intervalMs: 500, description: "persisted .uffref.json adjudication pointer"},
+          );
+          const passed = fuzzyVerified && reloadedBody.includes(".uffref.json");
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-smb-adjudication-failed");
+          return {
+            passed,
+            observed: `fuzzyVerified=${fuzzyVerified}; persistedUffRef=${reloadedBody.includes(".uffref.json")}`,
+            evidence,
+          };
+        });
+      }
+    } finally {
+      await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/uff/action"), {
+        headers: {...extHeaders, "Content-Type": "application/json"},
+        data: {action: "reset"},
+      }).then((r) => r.dispose()).catch(() => {});
+      if (this.originalRpmConfig) {
+        await this.emulator.replaceConfig(
+          this.config.testRpmId,
+          this.emulator.quietConfig(this.originalRpmConfig),
+        ).catch((err) => this.reporter.error("cargo-uff", "restore-quiet-config", err));
+      }
+    }
+
+    // 4. Verify post-reset zero-latency & zero-clutter restoration
+    await this.check({
+      scenario: "cargo-uff",
+      category: "post-reset-latency",
+      action: "verify Cargo UFF resets cleanly to disabled with zero Event Log latency degradation",
+      target: "/sensorhub/oscar/extensions/uff/active",
+      expected: `uff.enabled=false and Event Log first row <= ${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}ms`,
+    }, async () => {
+      const res = await page.context().request.get(
+        this.viewerUrl("/sensorhub/oscar/extensions/uff/active"),
+        {headers: {Accept: "application/json"}},
+      );
+      const body = res.ok() ? (await res.json()) as {enabled?: boolean} : {};
+      await res.dispose();
+
+      const t0 = Date.now();
+      await this.goto(page, "/event-log");
+      await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.uiTimeoutMs});
+      const postResetEventLogMs = Date.now() - t0;
+
+      const passed = body.enabled === false && postResetEventLogMs <= EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS;
+      return {
+        passed,
+        observed: `enabled=${String(body.enabled)}; postResetEventLogMs=${postResetEventLogMs}ms`,
+      };
+    });
+
+    await page.close();
+  }
+
+  private async trainingSandbox(): Promise<void> {
+    const capabilityMeta: CheckMetadata = {
+      scenario: "training-sandbox",
+      category: "training-sandbox",
+      action: "verify OSCAR 3.11.3+ ephemeral Hands-On Training Sandbox capability",
+      target: "oscar-sandbox.sh",
+      expected: "SSH storage probe resolves oscar-sandbox.sh on target host",
+    };
+    if (this.config.trainingSandboxWorkflow === "disabled") {
+      this.skip(capabilityMeta, "TRAINING_SANDBOX_WORKFLOW=disabled");
+      return;
+    }
+
+    const sshConfigured = Boolean(
+      this.config.oscarSshTarget && this.config.oscarReleaseDirectory && this.config.storageTargetAcknowledgement,
+    );
+    if (!sshConfigured) {
+      if (this.config.trainingSandboxWorkflow === "auto") {
+        this.skip(capabilityMeta, "SSH storage probe is not configured for training-sandbox (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+          capabilityMeta.expected, "SSH storage probe not configured", "incorrect", 0,
+        );
+      }
+      return;
+    }
+
+    const probe = this.alarmMediaProbe ?? new StorageProbeClient(this.config, this.reporter.runId);
+    let beforeSnap = await probe.sandboxIsolationSnapshot();
+    if (!beforeSnap.sandboxScriptPresent) {
+      if (this.config.trainingSandboxWorkflow === "auto") {
+        this.skip(capabilityMeta, "oscar-sandbox.sh is absent on pre-3.11.3 build (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+          capabilityMeta.expected, "oscar-sandbox.sh missing", "incorrect", 0,
+        );
+      }
+      return;
+    }
+
+    if (beforeSnap.sandboxContainerCount > 0 || beforeSnap.sandboxVolumeCount > 0) {
+      await probe.sandboxStop();
+      beforeSnap = await probe.sandboxIsolationSnapshot();
+    }
+
+    this.reporter.outcome(
+      capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+      capabilityMeta.expected,
+      `present=true; preConfigSha=${beforeSnap.stateConfigSha256.slice(0, 12)}`,
+      "correct", 0,
+    );
+
+    const opPage = await this.browser.oscarPage();
+    const browserInstance = opPage.context().browser();
+    if (!browserInstance) {
+      await opPage.close();
+      throw new Error("Playwright browser instance unavailable for training-sandbox");
+    }
+
+    const sandboxPort = 8444;
+    const parsedOpUrl = new URL(this.config.oscarBaseUrl);
+    const sandboxBaseUrl = `https://${parsedOpUrl.hostname}:${sandboxPort}`;
+
+    try {
+      await this.check({
+        scenario: "training-sandbox",
+        category: "sandbox-launch",
+        action: "start isolated ephemeral oscar-sandbox stack on :8444",
+        target: `${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`,
+        expected: "oscar.sh sandbox start brings up gateway+oscar+postgres healthy while operational :443 stays sandboxMode=false",
+      }, async () => {
+        await probe.sandboxStart(sandboxPort, 15);
+        const opRes = await opPage.context().request.get(
+          this.viewerUrl("/sensorhub/oscar/sandbox/active"),
+          {headers: {Accept: "application/json"}},
+        );
+        const opBody = opRes.ok() ? (await opRes.json()) as {sandboxMode?: boolean} : {};
+        await opRes.dispose();
+        const passed = opBody.sandboxMode === false;
+        return {
+          passed,
+          observed: `sandboxStarted=true; operationalSandboxMode=${String(opBody.sandboxMode)}`,
+        };
+      });
+
+      const sbCtx = await browserInstance.newContext({
+        viewport: {width: 1920, height: 1080},
+        ignoreHTTPSErrors: true,
+        httpCredentials: {
+          username: this.config.oscarUsername,
+          password: this.config.oscarPassword,
+        },
+      });
+      const sbPage = await sbCtx.newPage();
+      try {
+        await sbPage.goto(`${sandboxBaseUrl}/`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
+        const loginUser = sbPage.getByLabel("Username");
+        if (await loginUser.isVisible({timeout: 4_000}).catch(() => false)) {
+          await loginUser.fill(this.config.oscarUsername);
+          await sbPage.getByLabel("Password").fill(this.config.oscarPassword);
+          await Promise.all([
+            sbPage.waitForURL((u) => !u.pathname.startsWith("/login"), {timeout: 25_000}),
+            sbPage.getByRole("button", {name: "Sign in", exact: true}).click(),
+          ]);
+        }
+
+        await this.check({
+          scenario: "training-sandbox",
+          category: "operator-academy-lab",
+          action: "verify Training Coach dock, archiveEnabled=false, DemoLane01 online, and live EML Code 9999 auto-verification",
+          target: `${sandboxBaseUrl}/event-log`,
+          expected: "sandboxMode=true, archiveEnabled=false, onlineLaneCount>=1, and injected norm_eml auto-verifies Lab 1.3",
+        }, async () => {
+          await sbPage.goto(`${sandboxBaseUrl}/event-log`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
+          await sbPage.getByTestId("navbar-sandbox-indicator").waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+          if (!(await sbPage.getByTestId("training-coach-dock").isVisible().catch(() => false))) {
+            await sbPage.getByTestId("navbar-training-coach-toggle").click();
+          }
+          await sbPage.getByTestId("training-coach-dock").waitFor({state: "visible", timeout: 10_000});
+          await sbPage.getByTestId("training-lab-chip-op-3").click();
+          await sbPage.getByTestId("training-inject-norm_eml").click();
+
+          let activeJson: {
+            sandboxMode?: boolean;
+            archiveEnabled?: boolean;
+            verification?: {onlineLaneCount?: number; emlCode9999Count?: number};
+          } = {};
+          const deadline = Date.now() + 20_000;
+          while (Date.now() < deadline) {
+            const r = await sbCtx.request.get(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`, {
+              headers: {Accept: "application/json"},
+            });
+            if (r.ok()) {
+              activeJson = await r.json();
+            }
+            await r.dispose();
+            if ((activeJson.verification?.emlCode9999Count ?? 0) >= 1) {
+              break;
+            }
+            await sbPage.waitForTimeout(1_000);
+          }
+
+          const passed =
+            activeJson.sandboxMode === true &&
+            activeJson.archiveEnabled === false &&
+            (activeJson.verification?.onlineLaneCount ?? 0) >= 1 &&
+            (activeJson.verification?.emlCode9999Count ?? 0) >= 1;
+          const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-operator-lab-failed");
+          return {
+            passed,
+            observed: `sandboxMode=${String(activeJson.sandboxMode)}; archiveEnabled=${String(activeJson.archiveEnabled)}; onlineLanes=${activeJson.verification?.onlineLaneCount ?? 0}; emlCode9999=${activeJson.verification?.emlCode9999Count ?? 0}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "training-sandbox",
+          category: "certificate-and-admin-split",
+          action: "verify watermarked PDF Completion Record export and Track 3 Split-Pane SensorHub Admin",
+          target: `${sandboxBaseUrl}/sensorhub/oscar/sandbox/certificate`,
+          expected: "certificate endpoint returns valid PDF >= 4 KiB and Track 3 opens /sensorhub/admin iframe",
+        }, async () => {
+          const certRes = await sbCtx.request.post(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/certificate`, {
+            headers: {
+              "X-Requested-With": "XMLHttpRequest",
+              "Content-Type": "application/json",
+            },
+            data: {
+              traineeName: "Regression Operator",
+              completedLabs: [
+                {trackId: "operator", labId: "1.3", title: "NORM (Code 9999)", status: "verified"},
+              ],
+            },
+          });
+          const certStatus = certRes.status();
+          const certBytes = certRes.ok() ? await certRes.body() : Buffer.alloc(0);
+          await certRes.dispose();
+          const pdfValid = certStatus === 200 && certBytes.length >= 4096 && certBytes.subarray(0, 5).toString("ascii") === "%PDF-";
+
+          await sbPage.getByTestId("training-track-btn-administrator").click();
+          const splitBtn = sbPage.getByTestId("training-toggle-split-admin");
+          await splitBtn.waitFor({state: "visible", timeout: 15_000});
+          await splitBtn.click();
+          await sbPage.getByTestId("sandbox-split-admin-shell").waitFor({state: "visible", timeout: 15_000});
+          const iframeVisible = await sbPage.getByTestId("sandbox-admin-iframe").isVisible();
+
+          const passed = pdfValid && iframeVisible;
+          const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-admin-split-failed");
+          return {
+            passed,
+            observed: `certStatus=${certStatus}; certBytes=${certBytes.length}; splitAdminIframe=${iframeVisible}`,
+            evidence,
+          };
+        });
+      } finally {
+        await sbCtx.close().catch(() => {});
+      }
+    } finally {
+      await probe.sandboxStop().catch((err) => this.reporter.error("training-sandbox", "sandbox-stop", err));
+      await opPage.close().catch(() => {});
+    }
+
+    await this.check({
+      scenario: "training-sandbox",
+      category: "zero-production-residue",
+      action: "verify sandbox stop flushes all sandbox containers/volumes and leaves zero operational DB, Parquet, or config.json residue",
+      target: "operational PostgreSQL + Parquet archive + config.json",
+      expected: "unchanged config.json SHA-256 and zero sandbox datastreams, observations, archive files, containers, or volumes",
+    }, async () => {
+      const afterSnap = await probe.sandboxIsolationSnapshot();
+      const passed =
+        afterSnap.stateConfigSha256 === beforeSnap.stateConfigSha256 &&
+        afterSnap.postgresSandboxDatastreamCount === 0 &&
+        afterSnap.postgresSandboxObsCount === 0 &&
+        afterSnap.archiveSandboxFileCount === 0 &&
+        afterSnap.sandboxContainerCount === 0 &&
+        afterSnap.sandboxVolumeCount === 0;
+      return {
+        passed,
+        observed: `configUnchanged=${afterSnap.stateConfigSha256 === beforeSnap.stateConfigSha256}; sbDs=${afterSnap.postgresSandboxDatastreamCount}; sbObs=${afterSnap.postgresSandboxObsCount}; sbArchive=${afterSnap.archiveSandboxFileCount}; sbContainers=${afterSnap.sandboxContainerCount}; sbVolumes=${afterSnap.sandboxVolumeCount}`,
+      };
+    });
   }
 }

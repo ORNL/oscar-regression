@@ -153,5 +153,28 @@ must expose exactly the fixture lanes. `auto` skips cleanly only on legacy
 Viewers without the operational-view workflow; once detected, membership and
 fail-closed checks remain gating.
 
+`cargo-uff` is capability-gated with `CARGO_UFF_WORKFLOW` (`auto` by default). On
+OSCAR 3.11.2+ deployments it verifies shipped zero-clutter default behavior
+(`uff.enabled=false` with zero extra buttons and bounded `/event-log` load
+latency), uploads a pure-synthetic `CC0-1.0` `UFF 3.0.0` package from
+`uff-samples/` to validate client-side 16-bit `uint16` radiograph decoding,
+Window/Level LUT recomputation, `<Annotation>` High-Z bounding boxes,
+longitudinal RPM waveform alignment, and embedded `.n42` extraction. When
+`CARGO_UFF_SMB_SHARE` is configured in local `.env`, it also validates live
+SMBv2/SMBv3 share indexing, secret redaction in `/extensions/status`, Event Log
+Tier-1 UFF UUID omnibox lookup, `CargoUffSmbPickerDialog` 1-character fuzzy ISO
+6346 OCR correlation, and zero-download `.uffref.json` adjudication staging,
+restoring `uff.enabled=false` in `finally`.
+
+`training-sandbox` is capability-gated with `TRAINING_SANDBOX_WORKFLOW` (`auto`
+by default). On OSCAR 3.11.3+ deployments with SSH storage-probe access
+configured, it snapshots operational `config.json` SHA-256 and operational
+PostgreSQL/Parquet state, starts the isolated `oscar-sandbox` stack on `:8444`,
+confirms operational `:443` stays `sandboxMode=false`, exercises the Training
+Coach (`archiveEnabled=false`, `DemoLane01` live EML `Code 9999` auto-verify,
+watermarked PDF Completion Record export, and Track 3 Split-Pane
+`/sensorhub/admin`), stops/flushes the sandbox in `finally`, and proves zero
+sandbox containers, volumes, datastreams, observations, or Parquet files remain.
+
 `reserved-lane-setup` and `reserved-lane-cleanup` are mandatory harness phases
 for every full-profile run and cannot be suppressed by a scenario filter.
