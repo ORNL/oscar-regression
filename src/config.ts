@@ -2,7 +2,7 @@ import {existsSync, mkdirSync, readFileSync, statSync} from "node:fs";
 import {isAbsolute, posix, resolve} from "node:path";
 import {assertCanonicalOperationalViewOracle, loadLaneConfigOracle} from "./lane-config.js";
 import {publicObservationId} from "./public-observation-id.js";
-import type {BackupMode, CapabilityMode, Profile, SuiteConfig} from "./types.js";
+import type {BackupMode, CapabilityMode, Profile, StorageExpectedRelease, SuiteConfig} from "./types.js";
 
 // A newly restarted emulator can enter OCCUPIED before OSCAR's prior socket
 // reaches its heartbeat timeout and reconnects.  The Viewer deliberately uses
@@ -213,7 +213,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
-    "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "extended-occupancy", "adjudication-report",
+    "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "cargo-uff", "extended-occupancy", "adjudication-report",
     "runtime-extensions",
     "storage-health", "storage-lifecycle",
     "storage-restore-drill",
@@ -276,7 +276,32 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   if (!/^(?:ANY|[A-Z]{3}[UJZR]\d{7})$/.test(expectedVehicleOcrContainer)) {
     throw new Error("EXPECTED_VEHICLE_OCR_CONTAINER must be ANY or an 11-character ISO 6346 container code");
   }
+  const cargoUffWorkflow = capabilityMode("CARGO_UFF_WORKFLOW", "auto");
+  const cargoUffSamplesRaw = process.env.CARGO_UFF_SAMPLES_DIR?.trim() || "uff-samples";
+  if (/[\0\r\n]/.test(cargoUffSamplesRaw)) {
+    throw new Error("CARGO_UFF_SAMPLES_DIR must not contain control characters");
+  }
+  const cargoUffSamplesDirectory = resolve(cargoUffSamplesRaw);
+  if (cargoUffWorkflow !== "disabled" &&
+      (!existsSync(cargoUffSamplesDirectory) || !statSync(cargoUffSamplesDirectory).isDirectory())) {
+    throw new Error(`CARGO_UFF_SAMPLES_DIR does not point to an existing directory: ${cargoUffSamplesDirectory}`);
+  }
+  const cargoUffSmbShare = process.env.CARGO_UFF_SMB_SHARE?.trim() || undefined;
+  const cargoUffSmbSubPath = process.env.CARGO_UFF_SMB_SUBPATH?.trim() || undefined;
+  const cargoUffSmbDomain = process.env.CARGO_UFF_SMB_DOMAIN?.trim() || undefined;
+  const cargoUffSmbUsername = process.env.CARGO_UFF_SMB_USERNAME?.trim() || undefined;
+  const cargoUffSmbPassword = process.env.CARGO_UFF_SMB_PASSWORD?.trim() || undefined;
+  if (cargoUffSmbShare && /[\0\r\n]/.test(cargoUffSmbShare)) {
+    throw new Error("CARGO_UFF_SMB_SHARE must not contain control characters");
+  }
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
+  const storageExpectedReleaseRaw = process.env.STORAGE_EXPECTED_RELEASE?.trim() || "3.11.0";
+  if (storageExpectedReleaseRaw !== "3.11.0" &&
+      storageExpectedReleaseRaw !== "3.11.1" &&
+      storageExpectedReleaseRaw !== "3.11.2") {
+    throw new Error("STORAGE_EXPECTED_RELEASE must be 3.11.0, 3.11.1, or 3.11.2");
+  }
+  const storageExpectedRelease: StorageExpectedRelease = storageExpectedReleaseRaw;
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
   const storageBackupMode = backupMode("OSCAR_BACKUP_MODE", "disabled");
   const oscarBuildLabel = process.env.OSCAR_BUILD_LABEL?.trim();
@@ -355,8 +380,15 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     ...(spectraDirectory ? {spectraDirectory} : {}),
     vehicleOcrWorkflow,
     expectedVehicleOcrContainer,
+    cargoUffWorkflow,
+    cargoUffSamplesDirectory,
+    ...(cargoUffSmbShare ? {cargoUffSmbShare} : {}),
+    ...(cargoUffSmbSubPath ? {cargoUffSmbSubPath} : {}),
+    ...(cargoUffSmbDomain ? {cargoUffSmbDomain} : {}),
+    ...(cargoUffSmbUsername ? {cargoUffSmbUsername} : {}),
+    ...(cargoUffSmbPassword ? {cargoUffSmbPassword} : {}),
     storageWorkflow,
-    storageExpectedRelease: "3.11.0",
+    storageExpectedRelease,
     storageBackupWorkflow,
     storageBackupMode,
     storageTargetAcknowledgement: process.env.OSCAR_STORAGE_TARGET_ACK?.trim() || "",
