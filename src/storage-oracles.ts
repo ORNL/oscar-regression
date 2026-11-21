@@ -1445,7 +1445,11 @@ export function storagePlatformHasExactReleaseIdentity(
     value.nativeRuntime.effectiveDataTmp === "/tmp" &&
     value.appImage.reference === `oscar:${release}` &&
     value.postgisImage.reference === `oscar-postgis:${release}` &&
-    value.gatewayImage.reference === "nginxinc/nginx-unprivileged:1.28.1-alpine" &&
+    value.gatewayImage.reference === (
+      /^(?:3\.(?:9|10)\.|3\.11\.0$)/.test(release)
+        ? "nginxinc/nginx-unprivileged:1.28.1-alpine"
+        : "nginx/nginx-unprivileged:1.30.7-alpine"
+    ) &&
     value.appImage.imageId === value.appImage.containerImageId &&
     value.postgisImage.imageId === value.postgisImage.containerImageId &&
     value.gatewayImage.imageId === value.gatewayImage.containerImageId &&

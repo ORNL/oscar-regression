@@ -1875,7 +1875,7 @@ case $action in
       case $image in
         oscar-postgis:*) [[ -z $postgis_image ]] || fail 'Compose selects multiple PostGIS images.'; postgis_image=$image ;;
         oscar:*) [[ -z $app_image ]] || fail 'Compose selects multiple OSCAR application images.'; app_image=$image ;;
-        nginxinc/nginx-unprivileged:*) [[ -z $gateway_image ]] || fail 'Compose selects multiple gateway images.'; gateway_image=$image ;;
+        nginxinc/nginx-unprivileged:*|nginx/nginx-unprivileged:*) [[ -z $gateway_image ]] || fail 'Compose selects multiple gateway images.'; gateway_image=$image ;;
       esac
     done <<<"$images"
     [[ -n $app_image && -n $postgis_image && -n $gateway_image ]] ||
