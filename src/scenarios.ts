@@ -658,6 +658,7 @@ export class RegressionScenarios {
         await this.scenario("eml-auto-adjudication", () => this.emlAutoAdjudication());
         await this.scenario("vehicle-ocr", () => this.vehicleOcr());
         await this.scenario("cargo-uff", () => this.cargoUffAdjudication());
+        await this.scenario("training-sandbox", () => this.trainingSandbox());
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([
           {reportType: "ADJUDICATION"},
@@ -10233,5 +10234,231 @@ export class RegressionScenarios {
     });
 
     await page.close();
+  }
+
+  private async trainingSandbox(): Promise<void> {
+    const capabilityMeta: CheckMetadata = {
+      scenario: "training-sandbox",
+      category: "training-sandbox",
+      action: "verify OSCAR 3.11.3+ ephemeral Hands-On Training Sandbox capability",
+      target: "oscar-sandbox.sh",
+      expected: "SSH storage probe resolves oscar-sandbox.sh on target host",
+    };
+    if (this.config.trainingSandboxWorkflow === "disabled") {
+      this.skip(capabilityMeta, "TRAINING_SANDBOX_WORKFLOW=disabled");
+      return;
+    }
+
+    const sshConfigured = Boolean(
+      this.config.oscarSshTarget && this.config.oscarReleaseDirectory && this.config.storageTargetAcknowledgement,
+    );
+    if (!sshConfigured) {
+      if (this.config.trainingSandboxWorkflow === "auto") {
+        this.skip(capabilityMeta, "SSH storage probe is not configured for training-sandbox (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+          capabilityMeta.expected, "SSH storage probe not configured", "incorrect", 0,
+        );
+      }
+      return;
+    }
+
+    const probe = this.alarmMediaProbe ?? new StorageProbeClient(this.config, this.reporter.runId);
+    let beforeSnap = await probe.sandboxIsolationSnapshot();
+    if (!beforeSnap.sandboxScriptPresent) {
+      if (this.config.trainingSandboxWorkflow === "auto") {
+        this.skip(capabilityMeta, "oscar-sandbox.sh is absent on pre-3.11.3 build (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+          capabilityMeta.expected, "oscar-sandbox.sh missing", "incorrect", 0,
+        );
+      }
+      return;
+    }
+
+    if (beforeSnap.sandboxContainerCount > 0 || beforeSnap.sandboxVolumeCount > 0) {
+      await probe.sandboxStop();
+      beforeSnap = await probe.sandboxIsolationSnapshot();
+    }
+
+    this.reporter.outcome(
+      capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+      capabilityMeta.expected,
+      `present=true; preConfigSha=${beforeSnap.stateConfigSha256.slice(0, 12)}`,
+      "correct", 0,
+    );
+
+    const opPage = await this.browser.oscarPage();
+    const browserInstance = opPage.context().browser();
+    if (!browserInstance) {
+      await opPage.close();
+      throw new Error("Playwright browser instance unavailable for training-sandbox");
+    }
+
+    const sandboxPort = 8444;
+    const parsedOpUrl = new URL(this.config.oscarBaseUrl);
+    const sandboxBaseUrl = `https://${parsedOpUrl.hostname}:${sandboxPort}`;
+
+    try {
+      await this.check({
+        scenario: "training-sandbox",
+        category: "sandbox-launch",
+        action: "start isolated ephemeral oscar-sandbox stack on :8444",
+        target: `${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`,
+        expected: "oscar.sh sandbox start brings up gateway+oscar+postgres healthy while operational :443 stays sandboxMode=false",
+      }, async () => {
+        await probe.sandboxStart(sandboxPort, 15);
+        const opRes = await opPage.context().request.get(
+          this.viewerUrl("/sensorhub/oscar/sandbox/active"),
+          {headers: {Accept: "application/json"}},
+        );
+        const opBody = opRes.ok() ? (await opRes.json()) as {sandboxMode?: boolean} : {};
+        await opRes.dispose();
+        const passed = opBody.sandboxMode === false;
+        return {
+          passed,
+          observed: `sandboxStarted=true; operationalSandboxMode=${String(opBody.sandboxMode)}`,
+        };
+      });
+
+      const sbCtx = await browserInstance.newContext({
+        viewport: {width: 1920, height: 1080},
+        ignoreHTTPSErrors: true,
+        httpCredentials: {
+          username: this.config.oscarUsername,
+          password: this.config.oscarPassword,
+        },
+      });
+      const sbPage = await sbCtx.newPage();
+      try {
+        await sbPage.goto(`${sandboxBaseUrl}/`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
+        const loginUser = sbPage.getByLabel("Username");
+        if (await loginUser.isVisible({timeout: 4_000}).catch(() => false)) {
+          await loginUser.fill(this.config.oscarUsername);
+          await sbPage.getByLabel("Password").fill(this.config.oscarPassword);
+          await Promise.all([
+            sbPage.waitForURL((u) => !u.pathname.startsWith("/login"), {timeout: 25_000}),
+            sbPage.getByRole("button", {name: "Sign in", exact: true}).click(),
+          ]);
+        }
+
+        await this.check({
+          scenario: "training-sandbox",
+          category: "operator-academy-lab",
+          action: "verify Training Coach dock, archiveEnabled=false, DemoLane01 online, and live EML Code 9999 auto-verification",
+          target: `${sandboxBaseUrl}/event-log`,
+          expected: "sandboxMode=true, archiveEnabled=false, onlineLaneCount>=1, and injected norm_eml auto-verifies Lab 1.3",
+        }, async () => {
+          await sbPage.goto(`${sandboxBaseUrl}/event-log`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
+          await sbPage.getByTestId("navbar-sandbox-indicator").waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+          if (!(await sbPage.getByTestId("training-coach-dock").isVisible().catch(() => false))) {
+            await sbPage.getByTestId("navbar-training-coach-toggle").click();
+          }
+          await sbPage.getByTestId("training-coach-dock").waitFor({state: "visible", timeout: 10_000});
+          await sbPage.getByTestId("training-lab-chip-op-3").click();
+          await sbPage.getByTestId("training-inject-norm_eml").click();
+
+          let activeJson: {
+            sandboxMode?: boolean;
+            archiveEnabled?: boolean;
+            verification?: {onlineLaneCount?: number; emlCode9999Count?: number};
+          } = {};
+          const deadline = Date.now() + 20_000;
+          while (Date.now() < deadline) {
+            const r = await sbCtx.request.get(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`, {
+              headers: {Accept: "application/json"},
+            });
+            if (r.ok()) {
+              activeJson = await r.json();
+            }
+            await r.dispose();
+            if ((activeJson.verification?.emlCode9999Count ?? 0) >= 1) {
+              break;
+            }
+            await sbPage.waitForTimeout(1_000);
+          }
+
+          const passed =
+            activeJson.sandboxMode === true &&
+            activeJson.archiveEnabled === false &&
+            (activeJson.verification?.onlineLaneCount ?? 0) >= 1 &&
+            (activeJson.verification?.emlCode9999Count ?? 0) >= 1;
+          const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-operator-lab-failed");
+          return {
+            passed,
+            observed: `sandboxMode=${String(activeJson.sandboxMode)}; archiveEnabled=${String(activeJson.archiveEnabled)}; onlineLanes=${activeJson.verification?.onlineLaneCount ?? 0}; emlCode9999=${activeJson.verification?.emlCode9999Count ?? 0}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "training-sandbox",
+          category: "certificate-and-admin-split",
+          action: "verify watermarked PDF Completion Record export and Track 3 Split-Pane SensorHub Admin",
+          target: `${sandboxBaseUrl}/sensorhub/oscar/sandbox/certificate`,
+          expected: "certificate endpoint returns valid PDF >= 4 KiB and Track 3 opens /sensorhub/admin iframe",
+        }, async () => {
+          const certRes = await sbCtx.request.post(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/certificate`, {
+            headers: {
+              "X-Requested-With": "XMLHttpRequest",
+              "Content-Type": "application/json",
+            },
+            data: {
+              traineeName: "Regression Operator",
+              completedLabs: [
+                {trackId: "operator", labId: "1.3", title: "NORM (Code 9999)", status: "verified"},
+              ],
+            },
+          });
+          const certStatus = certRes.status();
+          const certBytes = certRes.ok() ? await certRes.body() : Buffer.alloc(0);
+          await certRes.dispose();
+          const pdfValid = certStatus === 200 && certBytes.length >= 4096 && certBytes.subarray(0, 5).toString("ascii") === "%PDF-";
+
+          await sbPage.getByTestId("training-track-btn-administrator").click();
+          const splitBtn = sbPage.getByTestId("training-toggle-split-admin");
+          await splitBtn.waitFor({state: "visible", timeout: 15_000});
+          await splitBtn.click();
+          await sbPage.getByTestId("sandbox-split-admin-shell").waitFor({state: "visible", timeout: 15_000});
+          const iframeVisible = await sbPage.getByTestId("sandbox-admin-iframe").isVisible();
+
+          const passed = pdfValid && iframeVisible;
+          const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-admin-split-failed");
+          return {
+            passed,
+            observed: `certStatus=${certStatus}; certBytes=${certBytes.length}; splitAdminIframe=${iframeVisible}`,
+            evidence,
+          };
+        });
+      } finally {
+        await sbCtx.close().catch(() => {});
+      }
+    } finally {
+      await probe.sandboxStop().catch((err) => this.reporter.error("training-sandbox", "sandbox-stop", err));
+      await opPage.close().catch(() => {});
+    }
+
+    await this.check({
+      scenario: "training-sandbox",
+      category: "zero-production-residue",
+      action: "verify sandbox stop flushes all sandbox containers/volumes and leaves zero operational DB, Parquet, or config.json residue",
+      target: "operational PostgreSQL + Parquet archive + config.json",
+      expected: "unchanged config.json SHA-256 and zero sandbox datastreams, observations, archive files, containers, or volumes",
+    }, async () => {
+      const afterSnap = await probe.sandboxIsolationSnapshot();
+      const passed =
+        afterSnap.stateConfigSha256 === beforeSnap.stateConfigSha256 &&
+        afterSnap.postgresSandboxDatastreamCount === 0 &&
+        afterSnap.postgresSandboxObsCount === 0 &&
+        afterSnap.archiveSandboxFileCount === 0 &&
+        afterSnap.sandboxContainerCount === 0 &&
+        afterSnap.sandboxVolumeCount === 0;
+      return {
+        passed,
+        observed: `configUnchanged=${afterSnap.stateConfigSha256 === beforeSnap.stateConfigSha256}; sbDs=${afterSnap.postgresSandboxDatastreamCount}; sbObs=${afterSnap.postgresSandboxObsCount}; sbArchive=${afterSnap.archiveSandboxFileCount}; sbContainers=${afterSnap.sandboxContainerCount}; sbVolumes=${afterSnap.sandboxVolumeCount}`,
+      };
+    });
   }
 }

@@ -118,6 +118,13 @@ source review before the suite can certify that version.
   embedded `.n42` extraction, plus live SMBv2/SMBv3 share indexing, 1-character fuzzy
   ISO 6346 OCR correlation, Event Log UFF UUID omnibox lookup, and zero-download
   `.uffref.json` adjudication staging when `CARGO_UFF_SMB_SHARE` is configured
+- isolated ephemeral Hands-On Training Sandbox & Guided Academy verification
+  (`training-sandbox`, gated by `TRAINING_SANDBOX_WORKFLOW`), starting `oscar-sandbox`
+  on `:8444` via `oscar.sh sandbox start`, proving operational `:443` remains
+  `sandboxMode=false`, verifying `archiveEnabled=false`, live loopback Rapiscan + RTSP
+  + EML (`Code 9999`) auto-verification, watermarked PDF Completion Record export,
+  Track 3 Split-Pane `/sensorhub/admin`, and byte-exact zero operational database,
+  Parquet archive, and `config.json` residue after `oscar.sh sandbox stop`
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.

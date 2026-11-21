@@ -166,5 +166,15 @@ Tier-1 UFF UUID omnibox lookup, `CargoUffSmbPickerDialog` 1-character fuzzy ISO
 6346 OCR correlation, and zero-download `.uffref.json` adjudication staging,
 restoring `uff.enabled=false` in `finally`.
 
+`training-sandbox` is capability-gated with `TRAINING_SANDBOX_WORKFLOW` (`auto`
+by default). On OSCAR 3.11.3+ deployments with SSH storage-probe access
+configured, it snapshots operational `config.json` SHA-256 and operational
+PostgreSQL/Parquet state, starts the isolated `oscar-sandbox` stack on `:8444`,
+confirms operational `:443` stays `sandboxMode=false`, exercises the Training
+Coach (`archiveEnabled=false`, `DemoLane01` live EML `Code 9999` auto-verify,
+watermarked PDF Completion Record export, and Track 3 Split-Pane
+`/sensorhub/admin`), stops/flushes the sandbox in `finally`, and proves zero
+sandbox containers, volumes, datastreams, observations, or Parquet files remain.
+
 `reserved-lane-setup` and `reserved-lane-cleanup` are mandatory harness phases
 for every full-profile run and cannot be suppressed by a scenario filter.
