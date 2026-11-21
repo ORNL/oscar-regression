@@ -111,6 +111,13 @@ source review before the suite can certify that version.
   cross-pass Linked Adjudication, and consolidated `VEHICLE_INCIDENT` PDF/JSON/XLSX reporting
 - external EML VM-250 `.jar` plugin upload, per-lane EML enablement, and automated
   `Code 9999: EML Non-Threat` disposition verification (`eml-auto-adjudication`)
+- optional WCO Cargo Non-Intrusive Inspection (`UFF 2.0` & `UFF 3.0.0`) integration
+  (`cargo-uff`), including shipped zero-clutter default (`uff.enabled=false`),
+  4 pure-synthetic `CC0-1.0` sample `.uff` packages in [`uff-samples/`](uff-samples/README.md)
+  for out-of-the-box local 16-bit `uint16` radiograph/HEMD/RPM-strip inspection and
+  embedded `.n42` extraction, plus live SMBv2/SMBv3 share indexing, 1-character fuzzy
+  ISO 6346 OCR correlation, Event Log UFF UUID omnibox lookup, and zero-download
+  `.uffref.json` adjudication staging when `CARGO_UFF_SMB_SHARE` is configured
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.

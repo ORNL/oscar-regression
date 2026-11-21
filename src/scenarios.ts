@@ -393,7 +393,7 @@ export class RegressionScenarios {
   private fullRunCanSelfSeedRetainedMedia(): boolean {
     return ["full", "3.9.2-release", "3.11.0-release"].includes(this.config.profile) &&
       this.selected("storage-lifecycle") &&
-      ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr"].some(scenario => this.selected(scenario));
+      ["rpm-alarms", "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "cargo-uff"].some(scenario => this.selected(scenario));
   }
 
   private async check<T>(metadata: CheckMetadata, probe: () => Promise<ProbeResult<T>>): Promise<T | undefined> {
@@ -653,6 +653,7 @@ export class RegressionScenarios {
         await this.scenario("adjudication", () => this.adjudicationAndAlarmTransfer());
         await this.scenario("eml-auto-adjudication", () => this.emlAutoAdjudication());
         await this.scenario("vehicle-ocr", () => this.vehicleOcr());
+        await this.scenario("cargo-uff", () => this.cargoUffAdjudication());
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([
           {reportType: "ADJUDICATION"},
@@ -9402,7 +9403,7 @@ export class RegressionScenarios {
         category: "viewer",
         action: "render /extensions accessible tabs and starter templates",
         target: "/extensions",
-        expected: "visible Pluggable Runtime Extensions & Regional Packs heading, ARIA tablist across 6 domains, and downloadable OCR starter template ZIP",
+        expected: "visible Pluggable Runtime Extensions & Regional Packs heading, ARIA tablist across 7 domains (including Cargo NII WCO UFF disabled by default), and downloadable OCR starter template ZIP",
       }, async () => {
         const status = await this.goto(page, "/extensions");
         const headingVisible = await page
@@ -9412,16 +9413,17 @@ export class RegressionScenarios {
           .then(() => true)
           .catch(() => false);
         const tabCount = await page.locator('[role="tablist"] [role="tab"]').count();
+        const uffTabVisible = await page.getByTestId("ext-tab-uff").isVisible().catch(() => false);
         const tplRes = await page.context().request.get(
           this.viewerUrl("/sensorhub/oscar/extensions/templates/ocr-pack.zip"),
         );
         const tplBytes = tplRes.ok() ? (await tplRes.body()).length : 0;
         await tplRes.dispose();
-        const passed = status >= 200 && status < 400 && headingVisible && tabCount === 6 && tplBytes > 100;
+        const passed = status >= 200 && status < 400 && headingVisible && tabCount === 7 && uffTabVisible && tplBytes > 100;
         const evidence = passed ? "" : await this.screenshotOnFailure(page, "runtime-extensions-ui-failed");
         return {
           passed,
-          observed: `HTTP ${status}; heading=${headingVisible}; tabs=${tabCount}; templateZipBytes=${tplBytes}`,
+          observed: `HTTP ${status}; heading=${headingVisible}; tabs=${tabCount}; uffTab=${uffTabVisible}; templateZipBytes=${tplBytes}`,
           evidence,
         };
       });
@@ -9761,6 +9763,364 @@ export class RegressionScenarios {
       return {
         passed,
         observed: `HTTP ${code}; ocr=${String(st.ocr?.customActive)}; maps=${String(st.maps?.customActive)}; spec=${String(st.spectroscopy?.customActive)}; trust=${String(st.trustedCerts?.customActive)}; policy=${String(st.policyPacks?.customActive)}`,
+      };
+    });
+
+    await page.close();
+  }
+
+  private async cargoUffAdjudication(): Promise<void> {
+    const capabilityMeta: CheckMetadata = {
+      scenario: "cargo-uff",
+      category: "cargo-uff",
+      action: "detect Cargo NII (WCO UFF 2.0 & 3.0.0) runtime capability",
+      target: "/sensorhub/oscar/extensions/uff/active",
+      expected: "OSCAR 3.11.2+ Cargo UFF runtime endpoint responds HTTP 200",
+    };
+    if (this.config.cargoUffWorkflow === "disabled") {
+      this.skip(capabilityMeta, "CARGO_UFF_WORKFLOW=disabled");
+      return;
+    }
+
+    const page = await this.browser.oscarPage();
+    const extHeaders = {"X-Requested-With": "OSCAR-Viewer"};
+    let preUffEnabled = false;
+
+    try {
+      const activeRes = await page.context().request.get(
+        this.viewerUrl("/sensorhub/oscar/extensions/uff/active"),
+        {headers: {Accept: "application/json"}},
+      );
+      const activeStatus = activeRes.status();
+      const activeBody = activeRes.ok() ? (await activeRes.json()) as {enabled?: boolean} : {};
+      await activeRes.dispose();
+
+      if (activeStatus === 404) {
+        if (this.config.cargoUffWorkflow === "auto") {
+          this.skip(capabilityMeta, "Cargo UFF runtime endpoint is absent on pre-3.11.2 build (auto)");
+        } else {
+          this.reporter.outcome(
+            capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+            capabilityMeta.expected, `HTTP ${activeStatus}`, "incorrect", 0,
+          );
+        }
+        return;
+      }
+      this.reporter.outcome(
+        capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+        capabilityMeta.expected, `HTTP ${activeStatus} (enabled=${String(activeBody.enabled)})`,
+        activeStatus === 200 ? "correct" : "incorrect", 0,
+      );
+      if (activeStatus !== 200) return;
+      preUffEnabled = Boolean(activeBody.enabled);
+
+      if (preUffEnabled) {
+        await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/uff/action"), {
+          headers: {...extHeaders, "Content-Type": "application/json"},
+          data: {action: "reset"},
+        }).then((r) => r.dispose()).catch(() => {});
+      }
+
+      // Trigger a real 1s gamma alarm on the reserved test lane so Cargo UFF inspection & adjudication
+      // operate on a fresh, deterministic occupancy with real gamma/neutron telemetry.
+      if (this.originalRpmConfig) {
+        await this.emulator.replaceConfig(
+          this.config.testRpmId,
+          this.emulator.shortAlarmConfig(this.originalRpmConfig, 3),
+        );
+        await this.waitHealthRpmConnection(page, "online", 60_000);
+      }
+      const trigger = await this.triggerAlarm("gamma", "cargo-uff");
+      if (!trigger) throw new Error("Cargo UFF gamma alarm trigger returned no occupancy identity");
+      const alarmRow = await this.findAlarmRow(page, /Gamma/i, trigger);
+      const eventId = await this.resolveAlarmEventUuid(
+        page,
+        alarmRow,
+        "gamma",
+        trigger.occupancyCount,
+        "cargo-uff",
+      );
+      if (!eventId) throw new Error("Failed to resolve occupancy UUID for Cargo UFF gamma alarm");
+      await this.captureAlarmMedia(page, eventId, "gamma", trigger.occupancyCount, "cargo-uff");
+
+      // 1. Verify shipped disabled default: zero UI clutter on /event-details and bounded /event-log latency
+      await this.check({
+        scenario: "cargo-uff",
+        category: "zero-clutter",
+        action: "verify zero permanent UI clutter and fast Event Log load when Cargo UFF is disabled",
+        target: `/event-details?eventId=${eventId}`,
+        expected: `Event Log first row <= ${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}ms; Browse Cargo Share button and correlated UFF banner absent when disabled; Upload Files input attached`,
+      }, async () => {
+        const t0 = Date.now();
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.uiTimeoutMs});
+        const eventLogLoadMs = Date.now() - t0;
+
+        await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}`);
+        await page.getByTestId("adjudication-file-input").waitFor({state: "attached", timeout: this.config.uiTimeoutMs});
+        await sleep(350);
+        const pickerCount = await page.getByTestId("open-cargo-uff-picker-btn").count();
+        const bannerCount = await page.getByTestId("correlated-cargo-uff-banner").count();
+        const fileInputCount = await page.getByTestId("adjudication-file-input").count();
+        const passed = eventLogLoadMs <= EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS &&
+          pickerCount === 0 && bannerCount === 0 && fileInputCount === 1;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-zero-clutter-failed");
+        return {
+          passed,
+          observed: `eventLogLoadMs=${eventLogLoadMs}; pickerCount=${pickerCount}; bannerCount=${bannerCount}; fileInputCount=${fileInputCount}`,
+          evidence,
+        };
+      });
+
+      // 2. Upload bundled CC0-1.0 UFF 3.0.0 High-Z anomaly package from uff-samples/ and exercise 16-bit inspector
+      const bundledSuspectUff = join(
+        this.config.cargoUffSamplesDirectory,
+        "04-uff3-highz-shielded-anomaly-scfu8572724.uff",
+      );
+      await this.check({
+        scenario: "cargo-uff",
+        category: "local-uff",
+        action: "upload bundled CC0-1.0 UFF 3.0.0 package, auto-extract embedded .n42, and inspect 16-bit radiograph + HEMD + RPM alignment",
+        target: basename(bundledSuspectUff),
+        expected: "16-bit uint16 canvas decodes (2048x600), High-Z annotation box and RPM alignment strip render, W/L invert updates WebGL2/Canvas pixels, and embedded .n42 is staged",
+      }, async () => {
+        await page.getByTestId("adjudication-file-input").setInputFiles(bundledSuspectUff);
+        const inspectBtn = page.getByTestId("inspect-uploaded-uff-0");
+        await inspectBtn.waitFor({timeout: this.config.uiTimeoutMs});
+        const pageTextAfterUpload = await poll(
+          () => page.locator("body").innerText(),
+          (txt) => /\.n42/i.test(txt),
+          {timeoutMs: 15_000, intervalMs: 250, description: "auto-extracted .n42 attachment from uploaded .uff"},
+        );
+        const hasExtractedN42 = /\.n42/i.test(pageTextAfterUpload);
+
+        await inspectBtn.click();
+        await page.getByTestId("cargo-uff-viewer-dialog").waitFor({timeout: this.config.uiTimeoutMs});
+        const canvas = page.getByTestId("uff-16bit-xray-canvas");
+        await canvas.waitFor({timeout: this.config.uiTimeoutMs});
+        const dims = await poll(
+          () => canvas.evaluate((el) => {
+            const c = el as HTMLCanvasElement;
+            return {w: c.width, h: c.height, png: c.width > 0 && c.height > 0 ? c.toDataURL("image/png") : ""};
+          }),
+          (d) => d.w >= 2048 && d.h >= 600 && d.png.length > 1000,
+          {timeoutMs: 20_000, intervalMs: 250, description: "decoded 16-bit uint16 radiograph canvas"},
+        );
+
+        const annotVisible = await page.getByTestId("uff-annotation-box-0").isVisible().catch(() => false);
+        const rpmStripVisible = await poll(
+          () => page.getByTestId("uff-rpm-alignment-strip").count(),
+          (c) => c > 0,
+          {timeoutMs: 10_000, intervalMs: 250, description: "longitudinal RPM alignment strip"},
+        ).then((c) => c > 0).catch(() => false);
+
+        await page.getByTestId("uff-toggle-invert").click();
+        const invertedPng = await poll(
+          () => canvas.evaluate((el) => (el as HTMLCanvasElement).toDataURL("image/png")),
+          (png) => png.length > 1000 && png !== dims.png,
+          {timeoutMs: 8_000, intervalMs: 150, description: "16-bit LUT invert recomputation"},
+        );
+
+        await page.getByTestId("cargo-uff-viewer-close").click();
+        await page.getByTestId("cargo-uff-viewer-dialog").waitFor({state: "hidden", timeout: 10_000});
+
+        const passed = hasExtractedN42 && dims.w === 2048 && dims.h === 600 &&
+          annotVisible && rpmStripVisible && invertedPng !== dims.png;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-local-inspector-failed");
+        return {
+          passed,
+          observed: `n42=${hasExtractedN42}; canvas=${dims.w}x${dims.h}; annot=${annotVisible}; rpmStrip=${rpmStripVisible}; lutChanged=${invertedPng !== dims.png}`,
+          evidence,
+        };
+      });
+
+      // 3. Live SMBv2/SMBv3 Commercial Operator Workflow (when CARGO_UFF_SMB_SHARE is configured in local .env)
+      if (this.config.cargoUffSmbShare) {
+        await this.check({
+          scenario: "cargo-uff",
+          category: "smb-share",
+          action: "connect SMBv2/SMBv3 Cargo UFF share in Runtime Extensions, verify secret redaction, and index .uff archives",
+          target: "/extensions",
+          expected: "Test Connection and Save & Apply succeed with indexedCount >= 1 and password redacted from /extensions/status",
+        }, async () => {
+          await this.goto(page, "/extensions");
+          const uffTab = page.getByTestId("ext-tab-uff");
+          await uffTab.waitFor({timeout: this.config.uiTimeoutMs});
+          await uffTab.click();
+
+          const enabledInput = page.getByTestId("uff-ext-enabled-checkbox").locator('input[type="checkbox"]');
+          if (!(await enabledInput.isChecked())) {
+            await page.getByTestId("uff-ext-enabled-checkbox").click();
+          }
+          await page.getByTestId("uff-ext-share-url").fill(this.config.cargoUffSmbShare ?? "");
+          await page.getByTestId("uff-ext-subpath").fill(this.config.cargoUffSmbSubPath ?? "");
+          await page.getByTestId("uff-ext-domain").fill(this.config.cargoUffSmbDomain ?? "WORKGROUP");
+          await page.getByTestId("uff-ext-username").fill(this.config.cargoUffSmbUsername ?? "");
+          if (this.config.cargoUffSmbPassword) {
+            await page.getByTestId("uff-ext-password").fill(this.config.cargoUffSmbPassword);
+          }
+
+          await page.getByTestId("uff-ext-test-btn").click();
+          await page.getByTestId("uff-ext-test-result").waitFor({timeout: 25_000});
+
+          await page.getByTestId("uff-ext-save-btn").click();
+          await page.getByTestId("uff-ext-active-summary").waitFor({timeout: 30_000});
+          const indexedCount = await poll(
+            async () => Number((await page.getByTestId("uff-ext-indexed-count").innerText().catch(() => "0")).trim()),
+            (n) => Number.isFinite(n) && n >= 1,
+            {timeoutMs: 25_000, intervalMs: 250, description: "indexed SMB Cargo UFF count >= 1"},
+          );
+
+          const stRes = await page.context().request.get(
+            this.viewerUrl("/sensorhub/oscar/extensions/status"),
+            {headers: {Accept: "application/json"}},
+          );
+          const stText = await stRes.text();
+          const stJson = stRes.ok() ? JSON.parse(stText) as {uff?: Record<string, unknown>} : {};
+          await stRes.dispose();
+          const secretRedacted = !("password" in (stJson.uff ?? {})) &&
+            (!this.config.cargoUffSmbPassword || !stText.includes(this.config.cargoUffSmbPassword));
+
+          const passed = indexedCount >= 1 && secretRedacted;
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-smb-connect-failed");
+          return {
+            passed,
+            observed: `indexedCount=${indexedCount}; secretRedacted=${secretRedacted}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "cargo-uff",
+          category: "event-log-omnibox",
+          action: "open sparse unlabelled UFF 2.0 package directly from Event Log omnibox by UFF UUID",
+          target: "/event-log",
+          expected: "pasting Tier-1 UFF UUID surfaces Open Cargo X-Ray match chip and opens CargoUffViewerDialog with UFF 2.0 radiograph",
+        }, async () => {
+          await this.goto(page, "/event-log");
+          const vInput = page.getByTestId("vehicle-id-search-input");
+          await vInput.waitFor({timeout: this.config.uiTimeoutMs});
+          await vInput.fill("3889134c-dd1f-4d03-9399-0ca25f6f01b8");
+          await page.getByTestId("vehicle-id-search-submit").click();
+          const openUffBtn = page.getByTestId("event-log-open-uff-btn");
+          const matchChipVisible = await openUffBtn.waitFor({timeout: 15_000}).then(() => true).catch(() => false);
+          if (matchChipVisible) {
+            await openUffBtn.click();
+          }
+          const dialog = page.getByTestId("cargo-uff-viewer-dialog");
+          const opened = matchChipVisible && await dialog.waitFor({timeout: 20_000}).then(() => true).catch(() => false);
+          const verText = opened
+            ? await page.getByTestId("uff-viewer-version-chip").innerText().catch(() => "")
+            : "";
+          if (opened) {
+            await page.getByTestId("cargo-uff-viewer-close").click();
+            await dialog.waitFor({state: "hidden", timeout: 10_000});
+          }
+          const passed = opened && /UFF\s*2/i.test(verText);
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-omnibox-failed");
+          return {
+            passed,
+            observed: `matchChip=${matchChipVisible}; dialogOpened=${opened}; versionChip=${verText}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "cargo-uff",
+          category: "smb-adjudication",
+          action: "browse Cargo SMB share with 1-char fuzzy OCR matching and submit zero-download .uffref.json adjudication",
+          target: `/event-details?eventId=${eventId}`,
+          expected: "CargoUffSmbPickerDialog finds exact + 1-Char OCR Match for EGHU3972694, stages .uffref.json without full archive copy, and records Code 9 adjudication",
+        }, async () => {
+          await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId)}`);
+          const pickerBtn = page.getByTestId("open-cargo-uff-picker-btn");
+          await pickerBtn.waitFor({timeout: this.config.uiTimeoutMs});
+          await pickerBtn.click();
+
+          const picker = page.getByTestId("cargo-uff-smb-picker-dialog");
+          await picker.waitFor({timeout: this.config.uiTimeoutMs});
+          await page.getByTestId("uff-smb-picker-window-select").click();
+          await page.getByRole("option", {name: /All Indexed Scans/i}).first().click();
+
+          await page.getByTestId("uff-smb-picker-search-input").fill("EGHU3972694");
+          await page.getByTestId("uff-smb-picker-submit").click();
+          const resultsText = await poll(
+            () => page.getByTestId("uff-smb-picker-results").innerText().catch(() => ""),
+            (txt) => txt.includes("EGHU3972G94") && /1-Char OCR Match/i.test(txt),
+            {timeoutMs: 15_000, intervalMs: 250, description: "1-Char OCR fuzzy match EGHU3972G94"},
+          );
+          const fuzzyVerified = resultsText.includes("EGHU3972G94");
+
+          await page.getByTestId("uff-smb-picker-search-input").fill("dfb985c4-eb26-41ab-938b-ad2a1f5966d4");
+          await page.getByTestId("uff-smb-picker-submit").click();
+          const linkBtn = page.getByTestId("uff-smb-link-dfb985c4-eb26-41ab-938b-ad2a1f5966d4");
+          await linkBtn.waitFor({timeout: 15_000});
+          await linkBtn.click();
+          await picker.waitFor({state: "hidden", timeout: 20_000});
+
+          const uffNotes = `Cargo UFF SMB regression ${this.reporter.runId.slice(-10)}`;
+          await page.getByRole("textbox", {name: "Vehicle ID", exact: true}).fill("SCFU8572724");
+          await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
+          await this.selectMui(page, "Secondary Inspection", "NONE");
+          await page.getByLabel("Notes").fill(uffNotes);
+          await page.getByRole("button", {name: "Submit", exact: true}).click();
+          const confirm = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+          await confirm.waitFor({timeout: 15_000});
+          await confirm.getByRole("button", {name: /Confirm & Submit/i}).click();
+          await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+
+          await page.reload({waitUntil: "domcontentloaded"});
+          const reloadedBody = await poll(
+            () => page.locator("body").innerText(),
+            (txt) => txt.includes(uffNotes) && txt.includes(".uffref.json"),
+            {timeoutMs: 30_000, intervalMs: 500, description: "persisted .uffref.json adjudication pointer"},
+          );
+          const passed = fuzzyVerified && reloadedBody.includes(".uffref.json");
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "cargo-uff-smb-adjudication-failed");
+          return {
+            passed,
+            observed: `fuzzyVerified=${fuzzyVerified}; persistedUffRef=${reloadedBody.includes(".uffref.json")}`,
+            evidence,
+          };
+        });
+      }
+    } finally {
+      await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/uff/action"), {
+        headers: {...extHeaders, "Content-Type": "application/json"},
+        data: {action: "reset"},
+      }).then((r) => r.dispose()).catch(() => {});
+      if (this.originalRpmConfig) {
+        await this.emulator.replaceConfig(
+          this.config.testRpmId,
+          this.emulator.quietConfig(this.originalRpmConfig),
+        ).catch((err) => this.reporter.error("cargo-uff", "restore-quiet-config", err));
+      }
+    }
+
+    // 4. Verify post-reset zero-latency & zero-clutter restoration
+    await this.check({
+      scenario: "cargo-uff",
+      category: "post-reset-latency",
+      action: "verify Cargo UFF resets cleanly to disabled with zero Event Log latency degradation",
+      target: "/sensorhub/oscar/extensions/uff/active",
+      expected: `uff.enabled=false and Event Log first row <= ${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}ms`,
+    }, async () => {
+      const res = await page.context().request.get(
+        this.viewerUrl("/sensorhub/oscar/extensions/uff/active"),
+        {headers: {Accept: "application/json"}},
+      );
+      const body = res.ok() ? (await res.json()) as {enabled?: boolean} : {};
+      await res.dispose();
+
+      const t0 = Date.now();
+      await this.goto(page, "/event-log");
+      await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.uiTimeoutMs});
+      const postResetEventLogMs = Date.now() - t0;
+
+      const passed = body.enabled === false && postResetEventLogMs <= EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS;
+      return {
+        passed,
+        observed: `enabled=${String(body.enabled)}; postResetEventLogMs=${postResetEventLogMs}ms`,
       };
     });
 

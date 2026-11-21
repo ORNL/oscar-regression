@@ -1713,6 +1713,9 @@ case $action in
   platform)
     expected_release=3.11.0
     configured_release=$(env_value OSCAR_VERSION missing)
+    if [[ $configured_release =~ ^3\.11\.[0-9]+$ ]]; then
+      expected_release="$configured_release"
+    fi
     template_release=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }' .env.example)
     deployment_id=$(env_value OSCAR_DEPLOYMENT_ID missing)
     valid_deployment_id "$deployment_id" || fail 'OSCAR_DEPLOYMENT_ID is missing or is not a lowercase UUID.'
@@ -2124,7 +2127,8 @@ case $action in
       marker_checksums=$(printf '%s\n' "$marker_text" | awk -F= '$1=="data_checksums" {print substr($0,index($0,"=")+1); exit}')
       marker_initialized=$(printf '%s\n' "$marker_text" | awk -F= '$1=="initialized_at" {print substr($0,index($0,"=")+1); exit}')
       if [[ $marker_lines == 4 && $marker_format == oscar-storage-profile &&
-            $marker_version == "$expected_release" && $marker_checksums == on &&
+            ( $marker_version == "$expected_release" || ( $expected_release =~ ^3\.11\.[0-9]+$ && $marker_version =~ ^3\.11\.[0-9]+$ ) ) &&
+            $marker_checksums == on &&
             $marker_initialized =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
         marker_exact=true
       fi
@@ -4115,7 +4119,7 @@ EOF
     epoch_created=$(awk -F'"' '/"createdAt"/ {print $4; exit}' "$root/epoch.json")
     valid_uuid "$epoch_id" || fail 'Backup epoch UUID is invalid.'
     [[ $epoch_backup == "$backup" && $epoch_format == oscar-backup-epoch && $epoch_version == 2 &&
-          $epoch_release == 3.11.0 && $epoch_state == CREATED &&
+          $epoch_release =~ ^3\.11\.[0-9]+$ && $epoch_state == CREATED &&
           $epoch_created =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] ||
       fail 'Backup epoch identity, format, state, or release is invalid.'
     [[ ! -e $root/wal-archive.tar.gz && ! -L $root/wal-archive.tar.gz ]] ||
@@ -4443,9 +4447,9 @@ SQL
     [[ $run =~ ^[A-Za-z0-9_]{1,96}$ ]] || fail 'Restore-drill run ID must be SQL-identifier safe.'
     [[ $confirmation == "$run:DESTRUCTIVE-RESTORE" ]] ||
       fail 'Restore drill is destructive and requires the exact per-run confirmation token.'
-    [[ $(env_value OSCAR_VERSION missing) == 3.11.0 &&
+    [[ $(env_value OSCAR_VERSION missing) =~ ^3\.11\.[0-9]+$ &&
        $(env_value OSCAR_BACKUP_MODE disabled) == single ]] ||
-      fail 'Restore drill requires OSCAR 3.11.0 with OSCAR_BACKUP_MODE=single.'
+      fail 'Restore drill requires OSCAR 3.11.x with OSCAR_BACKUP_MODE=single.'
     for expected in "$expected_archive" "$expected_backup"; do
       [[ $expected == /* && $expected != / && $expected =~ ^/[A-Za-z0-9._/-]+$ ]] ||
         fail 'Restore drill requires two canonical acknowledged storage paths.'

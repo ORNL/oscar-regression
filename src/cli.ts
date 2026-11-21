@@ -106,6 +106,8 @@ async function main(): Promise<number> {
     emlPluginConfigured: Boolean(config.emlPluginPath),
     spectroscopicWorkflow: config.spectroscopicWorkflow,
     vehicleOcrWorkflow: config.vehicleOcrWorkflow,
+    cargoUffWorkflow: config.cargoUffWorkflow,
+    cargoUffSmbConfigured: Boolean(config.cargoUffSmbShare),
     storageWorkflow: config.storageWorkflow,
     storageExpectedRelease: config.storageExpectedRelease,
     storageBackupWorkflow: config.storageBackupWorkflow,
