@@ -1,6 +1,10 @@
+import {execFile} from "node:child_process";
 import {readFileSync, writeFileSync} from "node:fs";
 import {createHash, randomUUID} from "node:crypto";
 import {basename, join} from "node:path";
+import {promisify} from "node:util";
+
+const execFileAsync = promisify(execFile);
 import type {Locator, Page, Request, Response} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
@@ -6783,17 +6787,58 @@ export class RegressionScenarios {
     const quiet = this.emulator.quietConfig(this.originalRpmConfig);
     const page = await this.browser.oscarPage();
     let ocrEnabledByScenario = false;
+    let restoreInitialReservedOcrEnabled = false;
 
-    const findLaneSystems = async (): Promise<{
+    const readConfiguredLiveOcrLaneNames = async (): Promise<Set<string> | null> => {
+      const sshTarget = this.config.oscarSshTarget?.trim() ?? "";
+      if (!sshTarget || !/^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9A-Fa-f:]+\])$/.test(sshTarget)) {
+        return null;
+      }
+      try {
+        const sshArgs = [
+          "-o", "BatchMode=yes",
+          "-o", "StrictHostKeyChecking=yes",
+          "-o", "ConnectTimeout=10",
+          ...(this.config.sshIdentityFile
+            ? ["-o", "IdentitiesOnly=yes", "-i", this.config.sshIdentityFile]
+            : []),
+          sshTarget,
+          "docker exec oscar-oscar-1 sh -c 'cat /var/lib/oscar/config.json 2>/dev/null || cat /var/lib/oscar/config/config.json'",
+        ];
+        const {stdout} = await execFileAsync("ssh", sshArgs, {maxBuffer: 16 * 1024 * 1024, timeout: 15_000});
+        const parsed = JSON.parse(stdout) as Array<{
+          moduleClass?: unknown;
+          name?: unknown;
+          ocrConfig?: {enabled?: unknown};
+          configuration?: {ocrConfig?: {enabled?: unknown}};
+        }>;
+        const enabledNames = new Set<string>();
+        for (const mod of Array.isArray(parsed) ? parsed : []) {
+          if (!String(mod?.moduleClass ?? "").includes("LaneSystem")) continue;
+          const isEnabled = Boolean(mod?.ocrConfig?.enabled ?? mod?.configuration?.ocrConfig?.enabled);
+          const lowerName = String(mod?.name ?? "").trim().toLowerCase();
+          if (isEnabled && lowerName) {
+            enabledNames.add(lowerName);
+            enabledNames.add(lowerName.replace(/^lane(\d+)$/, "lane-$1"));
+          }
+        }
+        return enabledNames;
+      } catch {
+        return null;
+      }
+    };
+
+    const findLaneSystems = async (liveOcrLaneNames: Set<string> | null): Promise<{
       reserved: {systemId: string; uid: string} | null;
       untouchedBaseline: {systemId: string; uid: string} | null;
+      liveOcrSystemIds: Set<string>;
     }> => {
       const res = await page.context().request.get(
         this.viewerUrl("/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500"),
         {headers: {Accept: "application/geo+json, application/json"}},
       );
       try {
-        if (!res.ok()) return {reserved: null, untouchedBaseline: null};
+        if (!res.ok()) return {reserved: null, untouchedBaseline: null, liveOcrSystemIds: new Set()};
         const json = await res.json() as {
           items?: Array<{
             id?: unknown;
@@ -6803,6 +6848,7 @@ export class RegressionScenarios {
         const expectedLower = this.config.testLaneLabel.toLowerCase();
         let reserved: {systemId: string; uid: string} | null = null;
         let untouchedBaseline: {systemId: string; uid: string} | null = null;
+        const liveOcrSystemIds = new Set<string>();
         for (const item of json.items ?? []) {
           const id = String(item.id ?? "").trim();
           const uid = String(item.properties?.uid ?? "").trim();
@@ -6810,13 +6856,20 @@ export class RegressionScenarios {
           if (!id || !uid.includes(":lane:")) continue;
           const lowerName = name.toLowerCase();
           const lowerUid = uid.toLowerCase();
+          const uidTail = lowerUid.split(":").pop() ?? "";
+          const isLiveOcr = liveOcrLaneNames
+            ? (liveOcrLaneNames.has(lowerName) || liveOcrLaneNames.has(uidTail))
+            : /:lane-4[1-9]$/i.test(lowerUid);
+          if (isLiveOcr) {
+            liveOcrSystemIds.add(id);
+          }
           if (lowerName === expectedLower || lowerUid.endsWith(`:${expectedLower}`)) {
             reserved = {systemId: id, uid};
-          } else if (!untouchedBaseline && (lowerName === "lane01" || lowerUid.endsWith(":lane-01"))) {
+          } else if (!untouchedBaseline && !isLiveOcr && (liveOcrLaneNames ? true : (lowerName === "lane01" || lowerUid.endsWith(":lane-01")))) {
             untouchedBaseline = {systemId: id, uid};
           }
         }
-        return {reserved, untouchedBaseline};
+        return {reserved, untouchedBaseline, liveOcrSystemIds};
       } finally {
         await res.dispose();
       }
@@ -7020,7 +7073,8 @@ export class RegressionScenarios {
     let laneSystem: {systemId: string; uid: string} | null = null;
     try {
       await this.ensureAlarmMediaBaseline("vehicle-ocr");
-      const discoveredLanes = await findLaneSystems();
+      const liveOcrLaneNames = await readConfiguredLiveOcrLaneNames();
+      const discoveredLanes = await findLaneSystems(liveOcrLaneNames);
       laneSystem = discoveredLanes.reserved;
       if (!laneSystem) {
         throw new Error(`Unable to resolve ConSys system ID for ${this.config.testLaneLabel}`);
@@ -7029,9 +7083,26 @@ export class RegressionScenarios {
 
       // Untouched lanes never register a vehicleOcr datastream; previously tested lanes retain historical
       // datastream metadata for archived observations while publishing zero new observations when disabled.
-      const untouchedLaneOcrStreams = discoveredLanes.untouchedBaseline
-        ? (await listLaneOcrDatastreams(discoveredLanes.untouchedBaseline.systemId, "latest")).length
-        : 0;
+      let untouchedLaneOcrStreams = 0;
+      if (discoveredLanes.untouchedBaseline) {
+        const baselineStreams = await listLaneOcrDatastreams(discoveredLanes.untouchedBaseline.systemId, "latest");
+        for (const bs of baselineStreams) {
+          const histRes = await page.context().request.get(
+            this.viewerUrl(`/sensorhub/api/datastreams/${encodeURIComponent(bs.id)}/observations?limit=1`),
+            {headers: {Accept: "application/om+json, application/json"}},
+          );
+          try {
+            if (histRes.ok()) {
+              const histJson = await histRes.json() as {items?: unknown[]};
+              if ((histJson.items ?? []).length === 0) {
+                untouchedLaneOcrStreams += 1;
+              }
+            }
+          } finally {
+            await histRes.dispose();
+          }
+        }
+      }
       const nonReservedOcrStreamIds: string[] = [];
       const allDsRes = await page.context().request.get(
         this.viewerUrl("/sensorhub/api/datastreams?validTime=latest&limit=2000"),
@@ -7053,9 +7124,10 @@ export class RegressionScenarios {
             const dsId = String(ds.id ?? "").trim();
             const sysId = String(ds["system@id"] ?? ds.system?.id ?? "").trim();
             const sysUid = String(ds["system@link"]?.uid ?? ds.system?.uid ?? "").trim();
-            // Container-transit lanes (lane-41..lane-49) may run continuous live OCR on background alarms;
-            // non-container lanes (lane-01..lane-40) stay disabled and must publish zero new OCR observations.
-            if (dsId && sysId && sysId !== targetLaneSystem.systemId && !/:lane-4[1-9]$/i.test(sysUid)) {
+            const isActiveBackgroundOcrLane = liveOcrLaneNames
+              ? discoveredLanes.liveOcrSystemIds.has(sysId)
+              : /:lane-4[1-9]$/i.test(sysUid);
+            if (dsId && sysId && sysId !== targetLaneSystem.systemId && !isActiveBackgroundOcrLane) {
               nonReservedOcrStreamIds.push(dsId);
             }
           }
@@ -7064,7 +7136,7 @@ export class RegressionScenarios {
         await allDsRes.dispose();
       }
 
-      const enableOutcome = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, true);
+      let enableOutcome = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, true);
       if (!enableOutcome.supported) {
         if (this.config.vehicleOcrWorkflow === "auto") {
           this.skip(adminMeta, "Vehicle OCR tab is not present on this build (auto detection)");
@@ -7076,6 +7148,13 @@ export class RegressionScenarios {
           );
         }
         return;
+      }
+      if (enableOutcome.initiallyChecked === true) {
+        // Host pre-enables Vehicle OCR on the reserved lane (e.g. 50-lane continuous OCR endurance topology):
+        // cycle false -> true to verify the full disable-to-enable transition and restore true on exit.
+        restoreInitialReservedOcrEnabled = true;
+        await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, false);
+        enableOutcome = await setLaneVehicleOcrEnabled(targetLaneSystem.systemId, true);
       }
       ocrEnabledByScenario = true;
 
@@ -7791,6 +7870,11 @@ export class RegressionScenarios {
       if (ocrEnabledByScenario && laneSystem) {
         await setLaneVehicleOcrEnabled(laneSystem.systemId, false).catch(error =>
           this.reporter.error("vehicle-ocr", "restore-lane-ocr-disabled", error));
+      }
+      if (restoreInitialReservedOcrEnabled && laneSystem) {
+        await setLaneVehicleOcrEnabled(laneSystem.systemId, true)
+          .then(() => this.waitHealthRpmConnection(page, "online", 60_000))
+          .catch(error => this.reporter.error("vehicle-ocr", "restore-initial-lane-ocr-enabled", error));
       }
       await this.emulator.replaceConfig(this.config.testRpmId, quiet).catch(error =>
         this.reporter.error("vehicle-ocr", "restore-quiet-config", error));
