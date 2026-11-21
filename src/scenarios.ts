@@ -7566,67 +7566,81 @@ export class RegressionScenarios {
             return fetchOcrForObsId(eventId2!, rescanWindowStartIso);
           };
 
-          let rescanObs = await pollOrRetriggerRescan(
-            c => c.idType === "container" &&
-              c.checksumValid &&
-              matchesExpectedContainer(c.normalizedValue),
-            `confirmation re-scan vehicleOcr (${expectedContainer})`,
-          );
-          const firstRescanBest = rescanObs.find(
-            c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
-          );
-          const firstRescanNorm = firstRescanBest
-            ? firstRescanBest.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase()
-            : "";
-
-          // If expectedContainer === "ANY" and a rotating multi-clip playlist crossed a container
-          // boundary between Pass #1 and Pass #2, adjudicate Pass #2 as the new base pass and
-          // trigger one confirmation pass inside the fresh ~90s container block.
-          if (expectedContainer === "ANY" && firstRescanNorm && firstRescanNorm !== canonicalExpected) {
-            await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
-            await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
-            const vInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
-            await poll(
-              async () => (await vInput.inputValue()).replace(/[^A-Z0-9]/gi, "").toUpperCase(),
-              val => val === firstRescanNorm,
-              {timeoutMs: 15_000, intervalMs: 250, description: `Vehicle ID auto-fill to equal ${firstRescanNorm}`},
-            );
-            await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
-            await this.selectMui(page, "Secondary Inspection", "NONE");
-            await page.getByLabel("Notes").fill(ocrNotes);
-            await page.getByRole("button", {name: "Submit", exact: true}).click();
-            const confirm2 = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
-            await confirm2.waitFor({timeout: this.config.uiTimeoutMs});
-            await confirm2.getByRole("button", {name: /Confirm & Submit/i}).click();
-            await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
-
-            basePassEventId = eventId2!;
-            canonicalExpected = firstRescanNorm;
-            this.lastRecognizedOcrContainer = canonicalExpected;
-
-            rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-            const trigger3 = await this.triggerAlarm("gamma", "vehicle-ocr");
-            if (!trigger3) throw new Error("Boundary-follow-up confirmation gamma alarm trigger returned no occupancy identity");
-            const alarmRow3 = await this.findAlarmRow(page, /Gamma/i, trigger3);
-            const eventId3 = await this.resolveAlarmEventUuid(
-              page,
-              alarmRow3,
-              "gamma",
-              trigger3.occupancyCount,
-              "vehicle-ocr",
-            );
-            if (!eventId3) throw new Error("Failed to resolve occupancy UUID for boundary-follow-up confirmation alarm");
-            await this.captureAlarmMedia(page, eventId3, "gamma", trigger3.occupancyCount, "vehicle-ocr");
-            eventId2 = eventId3;
-
-            rescanObs = await pollOrRetriggerRescan(
+          // Track adjudicated base passes by normalized ISO 6346 container ID across rotating multi-clip
+          // RTSP playlists so the first container seen twice yields an exact adjudicated Pass #1 + open Pass #2 pair.
+          const adjudicatedByContainer = new Map<string, string>([[canonicalExpected, basePassEventId]]);
+          let matchedRescanPair = false;
+          for (let playlistStep = 0; playlistStep < 6; playlistStep++) {
+            const rescanObs = await pollOrRetriggerRescan(
               c => c.idType === "container" &&
                 c.checksumValid &&
-                c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase() === canonicalExpected,
-              `confirmation re-scan vehicleOcr (${canonicalExpected})`,
+                matchesExpectedContainer(c.normalizedValue),
+              `confirmation re-scan vehicleOcr (${expectedContainer})`,
             );
-          } else if (expectedContainer !== "ANY" && firstRescanNorm !== canonicalExpected) {
-            throw new Error(`Confirmation re-scan recognized ${firstRescanNorm || "none"} instead of ${canonicalExpected}`);
+            const validRescanContainers = rescanObs.filter(
+              c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
+            );
+            const repeated = validRescanContainers.find(
+              c => adjudicatedByContainer.has(c.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase()),
+            );
+            if (repeated) {
+              const repeatedNorm = repeated.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase();
+              canonicalExpected = repeatedNorm;
+              basePassEventId = adjudicatedByContainer.get(repeatedNorm)!;
+              this.lastRecognizedOcrContainer = canonicalExpected;
+              matchedRescanPair = true;
+              break;
+            }
+            const candidateBest = validRescanContainers[0];
+            const candidateNorm = candidateBest
+              ? candidateBest.normalizedValue.replace(/[^A-Z0-9]/gi, "").toUpperCase()
+              : "";
+            if (expectedContainer !== "ANY") {
+              throw new Error(`Confirmation re-scan recognized ${candidateNorm || "none"} instead of ${canonicalExpected}`);
+            }
+            if (candidateNorm && playlistStep < 5) {
+              await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
+              await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+              const candChip = page.getByTestId(`ocr-chip-${candidateNorm}`);
+              if (await candChip.isVisible().catch(() => false)) {
+                await candChip.click().catch(() => {});
+              }
+              const vInput = page.getByRole("textbox", {name: "Vehicle ID", exact: true});
+              await poll(
+                async () => (await vInput.inputValue()).replace(/[^A-Z0-9]/gi, "").toUpperCase(),
+                val => val === candidateNorm,
+                {timeoutMs: 15_000, intervalMs: 250, description: `Vehicle ID auto-fill to equal ${candidateNorm}`},
+              );
+              await this.selectMui(page, "Adjudicate", "Code 9: Authorized Test, Maintenance, or Training Activity");
+              await this.selectMui(page, "Secondary Inspection", "NONE");
+              await page.getByLabel("Notes").fill(ocrNotes);
+              await page.getByRole("button", {name: "Submit", exact: true}).click();
+              const confirmNext = page.getByRole("dialog", {name: /Confirm Adjudication Submission/i});
+              await confirmNext.waitFor({timeout: this.config.uiTimeoutMs});
+              await confirmNext.getByRole("button", {name: /Confirm & Submit/i}).click();
+              await page.getByText(/Adjudication successful for Occupancy ID/i).waitFor({timeout: 60_000});
+              adjudicatedByContainer.set(candidateNorm, eventId2!);
+            }
+
+            if (playlistStep < 5) {
+              rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
+              const nextRescanTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+              if (!nextRescanTrigger) throw new Error("Playlist-follow-up confirmation gamma alarm trigger returned no occupancy identity");
+              const nextAlarmRow = await this.findAlarmRow(page, /Gamma/i, nextRescanTrigger);
+              const nextEventId = await this.resolveAlarmEventUuid(
+                page,
+                nextAlarmRow,
+                "gamma",
+                nextRescanTrigger.occupancyCount,
+                "vehicle-ocr",
+              );
+              if (!nextEventId) throw new Error("Failed to resolve occupancy UUID for playlist-follow-up confirmation alarm");
+              await this.captureAlarmMedia(page, nextEventId, "gamma", nextRescanTrigger.occupancyCount, "vehicle-ocr");
+              eventId2 = nextEventId;
+            }
+          }
+          if (!matchedRescanPair) {
+            throw new Error(`Did not observe a repeated checksum-valid container across confirmation re-scan passes (seen: ${[...adjudicatedByContainer.keys()].join(", ")})`);
           }
 
           const spacedQuery = `${canonicalExpected.slice(0, 4).toLowerCase()} ${canonicalExpected.slice(4, 10)}-${canonicalExpected.slice(10)}`;
@@ -7674,6 +7688,10 @@ export class RegressionScenarios {
 
           await this.goto(page, `/event-details?eventId=${encodeURIComponent(eventId2!)}`);
           await page.getByRole("heading", {name: "Event Details"}).waitFor({timeout: this.config.uiTimeoutMs});
+          const rescanChip = page.getByTestId(`ocr-chip-${canonicalExpected}`);
+          if (await rescanChip.waitFor({timeout: 15_000}).then(() => true).catch(() => false)) {
+            await rescanChip.click().catch(() => {});
+          }
           const banner = page.getByTestId("vehicle-related-passes-banner");
           await banner.waitFor({state: "visible", timeout: 25_000});
           await page.getByTestId("open-vehicle-pass-comparison").click();
