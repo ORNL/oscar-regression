@@ -80,7 +80,7 @@ export class StorageProbeClient {
       "active_release=$(docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project.working_dir\" }}' \"${containers[0]}\")",
       "active_config=$(docker inspect --format '{{ index .Config.Labels \"com.docker.compose.project.config_files\" }}' \"${containers[0]}\")",
       "test \"$active_release\" = \"$canonical\"",
-      "test \"$active_config\" = \"$canonical/compose.yaml\"",
+      "if [ \"$active_config\" = \"$canonical/compose.yaml,$canonical/compose.octelium.yaml\" ]; then test -f \"$canonical/compose.octelium.yaml\" && test ! -L \"$canonical/compose.octelium.yaml\"; else test \"$active_config\" = \"$canonical/compose.yaml\"; fi",
       "printf '%s\\n' \"$canonical\"",
     ].join("; ");
     const command = [
