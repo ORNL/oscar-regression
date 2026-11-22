@@ -176,5 +176,13 @@ watermarked PDF Completion Record export, and Track 3 Split-Pane
 `/sensorhub/admin`), stops/flushes the sandbox in `finally`, and proves zero
 sandbox containers, volumes, datastreams, observations, or Parquet files remain.
 
+`lane-webrelay` is capability-gated with `LANE_WEBRELAY_WORKFLOW` (`auto` by
+default). On OSCAR 3.11.4+ deployments, it starts an ephemeral runner HTTP/XML
+responder (`/stateFull.xml`), configures the reserved lane via `LaneWebRelayDialog`
+on Status of Health (`/health`), verifies `AUTO` arming (`R1=1, R2=1`), manual
+Gamma + Sound and Neutron Light pulses, `0,0,0,0` pass-through and re-arming,
+live RPM occupancy alarm pulse triggering, and exact configuration restoration
+in `finally`.
+
 `reserved-lane-setup` and `reserved-lane-cleanup` are mandatory harness phases
 for every full-profile run and cannot be suppressed by a scenario filter.
