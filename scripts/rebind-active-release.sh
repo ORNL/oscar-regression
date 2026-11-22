@@ -115,7 +115,9 @@ config_files=$(docker inspect --format '{{ index .Config.Labels "com.docker.comp
 canonical=$(realpath -e -- "$release")
 [[ $canonical == "$release" && -f $release/oscar.sh && ! -L $release/oscar.sh &&
    -f $release/compose.yaml && ! -L $release/compose.yaml &&
-   $config_files == "$release/compose.yaml" ]] || {
+   ( $config_files == "$release/compose.yaml" ||
+     ( $config_files == "$release/compose.yaml,$release/compose.octelium.yaml" &&
+       -f $release/compose.octelium.yaml && ! -L $release/compose.octelium.yaml ) ) ]] || {
   echo "The running container release binding is noncanonical or incomplete." >&2
   exit 66
 }
