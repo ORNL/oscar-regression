@@ -166,5 +166,23 @@ Tier-1 UFF UUID omnibox lookup, `CargoUffSmbPickerDialog` 1-character fuzzy ISO
 6346 OCR correlation, and zero-download `.uffref.json` adjudication staging,
 restoring `uff.enabled=false` in `finally`.
 
+`training-sandbox` is capability-gated with `TRAINING_SANDBOX_WORKFLOW` (`auto`
+by default). On OSCAR 3.11.3+ deployments with SSH storage-probe access
+configured, it snapshots operational `config.json` SHA-256 and operational
+PostgreSQL/Parquet state, starts the isolated `oscar-sandbox` stack on `:8444`,
+confirms operational `:443` stays `sandboxMode=false`, exercises the Training
+Coach (`archiveEnabled=false`, `DemoLane01` live EML `Code 9999` auto-verify,
+watermarked PDF Completion Record export, and Track 3 Split-Pane
+`/sensorhub/admin`), stops/flushes the sandbox in `finally`, and proves zero
+sandbox containers, volumes, datastreams, observations, or Parquet files remain.
+
+`lane-webrelay` is capability-gated with `LANE_WEBRELAY_WORKFLOW` (`auto` by
+default). On OSCAR 3.11.4+ deployments, it starts an ephemeral runner HTTP/XML
+responder (`/stateFull.xml`), configures the reserved lane via `LaneWebRelayDialog`
+on Status of Health (`/health`), verifies `AUTO` arming (`R1=1, R2=1`), manual
+Gamma + Sound and Neutron Light pulses, `0,0,0,0` pass-through and re-arming,
+live RPM occupancy alarm pulse triggering, and exact configuration restoration
+in `finally`.
+
 `reserved-lane-setup` and `reserved-lane-cleanup` are mandatory harness phases
 for every full-profile run and cannot be suppressed by a scenario filter.

@@ -1,6 +1,8 @@
 import {execFile} from "node:child_process";
+import {createSocket} from "node:dgram";
 import {readFileSync, writeFileSync} from "node:fs";
 import {createHash, randomUUID} from "node:crypto";
+import {createServer as createHttpServer, type IncomingMessage, type ServerResponse} from "node:http";
 import {basename, join} from "node:path";
 import {promisify} from "node:util";
 
@@ -658,6 +660,8 @@ export class RegressionScenarios {
         await this.scenario("eml-auto-adjudication", () => this.emlAutoAdjudication());
         await this.scenario("vehicle-ocr", () => this.vehicleOcr());
         await this.scenario("cargo-uff", () => this.cargoUffAdjudication());
+        await this.scenario("training-sandbox", () => this.trainingSandbox());
+        await this.scenario("lane-webrelay", () => this.laneWebRelay());
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([
           {reportType: "ADJUDICATION"},
@@ -10233,5 +10237,525 @@ export class RegressionScenarios {
     });
 
     await page.close();
+  }
+
+  private async trainingSandbox(): Promise<void> {
+    const capabilityMeta: CheckMetadata = {
+      scenario: "training-sandbox",
+      category: "training-sandbox",
+      action: "verify OSCAR 3.11.3+ ephemeral Hands-On Training Sandbox capability",
+      target: "oscar-sandbox.sh",
+      expected: "SSH storage probe resolves oscar-sandbox.sh on target host",
+    };
+    if (this.config.trainingSandboxWorkflow === "disabled") {
+      this.skip(capabilityMeta, "TRAINING_SANDBOX_WORKFLOW=disabled");
+      return;
+    }
+
+    const sshConfigured = Boolean(
+      this.config.oscarSshTarget && this.config.oscarReleaseDirectory && this.config.storageTargetAcknowledgement,
+    );
+    if (!sshConfigured) {
+      if (this.config.trainingSandboxWorkflow === "auto") {
+        this.skip(capabilityMeta, "SSH storage probe is not configured for training-sandbox (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+          capabilityMeta.expected, "SSH storage probe not configured", "incorrect", 0,
+        );
+      }
+      return;
+    }
+
+    const probe = this.alarmMediaProbe ?? new StorageProbeClient(this.config, this.reporter.runId);
+    let beforeSnap = await probe.sandboxIsolationSnapshot();
+    if (!beforeSnap.sandboxScriptPresent) {
+      if (this.config.trainingSandboxWorkflow === "auto") {
+        this.skip(capabilityMeta, "oscar-sandbox.sh is absent on pre-3.11.3 build (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+          capabilityMeta.expected, "oscar-sandbox.sh missing", "incorrect", 0,
+        );
+      }
+      return;
+    }
+
+    if (beforeSnap.sandboxContainerCount > 0 || beforeSnap.sandboxVolumeCount > 0) {
+      await probe.sandboxStop();
+      beforeSnap = await probe.sandboxIsolationSnapshot();
+    }
+
+    this.reporter.outcome(
+      capabilityMeta.scenario, capabilityMeta.category, capabilityMeta.action, capabilityMeta.target,
+      capabilityMeta.expected,
+      `present=true; preConfigSha=${beforeSnap.stateConfigSha256.slice(0, 12)}`,
+      "correct", 0,
+    );
+
+    const opPage = await this.browser.oscarPage();
+    const browserInstance = opPage.context().browser();
+    if (!browserInstance) {
+      await opPage.close();
+      throw new Error("Playwright browser instance unavailable for training-sandbox");
+    }
+
+    const sandboxPort = 8444;
+    const parsedOpUrl = new URL(this.config.oscarBaseUrl);
+    const sandboxBaseUrl = `https://${parsedOpUrl.hostname}:${sandboxPort}`;
+
+    try {
+      await this.check({
+        scenario: "training-sandbox",
+        category: "sandbox-launch",
+        action: "start isolated ephemeral oscar-sandbox stack on :8444",
+        target: `${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`,
+        expected: "oscar.sh sandbox start brings up gateway+oscar+postgres healthy while operational :443 stays sandboxMode=false",
+      }, async () => {
+        await probe.sandboxStart(sandboxPort, 15);
+        const opRes = await opPage.context().request.get(
+          this.viewerUrl("/sensorhub/oscar/sandbox/active"),
+          {headers: {Accept: "application/json"}},
+        );
+        const opBody = opRes.ok() ? (await opRes.json()) as {sandboxMode?: boolean} : {};
+        await opRes.dispose();
+        const passed = opBody.sandboxMode === false;
+        return {
+          passed,
+          observed: `sandboxStarted=true; operationalSandboxMode=${String(opBody.sandboxMode)}`,
+        };
+      });
+
+      const sbCtx = await browserInstance.newContext({
+        viewport: {width: 1920, height: 1080},
+        ignoreHTTPSErrors: true,
+        httpCredentials: {
+          username: this.config.oscarUsername,
+          password: this.config.oscarPassword,
+        },
+      });
+      const sbPage = await sbCtx.newPage();
+      try {
+        await sbPage.goto(`${sandboxBaseUrl}/`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
+        const loginUser = sbPage.getByLabel("Username");
+        if (await loginUser.isVisible({timeout: 4_000}).catch(() => false)) {
+          await loginUser.fill(this.config.oscarUsername);
+          await sbPage.getByLabel("Password").fill(this.config.oscarPassword);
+          await Promise.all([
+            sbPage.waitForURL((u) => !u.pathname.startsWith("/login"), {timeout: 25_000}),
+            sbPage.getByRole("button", {name: "Sign in", exact: true}).click(),
+          ]);
+        }
+
+        await this.check({
+          scenario: "training-sandbox",
+          category: "operator-academy-lab",
+          action: "verify Training Coach dock, archiveEnabled=false, DemoLane01 online, and live EML Code 9999 auto-verification",
+          target: `${sandboxBaseUrl}/event-log`,
+          expected: "sandboxMode=true, archiveEnabled=false, onlineLaneCount>=1, and injected norm_eml auto-verifies Lab 1.3",
+        }, async () => {
+          await sbPage.goto(`${sandboxBaseUrl}/event-log`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
+          await sbPage.getByTestId("navbar-sandbox-indicator").waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+          if (!(await sbPage.getByTestId("training-coach-dock").isVisible().catch(() => false))) {
+            await sbPage.getByTestId("navbar-training-coach-toggle").click();
+          }
+          await sbPage.getByTestId("training-coach-dock").waitFor({state: "visible", timeout: 10_000});
+          await sbPage.getByTestId("training-lab-chip-op-3").click();
+          await sbPage.getByTestId("training-inject-norm_eml").click();
+
+          let activeJson: {
+            sandboxMode?: boolean;
+            archiveEnabled?: boolean;
+            verification?: {onlineLaneCount?: number; emlCode9999Count?: number};
+          } = {};
+          const deadline = Date.now() + 20_000;
+          while (Date.now() < deadline) {
+            const r = await sbCtx.request.get(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`, {
+              headers: {Accept: "application/json"},
+            });
+            if (r.ok()) {
+              activeJson = await r.json();
+            }
+            await r.dispose();
+            if ((activeJson.verification?.emlCode9999Count ?? 0) >= 1) {
+              break;
+            }
+            await sbPage.waitForTimeout(1_000);
+          }
+
+          const passed =
+            activeJson.sandboxMode === true &&
+            activeJson.archiveEnabled === false &&
+            (activeJson.verification?.onlineLaneCount ?? 0) >= 1 &&
+            (activeJson.verification?.emlCode9999Count ?? 0) >= 1;
+          const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-operator-lab-failed");
+          return {
+            passed,
+            observed: `sandboxMode=${String(activeJson.sandboxMode)}; archiveEnabled=${String(activeJson.archiveEnabled)}; onlineLanes=${activeJson.verification?.onlineLaneCount ?? 0}; emlCode9999=${activeJson.verification?.emlCode9999Count ?? 0}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "training-sandbox",
+          category: "certificate-and-admin-split",
+          action: "verify watermarked PDF Completion Record export and Track 3 Split-Pane SensorHub Admin",
+          target: `${sandboxBaseUrl}/sensorhub/oscar/sandbox/certificate`,
+          expected: "certificate endpoint returns valid PDF >= 4 KiB and Track 3 opens /sensorhub/admin iframe",
+        }, async () => {
+          const certRes = await sbCtx.request.post(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/certificate`, {
+            headers: {
+              "X-Requested-With": "XMLHttpRequest",
+              "Content-Type": "application/json",
+            },
+            data: {
+              traineeName: "Regression Operator",
+              completedLabs: [
+                {trackId: "operator", labId: "1.3", title: "NORM (Code 9999)", status: "verified"},
+              ],
+            },
+          });
+          const certStatus = certRes.status();
+          const certBytes = certRes.ok() ? await certRes.body() : Buffer.alloc(0);
+          await certRes.dispose();
+          const pdfValid = certStatus === 200 && certBytes.length >= 4096 && certBytes.subarray(0, 5).toString("ascii") === "%PDF-";
+
+          await sbPage.getByTestId("training-track-btn-administrator").click();
+          const splitBtn = sbPage.getByTestId("training-toggle-split-admin");
+          await splitBtn.waitFor({state: "visible", timeout: 15_000});
+          await splitBtn.click();
+          await sbPage.getByTestId("sandbox-split-admin-shell").waitFor({state: "visible", timeout: 15_000});
+          const iframeVisible = await sbPage.getByTestId("sandbox-admin-iframe").isVisible();
+
+          const passed = pdfValid && iframeVisible;
+          const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-admin-split-failed");
+          return {
+            passed,
+            observed: `certStatus=${certStatus}; certBytes=${certBytes.length}; splitAdminIframe=${iframeVisible}`,
+            evidence,
+          };
+        });
+      } finally {
+        await sbCtx.close().catch(() => {});
+      }
+    } finally {
+      await probe.sandboxStop().catch((err) => this.reporter.error("training-sandbox", "sandbox-stop", err));
+      await opPage.close().catch(() => {});
+    }
+
+    await this.check({
+      scenario: "training-sandbox",
+      category: "zero-production-residue",
+      action: "verify sandbox stop flushes all sandbox containers/volumes and leaves zero operational DB, Parquet, or config.json residue",
+      target: "operational PostgreSQL + Parquet archive + config.json",
+      expected: "unchanged config.json SHA-256 and zero sandbox datastreams, observations, archive files, containers, or volumes",
+    }, async () => {
+      const afterSnap = await probe.sandboxIsolationSnapshot();
+      const passed =
+        afterSnap.stateConfigSha256 === beforeSnap.stateConfigSha256 &&
+        afterSnap.postgresSandboxDatastreamCount === 0 &&
+        afterSnap.postgresSandboxObsCount === 0 &&
+        afterSnap.archiveSandboxFileCount === 0 &&
+        afterSnap.sandboxContainerCount === 0 &&
+        afterSnap.sandboxVolumeCount === 0;
+      return {
+        passed,
+        observed: `configUnchanged=${afterSnap.stateConfigSha256 === beforeSnap.stateConfigSha256}; sbDs=${afterSnap.postgresSandboxDatastreamCount}; sbObs=${afterSnap.postgresSandboxObsCount}; sbArchive=${afterSnap.archiveSandboxFileCount}; sbContainers=${afterSnap.sandboxContainerCount}; sbVolumes=${afterSnap.sandboxVolumeCount}`,
+      };
+    });
+  }
+
+  private async resolveRunnerOutboundIp(targetHost: string): Promise<string> {
+    return await new Promise<string>((resolveIp, rejectIp) => {
+      const sock = createSocket("udp4");
+      sock.once("error", (err) => {
+        try { sock.close(); } catch { /* ignore */ }
+        rejectIp(err);
+      });
+      sock.connect(443, targetHost, () => {
+        try {
+          const addr = sock.address();
+          sock.close();
+          resolveIp(addr.address);
+        } catch (err) {
+          try { sock.close(); } catch { /* ignore */ }
+          rejectIp(err);
+        }
+      });
+    });
+  }
+
+  private async laneWebRelay(): Promise<void> {
+    const capabilityMeta = {
+      scenario: "lane-webrelay",
+      category: "lane-webrelay",
+      action: "verify OSCAR 3.11.4+ per-lane ControlByWeb WebRelay-Quad capability",
+      target: `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
+      expected: "authenticated admin endpoint returns lane WebRelay catalog",
+    };
+
+    if (this.config.laneWebRelayWorkflow === "disabled") {
+      this.skip(capabilityMeta, "LANE_WEBRELAY_WORKFLOW=disabled");
+      return;
+    }
+
+    const page = await this.browser.oscarPage();
+    await page.goto(`${this.config.oscarBaseUrl}/health`, {
+      waitUntil: "domcontentloaded",
+      timeout: this.config.uiTimeoutMs,
+    });
+
+    const statusRes = await page.context().request.get(
+      `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
+      {headers: {Accept: "application/json"}},
+    );
+    const initialHttpStatus = statusRes.status();
+    if (initialHttpStatus === 404) {
+      await statusRes.dispose();
+      if (this.config.laneWebRelayWorkflow === "auto") {
+        this.skip(capabilityMeta, "/sensorhub/oscar/webrelay/status is absent on pre-3.11.4 build (auto)");
+        return;
+      }
+      throw new Error("LANE_WEBRELAY_WORKFLOW=required but /sensorhub/oscar/webrelay/status returned 404");
+    }
+
+    const initialPayload = statusRes.ok()
+      ? (await statusRes.json() as {isAdmin?: boolean; lanes?: Array<Record<string, any>>})
+      : {isAdmin: false, lanes: []};
+    await statusRes.dispose();
+
+    const targetLaneEntry = (initialPayload.lanes ?? []).find(
+      (entry) => String(entry.laneName ?? "") === this.config.testLaneLabel,
+    );
+
+    await this.check(capabilityMeta, async () => ({
+      passed: initialHttpStatus === 200 && initialPayload.isAdmin === true && Boolean(targetLaneEntry),
+      observed: `httpStatus=${initialHttpStatus}; isAdmin=${String(initialPayload.isAdmin)}; foundTestLane=${Boolean(targetLaneEntry)}`,
+    }));
+    if (!targetLaneEntry) {
+      return;
+    }
+
+    // Start ephemeral mock ControlByWeb WebRelay-Quad (/stateFull.xml) on runner
+    const relayCoils: [number, number, number, number] = [0, 0, 0, 0];
+    const recordedQueries: string[] = [];
+    const mockServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
+      const reqUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+      if (reqUrl.pathname !== "/stateFull.xml") {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      const rawQs = reqUrl.search.startsWith("?") ? reqUrl.search.slice(1) : "";
+      if (rawQs.length > 0) {
+        recordedQueries.push(rawQs);
+        for (const [k, v] of reqUrl.searchParams.entries()) {
+          if (k === "relay1State") relayCoils[0] = (v === "1" || v === "2") ? 1 : 0;
+          if (k === "relay2State") relayCoils[1] = (v === "1" || v === "2") ? 1 : 0;
+          if (k === "relay3State") relayCoils[2] = (v === "1" || v === "2") ? 1 : 0;
+          if (k === "relay4State") relayCoils[3] = (v === "1" || v === "2") ? 1 : 0;
+        }
+      }
+      const xml = `<?xml version='1.0' encoding='utf-8'?><datavalues>` +
+        `<relay1state>${relayCoils[0]}</relay1state>` +
+        `<relay2state>${relayCoils[1]}</relay2state>` +
+        `<relay3state>${relayCoils[2]}</relay3state>` +
+        `<relay4state>${relayCoils[3]}</relay4state>` +
+        `</datavalues>`;
+      res.writeHead(200, {"Content-Type": "text/xml; charset=utf-8"});
+      res.end(xml);
+    });
+
+    await new Promise<void>((resolveListen, rejectListen) => {
+      mockServer.once("error", rejectListen);
+      mockServer.listen(0, "0.0.0.0", () => resolveListen());
+    });
+    const mockAddr = mockServer.address();
+    const mockPort = typeof mockAddr === "object" && mockAddr ? mockAddr.port : 0;
+    const runnerIp = await this.resolveRunnerOutboundIp(this.config.targetHost);
+    const originalRpmQuieted = this.originalRpmConfig ? this.emulator.quietConfig(this.originalRpmConfig) : undefined;
+
+    try {
+      await this.check({
+        scenario: "lane-webrelay",
+        category: "admin-ui-and-manual-relays",
+        action: "configure WebRelay on reserved lane via Status of Health dialog, verify AUTO arming (R1=1,R2=1), and exercise manual Gamma/Neutron pulses & pass-through",
+        target: this.config.testLaneLabel,
+        expected: "test-connection succeeds on /stateFull.xml, save-config arms R1=1,R2=1, manual pulses emit relay3State=2 & relay4State=2, and Status of Health shows WebRelay (AUTO) · Online",
+      }, async () => {
+        const openBtn = page.getByTestId(`webrelay-open-lane-${this.config.testLaneLabel}`);
+        await openBtn.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+        await openBtn.click();
+
+        const dlg = page.getByTestId("lane-webrelay-dialog");
+        await dlg.waitFor({state: "visible", timeout: 10_000});
+
+        const hostInput = page.getByTestId("webrelay-input-primary-host");
+        await hostInput.fill(runnerIp);
+        const portInput = page.getByTestId("webrelay-input-primary-port");
+        await portInput.fill(String(mockPort));
+
+        await page.getByTestId("webrelay-btn-test-primary").click();
+        await page.getByTestId("webrelay-status-banner").waitFor({state: "visible", timeout: 10_000});
+        const testBannerText = await page.getByTestId("webrelay-status-banner").innerText();
+
+        const enabledChk = page.getByTestId("webrelay-input-enabled");
+        if (!(await enabledChk.isChecked())) {
+          await enabledChk.check();
+        }
+        await page.getByTestId("webrelay-mode-auto").check();
+        await page.getByTestId("webrelay-input-pulse-seconds").fill("3");
+        await page.getByTestId("webrelay-btn-save").click();
+
+        await page.getByTestId("webrelay-primary-unit-r1").waitFor({state: "visible", timeout: 10_000});
+        const r1ArmedText = await page.getByTestId("webrelay-primary-unit-r1").innerText();
+
+        await page.getByTestId("webrelay-btn-pulse-gamma").click();
+        await page.waitForTimeout(400);
+        await page.getByTestId("webrelay-btn-pulse-neutron").click();
+        await page.waitForTimeout(400);
+        await page.getByTestId("webrelay-btn-passthrough").click();
+        await page.waitForTimeout(400);
+        await page.getByTestId("webrelay-btn-silence").click();
+        await page.waitForTimeout(400);
+
+        await page.getByTestId("webrelay-btn-close").click();
+        const rowText = await this.healthRow(page).innerText();
+
+        // Also verify anytime Read-Only Guided Walkthrough Refresher + auto-shutdown orientation on live :443
+        const walkthroughBtn = page.getByTestId("navbar-walkthrough-button");
+        await walkthroughBtn.waitFor({state: "visible", timeout: 10_000});
+        await walkthroughBtn.click();
+        await page.getByTestId("coach-refresher-badge").waitFor({state: "visible", timeout: 10_000});
+        const orientationText = await page.getByTestId("coach-refresher-orientation").innerText();
+        const refresherOrientationOk = /120\s*min/i.test(orientationText);
+        await page.getByTestId("training-coach-minimize").click();
+
+        const sawGammaPulse = recordedQueries.some((q) => q.includes("relay3State=2&pulseTime3=3"));
+        const sawNeutronPulse = recordedQueries.some((q) => q.includes("relay4State=2&pulseTime4=3"));
+        const sawPassThrough = recordedQueries.some((q) => q.includes("relay1State=0&relay2State=0&relay3State=0&relay4State=0"));
+        const sawReArm = recordedQueries.some((q) => q.includes("relay1State=1&relay2State=1&relay3State=0&relay4State=0"));
+        const healthChipVisible = /WebRelay\s*\(AUTO\)\s*·\s*Online/i.test(rowText);
+
+        const passed =
+          testBannerText.includes("/stateFull.xml") &&
+          /ARMED/i.test(r1ArmedText) &&
+          sawGammaPulse &&
+          sawNeutronPulse &&
+          sawPassThrough &&
+          sawReArm &&
+          healthChipVisible &&
+          refresherOrientationOk;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "lane-webrelay-manual-ui-failed");
+        return {
+          passed,
+          observed: `testBanner=${testBannerText.includes("/stateFull.xml")}; r1Armed=${/ARMED/i.test(r1ArmedText)}; gammaPulse=${sawGammaPulse}; neutronPulse=${sawNeutronPulse}; passThrough=${sawPassThrough}; reArm=${sawReArm}; healthChip=${healthChipVisible}; refresherOrientation=${refresherOrientationOk}`,
+          evidence,
+        };
+      });
+
+      if (this.originalRpmConfig) {
+        await this.check({
+          scenario: "lane-webrelay",
+          category: "auto-alarm-gatekeeper",
+          action: "trigger live RPM gamma alarm on reserved lane and verify AUTO hardware-timed WebRelay pulse",
+          target: this.config.testLaneLabel,
+          expected: "actionable RPM gamma alarm triggers relay1State=1&relay2State=1&relay3State=2&pulseTime3=3 and increments triggeredAlarmCount",
+        }, async () => {
+          const beforeLen = recordedQueries.length;
+          await this.emulator.replaceConfig(
+            this.config.testRpmId,
+            this.emulator.shortAlarmConfig(this.originalRpmConfig!),
+          );
+          await this.waitHealthRpmConnection(page, "online", 60_000);
+          await this.triggerAlarm("gamma");
+
+          let autoPulsed = false;
+          let triggeredCount = 0;
+          const deadline = Date.now() + 20_000;
+          while (Date.now() < deadline) {
+            const newQs = recordedQueries.slice(beforeLen);
+            if (newQs.some((q) => q.includes("relay1State=1&relay2State=1&relay3State=2&pulseTime3=3"))) {
+              autoPulsed = true;
+            }
+            const st = await page.context().request.get(
+              `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
+              {headers: {Accept: "application/json"}},
+            );
+            if (st.ok()) {
+              const stJson = await st.json() as {lanes?: Array<Record<string, any>>};
+              const entry = (stJson.lanes ?? []).find((l) => l.laneName === this.config.testLaneLabel);
+              triggeredCount = Number(entry?.triggeredAlarmCount ?? 0);
+            }
+            await st.dispose();
+            if (autoPulsed && triggeredCount >= 1) {
+              break;
+            }
+            await page.waitForTimeout(500);
+          }
+
+          if (originalRpmQuieted) {
+            await this.emulator.replaceConfig(this.config.testRpmId, originalRpmQuieted);
+          }
+          return {
+            passed: autoPulsed && triggeredCount >= 1,
+            observed: `autoPulsed=${autoPulsed}; triggeredAlarmCount=${triggeredCount}`,
+          };
+        });
+      }
+    } finally {
+      // Restore exact pre-test WebRelay settings on reserved lane
+      await page.context().request.post(
+        `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/action`,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-Requested-With": "OSCAR-Viewer",
+          },
+          data: {
+            action: "save-config",
+            laneUid: String(targetLaneEntry.laneUid),
+            enabled: Boolean(targetLaneEntry.enabled),
+            mode: String(targetLaneEntry.mode || "AUTO"),
+            primaryHost: String(targetLaneEntry.primaryHost ?? ""),
+            primaryPort: Number(targetLaneEntry.primaryPort ?? 80),
+            ancillaryEnabled: Boolean(targetLaneEntry.ancillaryEnabled),
+            ancillaryHost: String(targetLaneEntry.ancillaryHost ?? ""),
+            ancillaryPort: Number(targetLaneEntry.ancillaryPort ?? 80),
+            username: String(targetLaneEntry.username ?? ""),
+            clearPassword: !Boolean(targetLaneEntry.passwordConfigured),
+            alarmPulseSeconds: Number(targetLaneEntry.alarmPulseSeconds ?? 5),
+            suppressExtendedOccupancyGamma: targetLaneEntry.suppressExtendedOccupancyGamma !== false,
+            soundOnNeutronAlarm: Boolean(targetLaneEntry.soundOnNeutronAlarm),
+            pollIntervalSeconds: Number(targetLaneEntry.pollIntervalSeconds ?? 10),
+          },
+        },
+      ).then((r) => r.dispose()).catch((err) => this.reporter.error("lane-webrelay", "restore-config", err));
+
+      await new Promise<void>((resolveClose) => mockServer.close(() => resolveClose()));
+    }
+
+    await this.check({
+      scenario: "lane-webrelay",
+      category: "teardown",
+      action: "verify reserved lane WebRelay configuration restored after test",
+      target: this.config.testLaneLabel,
+      expected: `enabled=${String(Boolean(targetLaneEntry.enabled))} restored cleanly`,
+    }, async () => {
+      const checkRes = await page.context().request.get(
+        `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
+        {headers: {Accept: "application/json"}},
+      );
+      const body = checkRes.ok()
+        ? (await checkRes.json() as {lanes?: Array<Record<string, any>>})
+        : {lanes: []};
+      await checkRes.dispose();
+      const restored = (body.lanes ?? []).find((l) => l.laneName === this.config.testLaneLabel);
+      const passed = Boolean(restored) && Boolean(restored?.enabled) === Boolean(targetLaneEntry.enabled);
+      return {
+        passed,
+        observed: `restoredEnabled=${String(restored?.enabled)}; expected=${String(Boolean(targetLaneEntry.enabled))}`,
+      };
+    });
   }
 }

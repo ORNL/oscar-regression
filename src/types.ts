@@ -6,7 +6,7 @@ export type CapabilityMode = "auto" | "required" | "disabled";
 
 export type BackupMode = "disabled" | "single";
 
-export type StorageExpectedRelease = "3.11.0" | "3.11.1" | "3.11.2";
+export type StorageExpectedRelease = "3.11.0" | "3.11.1" | "3.11.2" | "3.11.3" | "3.11.4";
 
 export type ResultStatus = "correct" | "incorrect" | "skipped";
 
@@ -57,6 +57,8 @@ export interface SuiteConfig {
   cargoUffSmbDomain?: string;
   cargoUffSmbUsername?: string;
   cargoUffSmbPassword?: string;
+  trainingSandboxWorkflow: CapabilityMode;
+  laneWebRelayWorkflow: CapabilityMode;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: StorageExpectedRelease;
   storageBackupWorkflow: CapabilityMode;
@@ -307,4 +309,14 @@ export interface RpmStatus {
   nh_fault: boolean;
   tamper_fault: boolean;
   occupancy_frequency_effective?: number;
+}
+
+export interface SandboxIsolationSnapshot {
+  sandboxScriptPresent: boolean;
+  stateConfigSha256: string;
+  postgresSandboxDatastreamCount: number;
+  postgresSandboxObsCount: number;
+  archiveSandboxFileCount: number;
+  sandboxContainerCount: number;
+  sandboxVolumeCount: number;
 }
