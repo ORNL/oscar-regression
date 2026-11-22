@@ -213,7 +213,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
-    "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "cargo-uff", "training-sandbox", "extended-occupancy", "adjudication-report",
+    "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "cargo-uff", "training-sandbox", "lane-webrelay", "extended-occupancy", "adjudication-report",
     "runtime-extensions",
     "storage-health", "storage-lifecycle",
     "storage-restore-drill",
@@ -295,13 +295,15 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     throw new Error("CARGO_UFF_SMB_SHARE must not contain control characters");
   }
   const trainingSandboxWorkflow = capabilityMode("TRAINING_SANDBOX_WORKFLOW", "auto");
+  const laneWebRelayWorkflow = capabilityMode("LANE_WEBRELAY_WORKFLOW", "auto");
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
   const storageExpectedReleaseRaw = process.env.STORAGE_EXPECTED_RELEASE?.trim() || "3.11.0";
   if (storageExpectedReleaseRaw !== "3.11.0" &&
       storageExpectedReleaseRaw !== "3.11.1" &&
       storageExpectedReleaseRaw !== "3.11.2" &&
-      storageExpectedReleaseRaw !== "3.11.3") {
-    throw new Error("STORAGE_EXPECTED_RELEASE must be 3.11.0, 3.11.1, 3.11.2, or 3.11.3");
+      storageExpectedReleaseRaw !== "3.11.3" &&
+      storageExpectedReleaseRaw !== "3.11.4") {
+    throw new Error("STORAGE_EXPECTED_RELEASE must be 3.11.0, 3.11.1, 3.11.2, 3.11.3, or 3.11.4");
   }
   const storageExpectedRelease: StorageExpectedRelease = storageExpectedReleaseRaw;
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
@@ -390,6 +392,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     ...(cargoUffSmbUsername ? {cargoUffSmbUsername} : {}),
     ...(cargoUffSmbPassword ? {cargoUffSmbPassword} : {}),
     trainingSandboxWorkflow,
+    laneWebRelayWorkflow,
     storageWorkflow,
     storageExpectedRelease,
     storageBackupWorkflow,
@@ -559,7 +562,7 @@ export function assertMutationAllowed(config: SuiteConfig): void {
 export function requiresRemoteSuiteLease(config: SuiteConfig): boolean {
   if (["full", "3.9.2-release", "3.11.0-release", "restore-drill"].includes(config.profile)) return true;
   if (config.scenarioFilter.size === 0) return true;
-  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication", "vehicle-ocr", "training-sandbox", "runtime-extensions"].some(
+  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication", "vehicle-ocr", "training-sandbox", "lane-webrelay", "runtime-extensions"].some(
     name => config.scenarioFilter.has(name),
   )) {
     return true;
