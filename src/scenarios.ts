@@ -10350,50 +10350,77 @@ export class RegressionScenarios {
         await this.check({
           scenario: "training-sandbox",
           category: "operator-academy-lab",
-          action: "verify Training Coach dock, archiveEnabled=false, DemoLane01 online, and live EML Code 9999 auto-verification",
-          target: `${sandboxBaseUrl}/event-log`,
-          expected: "sandboxMode=true, archiveEnabled=false, onlineLaneCount>=1, and injected norm_eml auto-verifies Lab 1.3",
+          action: "verify Training Coach dock auto-navigates / -> /event-log on NORM Code 9999 injection, displays Code 9999 row, and emits zero preload warnings",
+          target: `${sandboxBaseUrl}/`,
+          expected: "sandboxMode=true, archiveEnabled=false, onlineLaneCount>=1, auto-navigation to /event-log, visible Code 9999 row, and zero link preload warnings",
         }, async () => {
-          await sbPage.goto(`${sandboxBaseUrl}/event-log`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
-          await sbPage.getByTestId("navbar-sandbox-indicator").waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
-          if (!(await sbPage.getByTestId("training-coach-dock").isVisible().catch(() => false))) {
-            await sbPage.getByTestId("navbar-training-coach-toggle").click();
-          }
-          await sbPage.getByTestId("training-coach-dock").waitFor({state: "visible", timeout: 10_000});
-          await sbPage.getByTestId("training-lab-chip-op-3").click();
-          await sbPage.getByTestId("training-inject-norm_eml").click();
-
-          let activeJson: {
-            sandboxMode?: boolean;
-            archiveEnabled?: boolean;
-            verification?: {onlineLaneCount?: number; emlCode9999Count?: number};
-          } = {};
-          const deadline = Date.now() + 20_000;
-          while (Date.now() < deadline) {
-            const r = await sbCtx.request.get(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`, {
-              headers: {Accept: "application/json"},
-            });
-            if (r.ok()) {
-              activeJson = await r.json();
+          const preloadWarnings: string[] = [];
+          const onConsole = (msg: {text(): string}) => {
+            const t = msg.text();
+            if (t.includes("was preloaded using link preload")) {
+              preloadWarnings.push(t);
             }
-            await r.dispose();
-            if ((activeJson.verification?.emlCode9999Count ?? 0) >= 1) {
-              break;
-            }
-            await sbPage.waitForTimeout(1_000);
-          }
-
-          const passed =
-            activeJson.sandboxMode === true &&
-            activeJson.archiveEnabled === false &&
-            (activeJson.verification?.onlineLaneCount ?? 0) >= 1 &&
-            (activeJson.verification?.emlCode9999Count ?? 0) >= 1;
-          const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-operator-lab-failed");
-          return {
-            passed,
-            observed: `sandboxMode=${String(activeJson.sandboxMode)}; archiveEnabled=${String(activeJson.archiveEnabled)}; onlineLanes=${activeJson.verification?.onlineLaneCount ?? 0}; emlCode9999=${activeJson.verification?.emlCode9999Count ?? 0}`,
-            evidence,
           };
+          sbPage.on("console", onConsole);
+          try {
+            await sbPage.goto(`${sandboxBaseUrl}/`, {waitUntil: "domcontentloaded", timeout: this.config.uiTimeoutMs});
+            await sbPage.getByTestId("navbar-sandbox-indicator").waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+            if (!(await sbPage.getByTestId("training-coach-dock").isVisible().catch(() => false))) {
+              await sbPage.getByTestId("navbar-training-coach-toggle").click();
+            }
+            await sbPage.getByTestId("training-coach-dock").waitFor({state: "visible", timeout: 10_000});
+            await sbPage.getByTestId("training-lab-chip-op-3").click();
+            await sbPage.waitForURL((u) => u.pathname.includes("/event-log"), {timeout: 10_000});
+            await sbPage.getByTestId("training-inject-norm_eml").click();
+
+            let activeJson: {
+              sandboxMode?: boolean;
+              archiveEnabled?: boolean;
+              verification?: {onlineLaneCount?: number; emlCode9999Count?: number};
+            } = {};
+            const deadline = Date.now() + 20_000;
+            while (Date.now() < deadline) {
+              const r = await sbCtx.request.get(`${sandboxBaseUrl}/sensorhub/oscar/sandbox/active`, {
+                headers: {Accept: "application/json"},
+              });
+              if (r.ok()) {
+                activeJson = await r.json();
+              }
+              await r.dispose();
+              if ((activeJson.verification?.emlCode9999Count ?? 0) >= 1) {
+                break;
+              }
+              await sbPage.waitForTimeout(1_000);
+            }
+
+            await sbPage.waitForFunction(
+              () => {
+                const txt = document.body?.innerText || "";
+                return txt.includes("9999") && txt.includes("EML Non-Threat");
+              },
+              {timeout: 10_000},
+            ).catch(() => {});
+            const bodyTxt = await sbPage.evaluate(() => document.body?.innerText || "");
+            const visibleCode9999 = bodyTxt.includes("9999") && bodyTxt.includes("EML Non-Threat");
+            const navigatedToEventLog = sbPage.url().includes("/event-log");
+
+            const passed =
+              activeJson.sandboxMode === true &&
+              activeJson.archiveEnabled === false &&
+              (activeJson.verification?.onlineLaneCount ?? 0) >= 1 &&
+              (activeJson.verification?.emlCode9999Count ?? 0) >= 1 &&
+              navigatedToEventLog &&
+              visibleCode9999 &&
+              preloadWarnings.length === 0;
+            const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-operator-lab-failed");
+            return {
+              passed,
+              observed: `sandboxMode=${String(activeJson.sandboxMode)}; archiveEnabled=${String(activeJson.archiveEnabled)}; onlineLanes=${activeJson.verification?.onlineLaneCount ?? 0}; emlCode9999=${activeJson.verification?.emlCode9999Count ?? 0}; navigatedToEventLog=${navigatedToEventLog}; visibleCode9999=${visibleCode9999}; preloadWarnings=${preloadWarnings.length}`,
+              evidence,
+            };
+          } finally {
+            sbPage.off("console", onConsole);
+          }
         });
 
         await this.check({
@@ -10427,11 +10454,23 @@ export class RegressionScenarios {
           await sbPage.getByTestId("sandbox-split-admin-shell").waitFor({state: "visible", timeout: 15_000});
           const iframeVisible = await sbPage.getByTestId("sandbox-admin-iframe").isVisible();
 
-          const passed = pdfValid && iframeVisible;
+          await sbPage.getByTestId("training-lab-chip-adm-5").click();
+          await sbPage.waitForURL((u) => u.pathname.includes("/health"), {timeout: 10_000});
+          await sbPage.getByTestId("training-inject-stage_webrelay_demo").click();
+          await sbPage.waitForFunction(
+            () => {
+              const el = document.querySelector('[data-testid="training-active-lab-status"]');
+              return Boolean(el && /Auto-Verified/i.test(el.textContent || ""));
+            },
+            {timeout: 15_000},
+          );
+          const lab35Verified = true;
+
+          const passed = pdfValid && iframeVisible && lab35Verified;
           const evidence = passed ? "" : await this.screenshotOnFailure(sbPage, "training-sandbox-admin-split-failed");
           return {
             passed,
-            observed: `certStatus=${certStatus}; certBytes=${certBytes.length}; splitAdminIframe=${iframeVisible}`,
+            observed: `certStatus=${certStatus}; certBytes=${certBytes.length}; splitAdminIframe=${iframeVisible}; lab35WebRelayVerified=${lab35Verified}`,
             evidence,
           };
         });

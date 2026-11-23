@@ -305,8 +305,9 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
       storageExpectedReleaseRaw !== "3.11.4" &&
       storageExpectedReleaseRaw !== "3.11.5" &&
       storageExpectedReleaseRaw !== "3.11.6" &&
-      storageExpectedReleaseRaw !== "3.11.7") {
-    throw new Error("STORAGE_EXPECTED_RELEASE must be 3.11.0, 3.11.1, 3.11.2, 3.11.3, 3.11.4, 3.11.5, 3.11.6, or 3.11.7");
+      storageExpectedReleaseRaw !== "3.11.7" &&
+      storageExpectedReleaseRaw !== "3.11.8") {
+    throw new Error("STORAGE_EXPECTED_RELEASE must be 3.11.0, 3.11.1, 3.11.2, 3.11.3, 3.11.4, 3.11.5, 3.11.6, 3.11.7, or 3.11.8");
   }
   const storageExpectedRelease: StorageExpectedRelease = storageExpectedReleaseRaw;
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
