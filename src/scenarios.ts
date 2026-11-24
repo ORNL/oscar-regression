@@ -369,11 +369,67 @@ function isVisible(locator: Locator): Promise<boolean> {
   return locator.isVisible().catch(() => false);
 }
 
+export interface CargoUffSmbFallbackConfig {
+  cargoUffSmbShare?: string;
+  cargoUffSmbSubPath?: string;
+  cargoUffSmbDomain?: string;
+  cargoUffSmbUsername?: string;
+  cargoUffSmbPassword?: string;
+}
+
+export function buildCargoUffRestorePayload(
+  preUffStatus: Record<string, unknown> | undefined,
+  smbFallback: CargoUffSmbFallbackConfig,
+): Record<string, unknown> | undefined {
+  if (!preUffStatus || preUffStatus.enabled !== true) {
+    return undefined;
+  }
+  const sourceType = String(preUffStatus.sourceType || (smbFallback.cargoUffSmbShare ? "smb" : "local")).trim();
+  const correlationWindowMinutes = Number(preUffStatus.correlationWindowMinutes ?? 60);
+  const allowFuzzyOcrMatch = preUffStatus.allowFuzzyOcrMatch !== false;
+
+  if (sourceType === "local") {
+    const localPath = String(preUffStatus.localPath ?? "").trim();
+    if (!localPath) {
+      return undefined;
+    }
+    return {
+      action: "save-config",
+      enabled: true,
+      sourceType: "local",
+      localPath,
+      correlationWindowMinutes,
+      allowFuzzyOcrMatch,
+    };
+  }
+
+  const shareUrl = String(preUffStatus.shareUrl || smbFallback.cargoUffSmbShare || "").trim();
+  if (!shareUrl) {
+    return undefined;
+  }
+  const subPath = String(preUffStatus.subPath ?? smbFallback.cargoUffSmbSubPath ?? "");
+  const domain = String(preUffStatus.domain ?? smbFallback.cargoUffSmbDomain ?? "WORKGROUP");
+  const username = String(preUffStatus.username ?? smbFallback.cargoUffSmbUsername ?? "");
+  return {
+    action: "save-config",
+    enabled: true,
+    sourceType: "smb",
+    shareUrl,
+    subPath,
+    domain,
+    username,
+    ...(smbFallback.cargoUffSmbPassword ? {password: smbFallback.cargoUffSmbPassword} : {}),
+    correlationWindowMinutes,
+    allowFuzzyOcrMatch,
+  };
+}
+
 export class RegressionScenarios {
   private originalRpmConfig: RpmConfig | undefined;
   private originalRpmRunning: boolean | undefined;
   private originalRpmStatus: RpmStatus | null | undefined;
   private reservedLanePrepared = false;
+  private pendingCargoUffRestorePayload: Record<string, unknown> | undefined;
   private alarmMediaBaselineCreated = false;
   private alarmMediaProbe: StorageProbeClient | undefined;
   private alarmCameraUids: string[] | undefined;
@@ -701,8 +757,31 @@ export class RegressionScenarios {
     try {
       await this.restoreReservedLane();
     } finally {
-      await this.alarmMediaProbe?.cleanup();
-      this.alarmMediaProbe = undefined;
+      try {
+        await this.restorePendingCargoUff();
+      } finally {
+        await this.alarmMediaProbe?.cleanup();
+        this.alarmMediaProbe = undefined;
+      }
+    }
+  }
+
+  private async restorePendingCargoUff(): Promise<void> {
+    const payload = this.pendingCargoUffRestorePayload;
+    if (!payload) return;
+    this.pendingCargoUffRestorePayload = undefined;
+    let page: Page | undefined;
+    try {
+      page = await this.browser.oscarPage();
+      const res = await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/uff/action"), {
+        headers: {"X-Requested-With": "OSCAR-Viewer", "Content-Type": "application/json"},
+        data: payload,
+      });
+      await res.dispose();
+    } catch (err) {
+      this.reporter.error("cargo-uff", "restore-pre-test-uff-config", err);
+    } finally {
+      await page?.close().catch(() => {});
     }
   }
 
@@ -10223,6 +10302,18 @@ export class RegressionScenarios {
       preUffEnabled = Boolean(activeBody.enabled);
 
       if (preUffEnabled) {
+        const preStatusRes = await page.context().request.get(
+          this.viewerUrl("/sensorhub/oscar/extensions/status"),
+          {headers: {Accept: "application/json"}},
+        );
+        const preStatusJson = preStatusRes.ok()
+          ? (await preStatusRes.json()) as {uff?: Record<string, unknown>}
+          : {};
+        await preStatusRes.dispose();
+        this.pendingCargoUffRestorePayload = buildCargoUffRestorePayload(
+          preStatusJson.uff ?? {enabled: true},
+          this.config,
+        );
         await page.context().request.post(this.viewerUrl("/sensorhub/oscar/extensions/uff/action"), {
           headers: {...extHeaders, "Content-Type": "application/json"},
           data: {action: "reset"},
@@ -10505,34 +10596,77 @@ export class RegressionScenarios {
       }
     }
 
-    // 4. Verify post-reset zero-latency & zero-clutter restoration
-    await this.check({
-      scenario: "cargo-uff",
-      category: "post-reset-latency",
-      action: "verify Cargo UFF resets cleanly to disabled with zero Event Log latency degradation",
-      target: "/sensorhub/oscar/extensions/uff/active",
-      expected: `uff.enabled=false and Event Log first row <= ${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}ms`,
-    }, async () => {
-      const res = await page.context().request.get(
-        this.viewerUrl("/sensorhub/oscar/extensions/uff/active"),
-        {headers: {Accept: "application/json"}},
-      );
-      const body = res.ok() ? (await res.json()) as {enabled?: boolean} : {};
-      await res.dispose();
+    const restorePayload = this.pendingCargoUffRestorePayload;
+    try {
+      // 4. Verify post-reset zero-latency & zero-clutter restoration
+      await this.check({
+        scenario: "cargo-uff",
+        category: "post-reset-latency",
+        action: "verify Cargo UFF resets cleanly to disabled with zero Event Log latency degradation",
+        target: "/sensorhub/oscar/extensions/uff/active",
+        expected: `uff.enabled=false and Event Log first row <= ${EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS}ms`,
+      }, async () => {
+        const res = await page.context().request.get(
+          this.viewerUrl("/sensorhub/oscar/extensions/uff/active"),
+          {headers: {Accept: "application/json"}},
+        );
+        const body = res.ok() ? (await res.json()) as {enabled?: boolean} : {};
+        await res.dispose();
 
-      const t0 = Date.now();
-      await this.goto(page, "/event-log");
-      await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.uiTimeoutMs});
-      const postResetEventLogMs = Date.now() - t0;
+        const t0 = Date.now();
+        await this.goto(page, "/event-log");
+        await page.locator(".MuiDataGrid-row").first().waitFor({timeout: this.config.uiTimeoutMs});
+        const postResetEventLogMs = Date.now() - t0;
 
-      const passed = body.enabled === false && postResetEventLogMs <= EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS;
-      return {
-        passed,
-        observed: `enabled=${String(body.enabled)}; postResetEventLogMs=${postResetEventLogMs}ms`,
-      };
-    });
+        const passed = body.enabled === false && postResetEventLogMs <= EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS;
+        return {
+          passed,
+          observed: `enabled=${String(body.enabled)}; postResetEventLogMs=${postResetEventLogMs}ms`,
+        };
+      });
 
-    await page.close();
+      if (restorePayload) {
+        this.pendingCargoUffRestorePayload = undefined;
+        await this.check({
+          scenario: "cargo-uff",
+          category: "endurance-restore",
+          action: "restore pre-existing Cargo UFF runtime configuration for normal endurance operations",
+          target: "/sensorhub/oscar/extensions/uff/action",
+          expected: "uff.enabled=true restored to pre-regression configuration",
+        }, async () => {
+          const restoreRes = await page.context().request.post(
+            this.viewerUrl("/sensorhub/oscar/extensions/uff/action"),
+            {
+              headers: {...extHeaders, "Content-Type": "application/json"},
+              data: restorePayload,
+            },
+          );
+          const restoreCode = restoreRes.status();
+          const restoreJson = restoreRes.ok()
+            ? (await restoreRes.json()) as {uff?: {enabled?: boolean; indexedCount?: number}}
+            : {};
+          await restoreRes.dispose();
+
+          const activeAfterRes = await page.context().request.get(
+            this.viewerUrl("/sensorhub/oscar/extensions/uff/active"),
+            {headers: {Accept: "application/json"}},
+          );
+          const activeAfter = activeAfterRes.ok() ? (await activeAfterRes.json()) as {enabled?: boolean} : {};
+          await activeAfterRes.dispose();
+
+          const passed = restoreCode === 200 && activeAfter.enabled === true;
+          return {
+            passed,
+            observed: `HTTP ${restoreCode}; enabled=${String(activeAfter.enabled)}; indexedCount=${String(restoreJson.uff?.indexedCount ?? 0)}`,
+          };
+        });
+      }
+    } finally {
+      if (this.pendingCargoUffRestorePayload) {
+        await this.restorePendingCargoUff();
+      }
+      await page.close().catch(() => {});
+    }
   }
 
   private async trainingSandbox(): Promise<void> {
