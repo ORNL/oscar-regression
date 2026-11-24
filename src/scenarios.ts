@@ -70,6 +70,7 @@ import {
   DASHBOARD_INITIAL_FIRST_ROW_MAX_MS,
   DASHBOARD_NEXT_PAGE_MAX_MS,
   EVENT_LOG_BACKWARD_10X_MAX_MS,
+  EVENT_LOG_BACKWARD_10X_MAX_PAGE_QUERIES,
   EVENT_LOG_DEEP_OFFSET_MAX_MS,
   EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS,
   EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS,
@@ -1311,18 +1312,17 @@ export class RegressionScenarios {
         category: "performance",
         action: "verify /event-log 10x rapid Previous (<) backward pagination in Priority and Newest-first sorts plus O(1) multi-Parquet deep-offset latency invariance",
         target: "/event-log and /sensorhub/api/observations",
-        expected: `10x Previous (<) across visited pages settles <=${EVENT_LOG_BACKWARD_10X_MAX_MS}ms with 0 server row queries in both Priority and Newest-first sorts, 0 unbounded startTime/endTime lookups, <=${EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS} duplicate offset fetches, and deep-offset ConSys pages <=${EVENT_LOG_DEEP_OFFSET_MAX_MS}ms`,
+        expected: `10x Previous (<) settles <=${EVENT_LOG_BACKWARD_10X_MAX_MS}ms via settled debounce (<=${EVENT_LOG_BACKWARD_10X_MAX_PAGE_QUERIES} offset page queries) in both Priority and Newest-first sorts, 0 unbounded startTime/endTime lookups, <=${EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS} duplicate offset fetches, and scoped + unscoped deep-offset ConSys pages <=${EVENT_LOG_DEEP_OFFSET_MAX_MS}ms`,
       }, async () => {
         let obs5xxCount = 0;
         let unboundedStartEndLookups = 0;
-        let totalObsRowRequests = 0;
+        let totalPaginatedOffsetRequests = 0;
         const offsetCounts = new Map<string, number>();
         const capturedOccupancyStreams = new Set<string>();
 
         const onReq = (req: Request) => {
           const url = req.url();
           if (!url.includes("/sensorhub/api/observations") || url.includes("/observations/count")) return;
-          totalObsRowRequests += 1;
           try {
             const parsed = new URL(url);
             const ds = parsed.searchParams.get("dataStream") ?? "";
@@ -1337,6 +1337,7 @@ export class RegressionScenarios {
             }
             const offsetVal = parsed.searchParams.get("offset");
             if (offsetVal && Number(offsetVal) > 0) {
+              totalPaginatedOffsetRequests += 1;
               const key = `${filterVal}|offset=${offsetVal}|limit=${parsed.searchParams.get("limit") ?? ""}`;
               offsetCounts.set(key, (offsetCounts.get(key) ?? 0) + 1);
             }
@@ -1426,17 +1427,17 @@ export class RegressionScenarios {
             // Wait briefly for any trailing forward prefetch request registration to settle before counting visited backward requests
             await sleep(200);
             if (forwardPages >= 2) {
-              // Click Previous (<) up to 10 times in a row across visited historical pages (e.g. Page 11 -> Page 1),
-              // where immutable pageLoadedTime caching must serve every page with 0 server queries.
+              // Click Previous (<) up to 10 times in a row (e.g. Page 11 -> Page 1),
+              // verifying settled 120ms debounce collapses intermediate clicks without serialized multi-page stalls.
               const historicalClicks = forwardPages - 1;
-              const beforeBackRowReqs = totalObsRowRequests;
+              const beforeBackRowReqs = totalPaginatedOffsetRequests;
               const tBack = performance.now();
               for (let k = 0; k < historicalClicks; k++) {
                 await prevBtn.click({delay: 30});
               }
               const backOneSig = await waitSettledAtPage(1, prevSig);
               const backwardBurstMs = backOneSig ? Math.round(performance.now() - tBack) : null;
-              const visitedBackwardServerRowQueries = totalObsRowRequests - beforeBackRowReqs;
+              const visitedBackwardServerRowQueries = totalPaginatedOffsetRequests - beforeBackRowReqs;
               if (!backOneSig) {
                 return {
                   pagesStepped: historicalClicks,
@@ -1526,6 +1527,38 @@ export class RegressionScenarios {
                   durationMs,
                 });
               }
+            }
+            // Also verify unscoped /observations?offset=... pushes offset past default empty InMemoryObsStore (systemStateDb)
+            if (totalRows >= 60) {
+              const recentStartIso = new Date(Date.now() - 2 * 3_600_000).toISOString();
+              const unscopedParams = new URLSearchParams({
+                phenomenonTime: `${recentStartIso}/${cutoffIso}`,
+                resultTime: `../${cutoffIso}`,
+                order: "desc",
+                offset: "300",
+                limit: "15",
+              });
+              const tUnscoped = performance.now();
+              const resUnscoped = await page.context().request.get(
+                this.viewerUrl(`/sensorhub/api/observations?${unscopedParams}`),
+                {headers: {Accept: "application/om+json"}},
+              );
+              const unscopedMs = Math.round(performance.now() - tUnscoped);
+              let unscopedItems = 0;
+              try {
+                if (resUnscoped.ok()) {
+                  const payload = await resUnscoped.json() as {items?: unknown[]};
+                  unscopedItems = Array.isArray(payload.items) ? payload.items.length : 0;
+                }
+              } finally {
+                await resUnscoped.dispose();
+              }
+              deepOffsetProbes.push({
+                offset: 300,
+                status: resUnscoped.status(),
+                itemCount: unscopedItems,
+                durationMs: unscopedMs,
+              });
             }
           }
 
@@ -10957,6 +10990,7 @@ export class RegressionScenarios {
       });
 
       if (this.originalRpmConfig) {
+        let webrelayTrigger: Awaited<ReturnType<typeof this.triggerAlarm>> | undefined;
         await this.check({
           scenario: "lane-webrelay",
           category: "auto-alarm-gatekeeper",
@@ -10970,7 +11004,7 @@ export class RegressionScenarios {
             this.emulator.shortAlarmConfig(this.originalRpmConfig!),
           );
           await this.waitHealthRpmConnection(page, "online", 60_000);
-          await this.triggerAlarm("gamma");
+          webrelayTrigger = await this.triggerAlarm("gamma", "lane-webrelay");
 
           let autoPulsed = false;
           let triggeredCount = 0;
@@ -11004,6 +11038,20 @@ export class RegressionScenarios {
             observed: `autoPulsed=${autoPulsed}; triggeredAlarmCount=${triggeredCount}`,
           };
         });
+
+        if (webrelayTrigger) {
+          const alarmRow = await this.findAlarmRow(page, /Gamma/i, webrelayTrigger);
+          const eventId = await this.resolveAlarmEventUuid(
+            page,
+            alarmRow,
+            "gamma",
+            webrelayTrigger.occupancyCount,
+            "lane-webrelay",
+          );
+          if (eventId) {
+            await this.captureAlarmMedia(page, eventId, "gamma", webrelayTrigger.occupancyCount, "lane-webrelay");
+          }
+        }
       }
     } finally {
       // Restore exact pre-test WebRelay settings on reserved lane

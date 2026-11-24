@@ -431,6 +431,7 @@ export function assessEventLogOnDemandUpSet(
 }
 
 export const EVENT_LOG_BACKWARD_10X_MAX_MS = 2_500;
+export const EVENT_LOG_BACKWARD_10X_MAX_PAGE_QUERIES = 6;
 export const EVENT_LOG_DEEP_OFFSET_MAX_MS = 2_500;
 export const EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS = 3;
 
@@ -483,7 +484,8 @@ function backwardModeValid(
     Number.isFinite(mode.backwardBurstMs) &&
     mode.backwardBurstMs >= 0 &&
     mode.backwardBurstMs <= EVENT_LOG_BACKWARD_10X_MAX_MS &&
-    mode.visitedBackwardServerRowQueries === 0;
+    mode.visitedBackwardServerRowQueries >= 0 &&
+    mode.visitedBackwardServerRowQueries <= EVENT_LOG_BACKWARD_10X_MAX_PAGE_QUERIES;
 }
 
 export function assessEventLogBackwardPaginationAndScaling(

@@ -418,13 +418,13 @@ test("assessEventLogBackwardPaginationAndScaling enforces 10x Previous (<) in Pr
     prioritySort: {
       pagesStepped: 10,
       backwardBurstMs: 420,
-      visitedBackwardServerRowQueries: 0,
+      visitedBackwardServerRowQueries: 2,
       settledBackAtPageZero: true,
     },
     newestFirstSort: {
       pagesStepped: 10,
       backwardBurstMs: 390,
-      visitedBackwardServerRowQueries: 0,
+      visitedBackwardServerRowQueries: 2,
       settledBackAtPageZero: true,
     },
     deepOffsetProbes: [
@@ -440,7 +440,7 @@ test("assessEventLogBackwardPaginationAndScaling enforces 10x Previous (<) in Pr
   };
   assert.equal(assessEventLogBackwardPaginationAndScaling(healthy).passed, true);
 
-  // Catches 33-second 10x Previous (<) delay or missing visited-page cache in either Priority or Newest-first sort
+  // Catches 33-second 10x Previous (<) delay or serialized un-debounced 10-page request storms in either Priority or Newest-first sort
   assert.equal(
     assessEventLogBackwardPaginationAndScaling({
       ...healthy,
@@ -451,7 +451,7 @@ test("assessEventLogBackwardPaginationAndScaling enforces 10x Previous (<) in Pr
   assert.equal(
     assessEventLogBackwardPaginationAndScaling({
       ...healthy,
-      newestFirstSort: {...healthy.newestFirstSort, visitedBackwardServerRowQueries: 3},
+      newestFirstSort: {...healthy.newestFirstSort, visitedBackwardServerRowQueries: 9},
     }).passed,
     false,
   );

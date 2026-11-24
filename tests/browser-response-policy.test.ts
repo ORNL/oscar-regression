@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {isExpectedHistoricalClipMiss, isExpectedRetainedMediaMiss} from "../src/browser.js";
+import {
+  isExpectedHistoricalClipMiss,
+  isExpectedHistoricalOcrCropMiss,
+  isExpectedRetainedMediaMiss,
+} from "../src/browser.js";
 
 const baseUrl = "https://oscar.local";
 
@@ -42,4 +46,15 @@ test("accepts only scoped historical clip GET 404 matching the active date key",
   assert.equal(isExpectedHistoricalClipMiss(baseUrl, "POST", 404, clipUrl, activeDates), false);
   assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 500, clipUrl, activeDates), false);
   assert.equal(isExpectedHistoricalClipMiss("https://other.local", "GET", 404, clipUrl, activeDates), false);
+});
+
+test("accepts only prior-day OCR crop GET 404 fallback probes while failing closed on current-day crops", () => {
+  const priorCrop = `${baseUrl}/sensorhub/buckets/ocr/crops/2026-11-23/obs-MGphcnAxdDAwNA_d205d1c2-3615-40f9-a3e8-c03e9df670f5.jpg`;
+  const todayCrop = `${baseUrl}/sensorhub/buckets/ocr/crops/2026-11-24/obs-MGphcnAxdDAwNA_d205d1c2-3615-40f9-a3e8-c03e9df670f5.jpg`;
+  assert.equal(isExpectedHistoricalOcrCropMiss(baseUrl, "GET", 404, priorCrop, "2026-11-24"), true);
+  assert.equal(isExpectedHistoricalOcrCropMiss(baseUrl, "GET", 404, todayCrop, "2026-11-24"), false);
+  assert.equal(isExpectedHistoricalOcrCropMiss(baseUrl, "POST", 404, priorCrop, "2026-11-24"), false);
+  assert.equal(isExpectedHistoricalOcrCropMiss(baseUrl, "GET", 500, priorCrop, "2026-11-24"), false);
+  assert.equal(isExpectedHistoricalOcrCropMiss(baseUrl, "GET", 404, `${priorCrop}?x=1`, "2026-11-24"), false);
+  assert.equal(isExpectedHistoricalOcrCropMiss("https://other.test", "GET", 404, priorCrop, "2026-11-24"), false);
 });
