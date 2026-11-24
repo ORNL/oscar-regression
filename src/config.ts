@@ -298,18 +298,10 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   const laneWebRelayWorkflow = capabilityMode("LANE_WEBRELAY_WORKFLOW", "auto");
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
   const storageExpectedReleaseRaw = process.env.STORAGE_EXPECTED_RELEASE?.trim() || "3.11.0";
-  if (storageExpectedReleaseRaw !== "3.11.0" &&
-      storageExpectedReleaseRaw !== "3.11.1" &&
-      storageExpectedReleaseRaw !== "3.11.2" &&
-      storageExpectedReleaseRaw !== "3.11.3" &&
-      storageExpectedReleaseRaw !== "3.11.4" &&
-      storageExpectedReleaseRaw !== "3.11.5" &&
-      storageExpectedReleaseRaw !== "3.11.6" &&
-      storageExpectedReleaseRaw !== "3.11.7" &&
-      storageExpectedReleaseRaw !== "3.11.8") {
-    throw new Error("STORAGE_EXPECTED_RELEASE must be 3.11.0, 3.11.1, 3.11.2, 3.11.3, 3.11.4, 3.11.5, 3.11.6, 3.11.7, or 3.11.8");
+  if (!/^3\.11\.\d+$/.test(storageExpectedReleaseRaw)) {
+    throw new Error("STORAGE_EXPECTED_RELEASE must match 3.11.<patch> (for example 3.11.0 .. 3.11.11)");
   }
-  const storageExpectedRelease: StorageExpectedRelease = storageExpectedReleaseRaw;
+  const storageExpectedRelease = storageExpectedReleaseRaw as StorageExpectedRelease;
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
   const storageBackupMode = backupMode("OSCAR_BACKUP_MODE", "disabled");
   const oscarBuildLabel = process.env.OSCAR_BUILD_LABEL?.trim();
