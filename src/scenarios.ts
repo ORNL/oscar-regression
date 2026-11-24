@@ -1393,12 +1393,13 @@ export class RegressionScenarios {
 
           const initialMeta = await readPaginationMeta();
           const totalRows = initialMeta.totalRows;
-          const targetSteps = totalRows > 15
-            ? Math.min(10, Math.floor((totalRows - 1) / 15))
-            : 0;
+          const maxPageIndex = totalRows > 15 ? Math.floor((totalRows - 1) / 15) : 0;
+          const forwardPages = maxPageIndex >= 2
+            ? Math.min(11, maxPageIndex)
+            : maxPageIndex;
 
           const runSortModeBackwardCheck = async (): Promise<EventLogBackwardSortModeObservation> => {
-            if (targetSteps === 0) {
+            if (forwardPages === 0) {
               return {
                 pagesStepped: 0,
                 backwardBurstMs: 0,
@@ -1409,12 +1410,12 @@ export class RegressionScenarios {
             const nextBtn = page.locator('button[aria-label="Go to next page"], button[title="Go to next page"]').first();
             const prevBtn = page.locator('button[aria-label="Go to previous page"], button[title="Go to previous page"]').first();
             let prevSig = (await readPaginationMeta()).firstSig;
-            for (let p = 1; p <= targetSteps; p++) {
+            for (let p = 1; p <= forwardPages; p++) {
               await nextBtn.click();
               const nextSig = await waitSettledAtPage(p, prevSig);
               if (!nextSig) {
                 return {
-                  pagesStepped: targetSteps,
+                  pagesStepped: forwardPages,
                   backwardBurstMs: null,
                   visitedBackwardServerRowQueries: 0,
                   settledBackAtPageZero: false,
@@ -1423,19 +1424,44 @@ export class RegressionScenarios {
               prevSig = nextSig;
             }
             // Wait briefly for any trailing forward prefetch request registration to settle before counting visited backward requests
-            await sleep(150);
-            const beforeBackRowReqs = totalObsRowRequests;
-            const tBack = performance.now();
-            for (let k = 0; k < targetSteps; k++) {
-              await prevBtn.click({delay: 30});
+            await sleep(200);
+            if (forwardPages >= 2) {
+              // Click Previous (<) up to 10 times in a row across visited historical pages (e.g. Page 11 -> Page 1),
+              // where immutable pageLoadedTime caching must serve every page with 0 server queries.
+              const historicalClicks = forwardPages - 1;
+              const beforeBackRowReqs = totalObsRowRequests;
+              const tBack = performance.now();
+              for (let k = 0; k < historicalClicks; k++) {
+                await prevBtn.click({delay: 30});
+              }
+              const backOneSig = await waitSettledAtPage(1, prevSig);
+              const backwardBurstMs = backOneSig ? Math.round(performance.now() - tBack) : null;
+              const visitedBackwardServerRowQueries = totalObsRowRequests - beforeBackRowReqs;
+              if (!backOneSig) {
+                return {
+                  pagesStepped: historicalClicks,
+                  backwardBurstMs: null,
+                  visitedBackwardServerRowQueries,
+                  settledBackAtPageZero: false,
+                };
+              }
+              // Step back from Page 1 -> Page 0 (which intentionally refreshes live Page 0)
+              await prevBtn.click();
+              const backZeroSig = await waitSettledAtPage(0, backOneSig);
+              return {
+                pagesStepped: historicalClicks,
+                backwardBurstMs,
+                visitedBackwardServerRowQueries,
+                settledBackAtPageZero: backZeroSig !== null,
+              };
             }
+            const tBack = performance.now();
+            await prevBtn.click();
             const backZeroSig = await waitSettledAtPage(0, prevSig);
-            const backwardBurstMs = backZeroSig ? Math.round(performance.now() - tBack) : null;
-            const visitedBackwardServerRowQueries = totalObsRowRequests - beforeBackRowReqs;
             return {
-              pagesStepped: targetSteps,
-              backwardBurstMs,
-              visitedBackwardServerRowQueries,
+              pagesStepped: 1,
+              backwardBurstMs: backZeroSig ? Math.round(performance.now() - tBack) : null,
+              visitedBackwardServerRowQueries: 0,
               settledBackAtPageZero: backZeroSig !== null,
             };
           };
