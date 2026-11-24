@@ -33,4 +33,31 @@ case "$profile" in
   *) echo "Usage: $0 [smoke|full|3.9.2-release|3.11.0-release|restore-drill] [--scenario name[,name...]]" >&2; exit 2 ;;
 esac
 
+endurance_units_to_restore=()
+restore_endurance_services() {
+  local rc=$?
+  if [[ "${#endurance_units_to_restore[@]}" -gt 0 ]]; then
+    for unit in "${endurance_units_to_restore[@]}"; do
+      systemctl --user start "$unit" >/dev/null 2>&1 || true
+    done
+  fi
+  return "$rc"
+}
+
+if [[ "${OSCAR_SKIP_ENDURANCE_HANDOFF:-0}" != "1" ]] \
+  && [[ "$profile" != "smoke" ]] \
+  && command -v systemctl >/dev/null 2>&1; then
+  for unit in oscar-ui-endurance.service oscar-ui-endurance-windows.service; do
+    if systemctl --user is-enabled "$unit" >/dev/null 2>&1; then
+      endurance_units_to_restore+=("$unit")
+    fi
+  done
+  if [[ "${#endurance_units_to_restore[@]}" -gt 0 ]]; then
+    trap restore_endurance_services EXIT INT TERM
+    if systemctl --user is-active oscar-ui-endurance.service >/dev/null 2>&1; then
+      systemctl --user stop oscar-ui-endurance.service >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
 npm run "test:$profile" -- "$@"
