@@ -560,3 +560,10 @@ test("configuration supports STORAGE_EXPECTED_RELEASE=3.11.12", () => {
     assert.equal(cfg.storageExpectedRelease, "3.11.12");
   });
 });
+
+test("configuration supports STORAGE_EXPECTED_RELEASE=3.11.13", () => {
+  withEnvironment({...baseEnvironment, STORAGE_EXPECTED_RELEASE: "3.11.13"}, () => {
+    const cfg = loadConfig(["--profile", "smoke"]);
+    assert.equal(cfg.storageExpectedRelease, "3.11.13");
+  });
+});

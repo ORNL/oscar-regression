@@ -299,7 +299,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
   const storageExpectedReleaseRaw = process.env.STORAGE_EXPECTED_RELEASE?.trim() || "3.11.0";
   if (!/^3\.11\.\d+$/.test(storageExpectedReleaseRaw)) {
-    throw new Error("STORAGE_EXPECTED_RELEASE must match 3.11.<patch> (for example 3.11.0 .. 3.11.12)");
+    throw new Error("STORAGE_EXPECTED_RELEASE must match 3.11.<patch> (for example 3.11.0 .. 3.11.13)");
   }
   const storageExpectedRelease = storageExpectedReleaseRaw as StorageExpectedRelease;
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");

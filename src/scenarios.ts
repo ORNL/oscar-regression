@@ -3676,6 +3676,157 @@ export class RegressionScenarios {
           page.off("console", onConsole);
         }
       });
+
+      await this.check({
+        scenario: "event-filtering",
+        category: "performance",
+        action: "apply Event Log Advanced Filters (Adjudicated, multi-Status, Max Gamma) and toggle Priority/Newest-first without HTTP 5xx",
+        target: "Event Log Advanced filters and toolbar-sort-time-only",
+        expected: "applying Adjudicated (Is not empty) and multi-Status + Max Gamma >= 50 in Priority mode and immediately toggling Newest first settles promptly with zero HTTP 5xx responses and zero error banners",
+      }, async () => {
+        const obs5xxUrls: string[] = [];
+        let inFlightObs = 0;
+        const onReq = (req: import("playwright").Request) => {
+          if (req.url().includes("/sensorhub/api/observations")) {
+            inFlightObs += 1;
+          }
+        };
+        const onReqDone = (req: import("playwright").Request) => {
+          if (req.url().includes("/sensorhub/api/observations")) {
+            inFlightObs = Math.max(0, inFlightObs - 1);
+          }
+        };
+        const onResponse = (res: import("playwright").Response) => {
+          if (res.url().includes("/sensorhub/api/observations") && res.status() >= 500) {
+            obs5xxUrls.push(`${res.status()} ${res.url()}`);
+          }
+        };
+        page.on("request", onReq);
+        page.on("requestfinished", onReqDone);
+        page.on("requestfailed", onReqDone);
+        page.on("response", onResponse);
+        try {
+          await this.goto(page, "/event-log");
+          await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
+          const newestBtn = page.getByTestId("toolbar-sort-time-only").first();
+          await newestBtn.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+          if ((await newestBtn.getAttribute("aria-pressed")) === "true") {
+            await newestBtn.click();
+            await poll(
+              async () => (await newestBtn.getAttribute("aria-pressed")) !== "true",
+              Boolean,
+              {timeoutMs: this.config.uiTimeoutMs, intervalMs: 100, description: "reset to Priority sort"},
+            );
+          }
+
+          const waitPageSettled = async (label: string): Promise<number> => {
+            const started = Date.now();
+            await poll(
+              async () => {
+                const progress = await page.locator(".MuiDataGrid-root [role='progressbar']").count();
+                return progress === 0 && inFlightObs === 0;
+              },
+              Boolean,
+              {timeoutMs: 15_000, intervalMs: 100, description: label},
+            );
+            return Date.now() - started;
+          };
+
+          // Phase 1: Exact operator reproduction — Adjudicated "Is not empty" in Priority mode -> immediate Newest first toggle -> back to Priority
+          await page.getByRole("button", {name: /advanced filters/i}).first().click();
+          const dialog = page.getByRole("dialog", {name: /advanced filters/i});
+          await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+          await dialog.getByRole("button", {name: /clear all/i}).click();
+          await dialog.getByRole("button", {name: /add condition/i}).click();
+          const boxes = dialog.getByRole("combobox");
+          await boxes.nth(1).click();
+          await page.getByRole("option", {name: "Adjudicated", exact: true}).click();
+          await boxes.nth(2).click();
+          await page.getByRole("option", {name: "Is not empty", exact: true}).click();
+          await dialog.getByRole("button", {name: /apply filters/i}).click();
+          await dialog.waitFor({state: "hidden"});
+
+          // Immediately toggle Newest first (racing the 150ms priority bucket-prewarm window)
+          const adjNewestStart = Date.now();
+          await newestBtn.click();
+          await poll(
+            async () => (await newestBtn.getAttribute("aria-pressed")) === "true",
+            Boolean,
+            {timeoutMs: this.config.uiTimeoutMs, intervalMs: 50, description: "Newest first active under Adjudicated filter"},
+          );
+          await waitPageSettled("Adjudicated + Newest first settlement");
+          const adjNewestMs = Date.now() - adjNewestStart;
+
+          // Toggle back to Priority mode and verify clean settlement
+          const adjPriorityStart = Date.now();
+          await newestBtn.click();
+          await poll(
+            async () => (await newestBtn.getAttribute("aria-pressed")) !== "true",
+            Boolean,
+            {timeoutMs: this.config.uiTimeoutMs, intervalMs: 50, description: "Priority active under Adjudicated filter"},
+          );
+          await waitPageSettled("Adjudicated + Priority settlement");
+          const adjPriorityMs = Date.now() - adjPriorityStart;
+
+          // Phase 2: Multi-Status (Gamma + Neutron) + numeric Max Gamma >= 50 -> immediate Newest first toggle
+          await page.getByRole("button", {name: /advanced filters/i}).first().click();
+          await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+          await dialog.getByRole("button", {name: /clear all/i}).click();
+          await dialog.getByRole("button", {name: /add condition/i}).click();
+          // Default new rule is Status + Is any of
+          await boxes.nth(3).click();
+          await page.getByRole("option", {name: "Gamma", exact: true}).click();
+          await page.getByRole("option", {name: "Neutron", exact: true}).click();
+          if (await page.getByRole("listbox").isVisible().catch(() => false)) {
+            await page.keyboard.press("Escape");
+          }
+          await dialog.getByRole("button", {name: /add condition/i}).click();
+          await boxes.nth(4).click();
+          await page.getByRole("option", {name: "Max Gamma (cps)", exact: true}).click();
+          await dialog.locator('input[type="number"]').first().fill("50");
+          await dialog.getByRole("button", {name: /apply filters/i}).click();
+          await dialog.waitFor({state: "hidden"});
+
+          const multiNewestStart = Date.now();
+          await newestBtn.click();
+          await poll(
+            async () => (await newestBtn.getAttribute("aria-pressed")) === "true",
+            Boolean,
+            {timeoutMs: this.config.uiTimeoutMs, intervalMs: 50, description: "Newest first active under multi-Status + Max Gamma"},
+          );
+          await waitPageSettled("multi-Status + Max Gamma + Newest first settlement");
+          const multiNewestMs = Date.now() - multiNewestStart;
+
+          const errorAlerts = await page.locator('[role="alert"]').filter({hasText: /failed|error|500|busy/i}).count();
+
+          // Clean up filters & restore default Priority sort for downstream checks
+          await page.getByRole("button", {name: /advanced filters/i}).first().click();
+          await dialog.waitFor({timeout: this.config.uiTimeoutMs});
+          await dialog.getByRole("button", {name: /clear all/i}).click();
+          await dialog.getByRole("button", {name: /apply filters/i}).click();
+          await dialog.waitFor({state: "hidden"});
+          if ((await newestBtn.getAttribute("aria-pressed")) === "true") {
+            await newestBtn.click();
+          }
+
+          const passed = obs5xxUrls.length === 0 &&
+            errorAlerts === 0 &&
+            adjNewestMs <= 4_500 &&
+            adjPriorityMs <= 4_500 &&
+            multiNewestMs <= 10_000;
+          return {
+            passed,
+            observed: `adjNewestMs=${adjNewestMs}; adjPriorityMs=${adjPriorityMs}; multiStatusMaxGammaNewestMs=${multiNewestMs}; ` +
+              `obs5xx=${obs5xxUrls.length}; errorAlerts=${errorAlerts}`,
+            evidence: passed ? "" : await this.screenshotOnFailure(page, "event-log-filter-sort-contention-failed"),
+          };
+        } finally {
+          page.off("request", onReq);
+          page.off("requestfinished", onReqDone);
+          page.off("requestfailed", onReqDone);
+          page.off("response", onResponse);
+        }
+      });
     } finally { await page.close(); }
   }
 
