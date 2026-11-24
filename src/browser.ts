@@ -49,6 +49,28 @@ export function isExpectedHistoricalClipMiss(
   }
 }
 
+export function isExpectedHistoricalOcrCropMiss(
+  baseUrl: string,
+  method: string,
+  status: number,
+  responseUrl: string,
+  currentUtcDate = new Date().toISOString().slice(0, 10),
+): boolean {
+  if (method !== "GET" || status !== 404) return false;
+  try {
+    const expectedOrigin = new URL(baseUrl).origin;
+    const response = new URL(responseUrl);
+    if (response.origin !== expectedOrigin || response.search !== "" || response.hash !== "") return false;
+    const pathname = decodeURIComponent(response.pathname);
+    const match = /^\/sensorhub\/buckets\/ocr\/crops\/(\d{4}-\d{2}-\d{2})\/obs-[A-Za-z0-9_-]{1,160}\.jpg$/.exec(
+      pathname,
+    );
+    return Boolean(match?.[1] && match[1] < currentUtcDate);
+  } catch {
+    return false;
+  }
+}
+
 export class BrowserHarness {
   private browser: Browser | undefined;
   private oscarContext: BrowserContext | undefined;
@@ -374,8 +396,15 @@ export class BrowserHarness {
           url,
           this.expectedHistoricalClipDates,
         );
+        const expectedHistoricalOcrCropMiss = isExpectedHistoricalOcrCropMiss(
+          this.config.oscarBaseUrl,
+          response.request().method(),
+          response.status(),
+          url,
+        );
         if (!expectedPreparingRequest && !expectedRetainedMediaMiss &&
-            !expectedMissingObservation && !expectedHistoricalClipMiss) {
+            !expectedMissingObservation && !expectedHistoricalClipMiss &&
+            !expectedHistoricalOcrCropMiss) {
           this.reporter.error(
             this.scenario,
             `${source}-http`,
