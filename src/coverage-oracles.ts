@@ -429,3 +429,96 @@ export function assessEventLogOnDemandUpSet(
     fullFilterSummaryValid,
   };
 }
+
+export const EVENT_LOG_BACKWARD_10X_MAX_MS = 2_500;
+export const EVENT_LOG_DEEP_OFFSET_MAX_MS = 2_500;
+export const EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS = 3;
+
+export interface EventLogBackwardSortModeObservation {
+  pagesStepped: number;
+  backwardBurstMs: number | null;
+  visitedBackwardServerRowQueries: number;
+  settledBackAtPageZero: boolean;
+}
+
+export interface EventLogDeepOffsetProbeObservation {
+  offset: number;
+  status: number;
+  itemCount: number;
+  durationMs: number;
+}
+
+export interface EventLogBackwardPaginationObservation {
+  totalRows: number;
+  prioritySort: EventLogBackwardSortModeObservation;
+  newestFirstSort: EventLogBackwardSortModeObservation;
+  deepOffsetProbes: readonly EventLogDeepOffsetProbeObservation[];
+  obs5xxCount: number;
+  unboundedStartEndLookups: number;
+  maxDuplicateOffsetRequests: number;
+  errorBannerShown: boolean;
+  noResultsShown: boolean;
+}
+
+export interface EventLogBackwardPaginationAssessment {
+  passed: boolean;
+  priorityBackwardValid: boolean;
+  newestBackwardValid: boolean;
+  deepOffsetsValid: boolean;
+  no5xx: boolean;
+  noUnboundedLookups: boolean;
+  noPrefetchStorm: boolean;
+  noUiErrors: boolean;
+}
+
+function backwardModeValid(
+  totalRows: number,
+  mode: EventLogBackwardSortModeObservation,
+): boolean {
+  if (totalRows <= 15 || mode.pagesStepped === 0) {
+    return mode.pagesStepped === 0;
+  }
+  return mode.settledBackAtPageZero &&
+    mode.backwardBurstMs !== null &&
+    Number.isFinite(mode.backwardBurstMs) &&
+    mode.backwardBurstMs >= 0 &&
+    mode.backwardBurstMs <= EVENT_LOG_BACKWARD_10X_MAX_MS &&
+    mode.visitedBackwardServerRowQueries === 0;
+}
+
+export function assessEventLogBackwardPaginationAndScaling(
+  obs: EventLogBackwardPaginationObservation,
+): EventLogBackwardPaginationAssessment {
+  const priorityBackwardValid = backwardModeValid(obs.totalRows, obs.prioritySort);
+  const newestBackwardValid = backwardModeValid(obs.totalRows, obs.newestFirstSort);
+  const deepOffsetsValid = obs.deepOffsetProbes.every((probe) =>
+    probe.status === 200 &&
+    probe.itemCount > 0 &&
+    Number.isFinite(probe.durationMs) &&
+    probe.durationMs >= 0 &&
+    probe.durationMs <= EVENT_LOG_DEEP_OFFSET_MAX_MS,
+  );
+  const no5xx = obs.obs5xxCount === 0;
+  const noUnboundedLookups = obs.unboundedStartEndLookups === 0;
+  const noPrefetchStorm =
+    obs.maxDuplicateOffsetRequests >= 0 &&
+    obs.maxDuplicateOffsetRequests <= EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS;
+  const noUiErrors = !obs.errorBannerShown && (obs.totalRows === 0 || !obs.noResultsShown);
+
+  return {
+    passed: priorityBackwardValid &&
+      newestBackwardValid &&
+      deepOffsetsValid &&
+      no5xx &&
+      noUnboundedLookups &&
+      noPrefetchStorm &&
+      noUiErrors,
+    priorityBackwardValid,
+    newestBackwardValid,
+    deepOffsetsValid,
+    no5xx,
+    noUnboundedLookups,
+    noPrefetchStorm,
+    noUiErrors,
+  };
+}

@@ -58,6 +58,7 @@ import {
 import {
   assessDashboardLoadAndNextPageLatency,
   assessDashboardWidgetCustomization,
+  assessEventLogBackwardPaginationAndScaling,
   assessEventLogOnDemandUpSet,
   assessLaneViewStatusTableFaults,
   assessLiveVideoStartupAndAdvance,
@@ -68,7 +69,10 @@ import {
   DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS,
   DASHBOARD_INITIAL_FIRST_ROW_MAX_MS,
   DASHBOARD_NEXT_PAGE_MAX_MS,
+  EVENT_LOG_BACKWARD_10X_MAX_MS,
+  EVENT_LOG_DEEP_OFFSET_MAX_MS,
   EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS,
+  EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS,
   EVENT_LOG_UPSET_EXPAND_MAX_MS,
   importedAlarmChartsRendered,
   LIVE_VIDEO_MAX_STARTUP_MS,
@@ -78,6 +82,8 @@ import {
   scopedUuidOperationalViewChecksEnabled,
   type AlarmChartCanvasSnapshot,
   type AlarmChartSeries,
+  type EventLogBackwardSortModeObservation,
+  type EventLogDeepOffsetProbeObservation,
   type MultiCameraFeedObservation,
 } from "./coverage-oracles.js";
 import {assessKnownClearTamperBaseline, RpmEmulatorClient} from "./emulator.js";
@@ -1298,6 +1304,263 @@ export class RegressionScenarios {
             `returnObsRequests=${returnObsRequests}; returnCountRequests=${returnCountRequests}`,
           evidence: passed ? "" : await this.screenshotOnFailure(page, "saved-query-cached-return-failed"),
         };
+      });
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "performance",
+        action: "verify /event-log 10x rapid Previous (<) backward pagination in Priority and Newest-first sorts plus O(1) multi-Parquet deep-offset latency invariance",
+        target: "/event-log and /sensorhub/api/observations",
+        expected: `10x Previous (<) across visited pages settles <=${EVENT_LOG_BACKWARD_10X_MAX_MS}ms with 0 server row queries in both Priority and Newest-first sorts, 0 unbounded startTime/endTime lookups, <=${EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS} duplicate offset fetches, and deep-offset ConSys pages <=${EVENT_LOG_DEEP_OFFSET_MAX_MS}ms`,
+      }, async () => {
+        let obs5xxCount = 0;
+        let unboundedStartEndLookups = 0;
+        let totalObsRowRequests = 0;
+        const offsetCounts = new Map<string, number>();
+        const capturedOccupancyStreams = new Set<string>();
+
+        const onReq = (req: Request) => {
+          const url = req.url();
+          if (!url.includes("/sensorhub/api/observations") || url.includes("/observations/count")) return;
+          totalObsRowRequests += 1;
+          try {
+            const parsed = new URL(url);
+            const ds = parsed.searchParams.get("dataStream") ?? "";
+            if (ds.includes(",")) {
+              for (const id of ds.split(",")) {
+                if (id.trim()) capturedOccupancyStreams.add(id.trim());
+              }
+            }
+            const filterVal = decodeURIComponent(parsed.searchParams.get("filter") ?? "");
+            if (filterVal.includes("startTime=") && !parsed.searchParams.has("phenomenonTime")) {
+              unboundedStartEndLookups += 1;
+            }
+            const offsetVal = parsed.searchParams.get("offset");
+            if (offsetVal && Number(offsetVal) > 0) {
+              const key = `${filterVal}|offset=${offsetVal}|limit=${parsed.searchParams.get("limit") ?? ""}`;
+              offsetCounts.set(key, (offsetCounts.get(key) ?? 0) + 1);
+            }
+          } catch {
+            // ignore malformed URL
+          }
+        };
+        const onRes = (res: Response) => {
+          if (res.url().includes("/sensorhub/api/observations") && res.status() >= 500) {
+            obs5xxCount += 1;
+          }
+        };
+
+        page.on("request", onReq);
+        page.on("response", onRes);
+        try {
+          await this.goto(page, "/event-log");
+          await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+          await page.locator(".MuiDataGrid-row").first().waitFor({state: "visible", timeout: 10_000}).catch(() => {});
+
+          const readPaginationMeta = () => page.evaluate(() => {
+            const pag = document.querySelector(".MuiTablePagination-displayedRows")?.textContent?.trim() ?? "";
+            const totalMatch = /of\s+([\d,]+)/i.exec(pag);
+            const totalRows = totalMatch?.[1] ? Number(totalMatch[1].replace(/,/g, "")) : 0;
+            const r0 = document.querySelector(".MuiDataGrid-row");
+            const firstSig = r0
+              ? `${r0.getAttribute("data-id") ?? ""}|${(r0.textContent ?? "").slice(0, 80)}`
+              : "";
+            const busy = Boolean(
+              document.querySelector(".MuiDataGrid-main .MuiCircularProgress-root") ||
+              document.querySelector(".MuiDataGrid-main .MuiLinearProgress-root"),
+            );
+            return {pag, totalRows, firstSig, rowCount: document.querySelectorAll(".MuiDataGrid-row").length, busy};
+          });
+
+          const waitSettledAtPage = async (pageIdx: number, prevSig: string): Promise<string | null> => {
+            const expectedStart = pageIdx * 15 + 1;
+            let latestSig: string | null = null;
+            const settled = await poll(
+              async () => {
+                const m = await readPaginationMeta();
+                const startsOk = m.pag.startsWith(`${expectedStart}–`) || m.pag.startsWith(`${expectedStart}-`);
+                if (!startsOk || m.busy || m.rowCount === 0 || !m.firstSig || m.firstSig === prevSig) {
+                  return false;
+                }
+                latestSig = m.firstSig;
+                return true;
+              },
+              Boolean,
+              {timeoutMs: 15_000, intervalMs: 40, description: `/event-log page ${pageIdx} settled`},
+            ).then(() => true, () => false);
+            return settled ? latestSig : null;
+          };
+
+          const initialMeta = await readPaginationMeta();
+          const totalRows = initialMeta.totalRows;
+          const maxPageIndex = totalRows > 15 ? Math.floor((totalRows - 1) / 15) : 0;
+          const forwardPages = maxPageIndex >= 2
+            ? Math.min(11, maxPageIndex)
+            : maxPageIndex;
+
+          const runSortModeBackwardCheck = async (): Promise<EventLogBackwardSortModeObservation> => {
+            if (forwardPages === 0) {
+              return {
+                pagesStepped: 0,
+                backwardBurstMs: 0,
+                visitedBackwardServerRowQueries: 0,
+                settledBackAtPageZero: true,
+              };
+            }
+            const nextBtn = page.locator('button[aria-label="Go to next page"], button[title="Go to next page"]').first();
+            const prevBtn = page.locator('button[aria-label="Go to previous page"], button[title="Go to previous page"]').first();
+            let prevSig = (await readPaginationMeta()).firstSig;
+            for (let p = 1; p <= forwardPages; p++) {
+              await nextBtn.click();
+              const nextSig = await waitSettledAtPage(p, prevSig);
+              if (!nextSig) {
+                return {
+                  pagesStepped: forwardPages,
+                  backwardBurstMs: null,
+                  visitedBackwardServerRowQueries: 0,
+                  settledBackAtPageZero: false,
+                };
+              }
+              prevSig = nextSig;
+            }
+            // Wait briefly for any trailing forward prefetch request registration to settle before counting visited backward requests
+            await sleep(200);
+            if (forwardPages >= 2) {
+              // Click Previous (<) up to 10 times in a row across visited historical pages (e.g. Page 11 -> Page 1),
+              // where immutable pageLoadedTime caching must serve every page with 0 server queries.
+              const historicalClicks = forwardPages - 1;
+              const beforeBackRowReqs = totalObsRowRequests;
+              const tBack = performance.now();
+              for (let k = 0; k < historicalClicks; k++) {
+                await prevBtn.click({delay: 30});
+              }
+              const backOneSig = await waitSettledAtPage(1, prevSig);
+              const backwardBurstMs = backOneSig ? Math.round(performance.now() - tBack) : null;
+              const visitedBackwardServerRowQueries = totalObsRowRequests - beforeBackRowReqs;
+              if (!backOneSig) {
+                return {
+                  pagesStepped: historicalClicks,
+                  backwardBurstMs: null,
+                  visitedBackwardServerRowQueries,
+                  settledBackAtPageZero: false,
+                };
+              }
+              // Step back from Page 1 -> Page 0 (which intentionally refreshes live Page 0)
+              await prevBtn.click();
+              const backZeroSig = await waitSettledAtPage(0, backOneSig);
+              return {
+                pagesStepped: historicalClicks,
+                backwardBurstMs,
+                visitedBackwardServerRowQueries,
+                settledBackAtPageZero: backZeroSig !== null,
+              };
+            }
+            const tBack = performance.now();
+            await prevBtn.click();
+            const backZeroSig = await waitSettledAtPage(0, prevSig);
+            return {
+              pagesStepped: 1,
+              backwardBurstMs: backZeroSig ? Math.round(performance.now() - tBack) : null,
+              visitedBackwardServerRowQueries: 0,
+              settledBackAtPageZero: backZeroSig !== null,
+            };
+          };
+
+          const prioritySort = await runSortModeBackwardCheck();
+
+          // Toggle "Newest first" chronological mode and repeat the 10x Previous (<) check
+          const newestBtn = page.getByTestId("toolbar-sort-time-only").first();
+          await newestBtn.waitFor({state: "visible", timeout: 10_000});
+          await newestBtn.click();
+          await poll(
+            async () => (await newestBtn.getAttribute("aria-pressed")) === "true",
+            Boolean,
+            {timeoutMs: 5_000, intervalMs: 50, description: "Newest first sort active"},
+          );
+          if (totalRows > 0) {
+            await waitSettledAtPage(0, "__NEWEST_INIT__");
+          }
+          offsetCounts.clear();
+          const newestFirstSort = await runSortModeBackwardCheck();
+
+          // Probe ConSys deep-offset O(1) latency invariance directly across available history depth
+          const deepOffsetProbes: EventLogDeepOffsetProbeObservation[] = [];
+          if (capturedOccupancyStreams.size > 0 && totalRows > 60) {
+            const dsCsv = [...capturedOccupancyStreams].join(",");
+            const cutoffIso = new Date().toISOString();
+            const candidateOffsets = [405, 150_000, 1_500_000]
+              .filter((off) => off + 15 <= totalRows);
+            if (candidateOffsets.length === 0) {
+              candidateOffsets.push(Math.max(15, Math.floor((totalRows - 15) / 15) * 15));
+            }
+            for (const probeOffset of candidateOffsets) {
+              const params = new URLSearchParams({
+                dataStream: dsCsv,
+                resultTime: `../${cutoffIso}`,
+                filter: probeOffset >= 5_000 ? "gammaAlarm=false AND neutronAlarm=false" : "",
+                order: "desc",
+                offset: String(probeOffset),
+                limit: "15",
+              });
+              if (!params.get("filter")) params.delete("filter");
+              const tProbe = performance.now();
+              const res = await page.context().request.get(
+                this.viewerUrl(`/sensorhub/api/observations?${params}`),
+                {headers: {Accept: "application/om+json"}},
+              );
+              const durationMs = Math.round(performance.now() - tProbe);
+              let itemCount = 0;
+              try {
+                if (res.ok()) {
+                  const payload = await res.json() as {items?: unknown[]};
+                  itemCount = Array.isArray(payload.items) ? payload.items.length : 0;
+                }
+              } finally {
+                await res.dispose();
+              }
+              if (itemCount > 0 || probeOffset < 5_000) {
+                deepOffsetProbes.push({
+                  offset: probeOffset,
+                  status: res.status(),
+                  itemCount,
+                  durationMs,
+                });
+              }
+            }
+          }
+
+          const errorBannerShown = (await page.locator('text="Events could not be loaded"').count()) > 0;
+          const noResultsShown = (await page.locator('text="No results found"').count()) > 0;
+          const maxDuplicateOffsetRequests = offsetCounts.size > 0
+            ? Math.max(...offsetCounts.values())
+            : 0;
+
+          const assessment = assessEventLogBackwardPaginationAndScaling({
+            totalRows,
+            prioritySort,
+            newestFirstSort,
+            deepOffsetProbes,
+            obs5xxCount,
+            unboundedStartEndLookups,
+            maxDuplicateOffsetRequests,
+            errorBannerShown,
+            noResultsShown,
+          });
+          const evidence = assessment.passed
+            ? ""
+            : await this.screenshotOnFailure(page, "event-log-backward-pagination-failed");
+          return {
+            passed: assessment.passed,
+            observed: `totalRows=${totalRows}; priority10xBackMs=${prioritySort.backwardBurstMs ?? "timeout"} (srvReqs=${prioritySort.visitedBackwardServerRowQueries}); ` +
+              `newest10xBackMs=${newestFirstSort.backwardBurstMs ?? "timeout"} (srvReqs=${newestFirstSort.visitedBackwardServerRowQueries}); ` +
+              `deepProbes=[${deepOffsetProbes.map((p) => `off=${p.offset}:${p.status}:${p.itemCount}rows:${p.durationMs}ms`).join(", ")}]; ` +
+              `obs5xx=${obs5xxCount}; unboundedLookups=${unboundedStartEndLookups}; maxDupOffsetReqs=${maxDuplicateOffsetRequests}`,
+            evidence,
+          };
+        } finally {
+          page.off("request", onReq);
+          page.off("response", onRes);
+        }
       });
 
       await this.check({

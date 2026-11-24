@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   assessDashboardLoadAndNextPageLatency,
   assessDashboardWidgetCustomization,
+  assessEventLogBackwardPaginationAndScaling,
   assessEventLogOnDemandUpSet,
   assessLaneViewStatusTableFaults,
   assessLiveVideoStartupAndAdvance,
@@ -14,7 +15,10 @@ import {
   DASHBOARD_DATASTREAMS_COLLECTION_MAX_MS,
   DASHBOARD_INITIAL_FIRST_ROW_MAX_MS,
   DASHBOARD_NEXT_PAGE_MAX_MS,
+  EVENT_LOG_BACKWARD_10X_MAX_MS,
+  EVENT_LOG_DEEP_OFFSET_MAX_MS,
   EVENT_LOG_INITIAL_FIRST_ROW_MAX_MS,
+  EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS,
   EVENT_LOG_UPSET_EXPAND_MAX_MS,
   importedAlarmChartsRendered,
   LIVE_VIDEO_MAX_STARTUP_MS,
@@ -404,6 +408,79 @@ test("assessEventLogOnDemandUpSet requires collapsed zero-cost load and full-fil
   // Rejects summarizing only the 15 paginated rows on Page 1 when totalAlarmCount > 15
   assert.equal(
     assessEventLogOnDemandUpSet({...healthy, summarizedOccupancies: 15}).passed,
+    false,
+  );
+});
+
+test("assessEventLogBackwardPaginationAndScaling enforces 10x Previous (<) in Priority & Newest-first sorts plus O(1) deep offsets", () => {
+  const healthy = {
+    totalRows: 1_790_000,
+    prioritySort: {
+      pagesStepped: 10,
+      backwardBurstMs: 420,
+      visitedBackwardServerRowQueries: 0,
+      settledBackAtPageZero: true,
+    },
+    newestFirstSort: {
+      pagesStepped: 10,
+      backwardBurstMs: 390,
+      visitedBackwardServerRowQueries: 0,
+      settledBackAtPageZero: true,
+    },
+    deepOffsetProbes: [
+      {offset: 405, status: 200, itemCount: 15, durationMs: 120},
+      {offset: 150_000, status: 200, itemCount: 15, durationMs: 140},
+      {offset: 1_500_000, status: 200, itemCount: 15, durationMs: 165},
+    ],
+    obs5xxCount: 0,
+    unboundedStartEndLookups: 0,
+    maxDuplicateOffsetRequests: 1,
+    errorBannerShown: false,
+    noResultsShown: false,
+  };
+  assert.equal(assessEventLogBackwardPaginationAndScaling(healthy).passed, true);
+
+  // Catches 33-second 10x Previous (<) delay or missing visited-page cache in either Priority or Newest-first sort
+  assert.equal(
+    assessEventLogBackwardPaginationAndScaling({
+      ...healthy,
+      prioritySort: {...healthy.prioritySort, backwardBurstMs: EVENT_LOG_BACKWARD_10X_MAX_MS + 100},
+    }).passed,
+    false,
+  );
+  assert.equal(
+    assessEventLogBackwardPaginationAndScaling({
+      ...healthy,
+      newestFirstSort: {...healthy.newestFirstSort, visitedBackwardServerRowQueries: 3},
+    }).passed,
+    false,
+  );
+
+  // Catches O(N) multi-Parquet or overlay scan regression on deep offsets
+  assert.equal(
+    assessEventLogBackwardPaginationAndScaling({
+      ...healthy,
+      deepOffsetProbes: [
+        {offset: 1_500_000, status: 200, itemCount: 15, durationMs: EVENT_LOG_DEEP_OFFSET_MAX_MS + 500},
+      ],
+    }).passed,
+    false,
+  );
+
+  // Catches live MQTT HTTP 499 prefetch-invalidation storms, unbounded startTime/endTime lookups, or UI error states
+  assert.equal(
+    assessEventLogBackwardPaginationAndScaling({
+      ...healthy,
+      maxDuplicateOffsetRequests: EVENT_LOG_MAX_DUPLICATE_OFFSET_REQUESTS + 1,
+    }).passed,
+    false,
+  );
+  assert.equal(
+    assessEventLogBackwardPaginationAndScaling({...healthy, unboundedStartEndLookups: 1}).passed,
+    false,
+  );
+  assert.equal(
+    assessEventLogBackwardPaginationAndScaling({...healthy, errorBannerShown: true}).passed,
     false,
   );
 });

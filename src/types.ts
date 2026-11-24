@@ -6,7 +6,7 @@ export type CapabilityMode = "auto" | "required" | "disabled";
 
 export type BackupMode = "disabled" | "single";
 
-export type StorageExpectedRelease = "3.11.0" | "3.11.1" | "3.11.2" | "3.11.3" | "3.11.4" | "3.11.5" | "3.11.6" | "3.11.7" | "3.11.8";
+export type StorageExpectedRelease = `3.11.${number}`;
 
 export type ResultStatus = "correct" | "incorrect" | "skipped";
 

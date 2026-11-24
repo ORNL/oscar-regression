@@ -546,3 +546,10 @@ test("configuration supports training-sandbox scenario filter and STORAGE_EXPECT
     assert.ok(cfg.scenarioFilter.has("training-sandbox"));
   });
 });
+
+test("configuration supports STORAGE_EXPECTED_RELEASE=3.11.11", () => {
+  withEnvironment({...baseEnvironment, STORAGE_EXPECTED_RELEASE: "3.11.11"}, () => {
+    const cfg = loadConfig(["--profile", "smoke"]);
+    assert.equal(cfg.storageExpectedRelease, "3.11.11");
+  });
+});
