@@ -134,7 +134,7 @@ test("lane configuration parser supports multi-camera CSV headers (e.g. 3 camera
   const rows3 = origRows.map((row, idx) => {
     if (idx === 2) {
       // Lane03 with Camera0 (emulator) + Camera1 (Axis default) + Camera2 (Axis RTSP)
-      return `${row},Axis,192.168.0.188,,H264,user,pass,Custom,192.168.0.188:554,/axis-media/media.amp?videocodec=h264,H264,user,pass`;
+      return `${row},Axis,198.51.100.20,,H264,user,pass,Custom,198.51.100.21:554,/axis-media/media.amp?videocodec=h264,H264,user,pass`;
     }
     return `${row},,,,,,,,,,,,`;
   });
