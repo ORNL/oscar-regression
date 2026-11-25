@@ -12509,16 +12509,25 @@ export class RegressionScenarios {
         }, async () => {
           const recentStartIso = new Date(Date.now() - 24 * 60 * 60 * 1_000).toISOString();
           const windowStartIso = new Date(Date.now() - 29 * 24 * 60 * 60 * 1_000).toISOString();
+          const isoContainerPattern = /^[A-Z]{3}[UJZR]\d{7}$/;
           const collectVehicles = async (
             reqCtx: APIRequestContext,
             baseUrl: string,
           ): Promise<Map<string, string>> => {
             const map = new Map<string, string>();
-            for (const startIso of [recentStartIso, windowStartIso]) {
-              const res = await reqCtx.get(
+            for (const startIso of [windowStartIso, recentStartIso]) {
+              let res = await reqCtx.get(
                 `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=50&startTime=${encodeURIComponent(startIso)}`,
                 {headers: {Accept: "application/json"}, timeout: 90_000},
               );
+              if (res.status() >= 500 && res.status() < 600) {
+                await res.dispose();
+                await new Promise((r) => setTimeout(r, 600));
+                res = await reqCtx.get(
+                  `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=50&startTime=${encodeURIComponent(startIso)}`,
+                  {headers: {Accept: "application/json"}, timeout: 90_000},
+                );
+              }
               try {
                 if (res.ok()) {
                   const json = await res.json() as {
@@ -12552,12 +12561,15 @@ export class RegressionScenarios {
           let targetVehicleId = "";
           let correlationSeedSource = "existing-both-portals";
 
-          for (const [norm] of peerVehicles.entries()) {
-            if (norm.length >= 7 && localVehicles.has(norm)) {
-              targetNorm = norm;
-              targetVehicleId = norm;
-              break;
-            }
+          const sharedIso = [...peerVehicles.keys()].find(
+            (norm) => isoContainerPattern.test(norm) && localVehicles.has(norm),
+          );
+          const sharedSevenChar = [...peerVehicles.keys()].find(
+            (norm) => norm.length >= 7 && localVehicles.has(norm),
+          );
+          if (sharedIso ?? sharedSevenChar) {
+            targetNorm = (sharedIso ?? sharedSevenChar)!;
+            targetVehicleId = targetNorm;
           }
 
           if (!targetNorm) {
