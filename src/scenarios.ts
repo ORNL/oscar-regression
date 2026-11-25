@@ -4042,13 +4042,22 @@ export class RegressionScenarios {
       }, async () => {
         const obs5xxUrls: string[] = [];
         let inFlightObs = 0;
+        let inFlightCounts = 0;
         const onReq = (req: import("playwright").Request) => {
-          if (req.url().includes("/sensorhub/api/observations")) {
+          const url = req.url();
+          if (!url.includes("/sensorhub/api/observations")) return;
+          if (url.includes("/observations/count")) {
+            inFlightCounts += 1;
+          } else {
             inFlightObs += 1;
           }
         };
         const onReqDone = (req: import("playwright").Request) => {
-          if (req.url().includes("/sensorhub/api/observations")) {
+          const url = req.url();
+          if (!url.includes("/sensorhub/api/observations")) return;
+          if (url.includes("/observations/count")) {
+            inFlightCounts = Math.max(0, inFlightCounts - 1);
+          } else {
             inFlightObs = Math.max(0, inFlightObs - 1);
           }
         };
@@ -4154,6 +4163,11 @@ export class RegressionScenarios {
           const multiNewestMs = Date.now() - multiNewestStart;
 
           const errorAlerts = await page.locator('[role="alert"]').filter({hasText: /failed|error|500|busy/i}).count();
+          await poll(
+            async () => inFlightCounts === 0,
+            Boolean,
+            {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100, description: "background count queries HTTP status check"},
+          ).catch(() => undefined);
 
           // Clean up filters & restore default Priority sort for downstream checks
           await page.getByRole("button", {name: /advanced filters/i}).first().click();
@@ -8353,20 +8367,22 @@ export class RegressionScenarios {
         // radiation profile traces, open VehiclePassComparisonDialog from Pass #2's related-passes
         // banner, batch-adjudicate open Pass #2, and export consolidated VEHICLE_INCIDENT reports
         // across PDF, CSV, JSON, and XLSX.
+        // Use a neutron alarm on confirmation re-scans so EML never auto-releases Pass #2 as EML Non-Threat
+        // before VehiclePassComparisonDialog exercises open-alarm batch adjudication.
         let basePassEventId = eventId;
         let rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-        const trigger2 = await this.triggerAlarm("gamma", "vehicle-ocr");
-        if (!trigger2) throw new Error("Confirmation re-scan gamma alarm trigger returned no occupancy identity");
-        const alarmRow2 = await this.findAlarmRow(page, /Gamma/i, trigger2);
+        const trigger2 = await this.triggerAlarm("neutron", "vehicle-ocr");
+        if (!trigger2) throw new Error("Confirmation re-scan neutron alarm trigger returned no occupancy identity");
+        const alarmRow2 = await this.findAlarmRow(page, /Neutron/i, trigger2);
         let eventId2 = await this.resolveAlarmEventUuid(
           page,
           alarmRow2,
-          "gamma",
+          "neutron",
           trigger2.occupancyCount,
           "vehicle-ocr",
         );
-        if (!eventId2) throw new Error("Failed to resolve occupancy UUID for confirmation re-scan gamma alarm");
-        await this.captureAlarmMedia(page, eventId2, "gamma", trigger2.occupancyCount, "vehicle-ocr");
+        if (!eventId2) throw new Error("Failed to resolve occupancy UUID for confirmation re-scan neutron alarm");
+        await this.captureAlarmMedia(page, eventId2, "neutron", trigger2.occupancyCount, "vehicle-ocr");
 
         const fetchOcrForObsId = async (targetObsId: string, winStartIso: string): Promise<OcrObservationRecord[]> => {
           const windowEndIso = new Date(Date.now() + 60_000).toISOString();
@@ -8424,22 +8440,22 @@ export class RegressionScenarios {
             predicate: (c: OcrObservationRecord) => boolean,
             label: string,
           ): Promise<OcrObservationRecord[]> => {
-            for (let attempt = 0; attempt < 3; attempt++) {
+            for (let attempt = 0; attempt < 6; attempt++) {
               if (attempt > 0) {
                 await sleep(3_500);
                 rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-                const retryTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+                const retryTrigger = await this.triggerAlarm("neutron", "vehicle-ocr");
                 if (!retryTrigger) break;
-                const retryRow = await this.findAlarmRow(page, /Gamma/i, retryTrigger);
+                const retryRow = await this.findAlarmRow(page, /Neutron/i, retryTrigger);
                 const retryEventId = await this.resolveAlarmEventUuid(
                   page,
                   retryRow,
-                  "gamma",
+                  "neutron",
                   retryTrigger.occupancyCount,
                   "vehicle-ocr",
                 );
                 if (!retryEventId) break;
-                await this.captureAlarmMedia(page, retryEventId, "gamma", retryTrigger.occupancyCount, "vehicle-ocr");
+                await this.captureAlarmMedia(page, retryEventId, "neutron", retryTrigger.occupancyCount, "vehicle-ocr");
                 eventId2 = retryEventId;
               }
               const currentId = eventId2!;
@@ -8447,7 +8463,7 @@ export class RegressionScenarios {
                 () => fetchOcrForObsId(currentId, rescanWindowStartIso),
                 items => items.some(predicate),
                 {
-                  timeoutMs: attempt < 2 ? 28_000 : Math.max(this.config.eventTimeoutMs, 45_000),
+                  timeoutMs: attempt < 5 ? 20_000 : Math.max(this.config.eventTimeoutMs, 45_000),
                   intervalMs: 1_000,
                   description: `${label} for occupancy ${currentId}`,
                 },
@@ -8515,18 +8531,18 @@ export class RegressionScenarios {
 
             if (playlistStep < 5) {
               rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-              const nextRescanTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
-              if (!nextRescanTrigger) throw new Error("Playlist-follow-up confirmation gamma alarm trigger returned no occupancy identity");
-              const nextAlarmRow = await this.findAlarmRow(page, /Gamma/i, nextRescanTrigger);
+              const nextRescanTrigger = await this.triggerAlarm("neutron", "vehicle-ocr");
+              if (!nextRescanTrigger) throw new Error("Playlist-follow-up confirmation neutron alarm trigger returned no occupancy identity");
+              const nextAlarmRow = await this.findAlarmRow(page, /Neutron/i, nextRescanTrigger);
               const nextEventId = await this.resolveAlarmEventUuid(
                 page,
                 nextAlarmRow,
-                "gamma",
+                "neutron",
                 nextRescanTrigger.occupancyCount,
                 "vehicle-ocr",
               );
               if (!nextEventId) throw new Error("Failed to resolve occupancy UUID for playlist-follow-up confirmation alarm");
-              await this.captureAlarmMedia(page, nextEventId, "gamma", nextRescanTrigger.occupancyCount, "vehicle-ocr");
+              await this.captureAlarmMedia(page, nextEventId, "neutron", nextRescanTrigger.occupancyCount, "vehicle-ocr");
               eventId2 = nextEventId;
             }
           }
@@ -12220,9 +12236,11 @@ export class RegressionScenarios {
           const delRes = await peerContext.delete(deleteUrl, {
             headers: {
               Accept: "application/json",
+              "Content-Type": "application/json",
               Origin: peerBaseUrl,
               "X-Requested-With": "XMLHttpRequest",
             },
+            data: {},
             timeout: 60_000,
           });
           const delStatus = delRes.status();
