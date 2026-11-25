@@ -4083,7 +4083,7 @@ export class RegressionScenarios {
                 return progress === 0 && inFlightObs === 0;
               },
               Boolean,
-              {timeoutMs: 15_000, intervalMs: 100, description: label},
+              {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100, description: label},
             );
             return Date.now() - started;
           };
@@ -12209,11 +12209,22 @@ export class RegressionScenarios {
       if (!createdTokenId) return;
       const tokenToRevoke = createdTokenId;
       createdTokenId = "";
-      const delRes = await peerContext.delete(
-        `${peerBaseUrl}/sensorhub/session/admin/federation-tokens/${encodeURIComponent(tokenToRevoke)}`,
-        {data: {}},
-      );
-      await delRes.dispose();
+      const deleteUrl = `${peerBaseUrl}/sensorhub/session/admin/federation-tokens/${encodeURIComponent(tokenToRevoke)}`;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          const delRes = await peerContext.delete(deleteUrl, {
+            headers: {
+              Accept: "application/json",
+              Origin: peerBaseUrl,
+            },
+            timeout: 60_000,
+          });
+          await delRes.dispose();
+          return;
+        } catch (err) {
+          if (attempt === 2) throw err;
+        }
+      }
     };
 
     this.pendingFederationCleanup = async () => {
