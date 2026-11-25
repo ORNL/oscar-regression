@@ -6,25 +6,25 @@ import {
   isExpectedRetainedMediaMiss,
 } from "../src/browser.js";
 
-const baseUrl = "https://oscar.local";
+const baseUrl = "https://example.invalid";
 
 test("accepts only an exact same-origin retained-media GET 404", () => {
   assert.equal(isExpectedRetainedMediaMiss(
     baseUrl,
     "GET",
     404,
-    "https://oscar.local/sensorhub/buckets/videos/media/0jss260",
+    "https://example.invalid/sensorhub/buckets/videos/media/0jss260",
   ), true);
   assert.equal(isExpectedRetainedMediaMiss(
     baseUrl,
     "GET",
     404,
-    "https://oscar.local/sensorhub/buckets/videos/media/node-0.15303634153679013",
+    "https://example.invalid/sensorhub/buckets/videos/media/node-0.15303634153679013",
   ), true);
 });
 
 test("does not suppress failures outside the retained-media fallback contract", () => {
-  const exactUrl = "https://oscar.local/sensorhub/buckets/videos/media/0jss260";
+  const exactUrl = "https://example.invalid/sensorhub/buckets/videos/media/0jss260";
   assert.equal(isExpectedRetainedMediaMiss(baseUrl, "POST", 404, exactUrl), false);
   assert.equal(isExpectedRetainedMediaMiss(baseUrl, "GET", 500, exactUrl), false);
   assert.equal(isExpectedRetainedMediaMiss(baseUrl, "GET", 404, `${exactUrl}?probe=true`), false);
@@ -32,14 +32,14 @@ test("does not suppress failures outside the retained-media fallback contract", 
   assert.equal(isExpectedRetainedMediaMiss(baseUrl, "GET", 404,
     "https://other.test/sensorhub/buckets/videos/media/0jss260"), false);
   assert.equal(isExpectedRetainedMediaMiss(baseUrl, "GET", 404,
-    "https://oscar.local/sensorhub/buckets/videos/media/%2e%2e%2fadmin"), false);
+    "https://example.invalid/sensorhub/buckets/videos/media/%2e%2e%2fadmin"), false);
   assert.equal(isExpectedRetainedMediaMiss(baseUrl, "GET", 404,
-    "https://oscar.local/sensorhub/buckets/videos/media/"), false);
+    "https://example.invalid/sensorhub/buckets/videos/media/"), false);
 });
 
 test("accepts only scoped historical clip GET 404 matching the active date key", () => {
   const activeDates = new Set(["2026-10-26"]);
-  const clipUrl = "https://oscar.local/sensorhub/buckets/videos/clips/urn-osh-sensor-ffmpeg-lane-lane-02-0/2026-10-26_01-43-05_530-g1.mp4";
+  const clipUrl = "https://example.invalid/sensorhub/buckets/videos/clips/urn-osh-sensor-ffmpeg-lane-lane-02-0/2026-10-26_01-43-05_530-g1.mp4";
   assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 404, clipUrl, activeDates), true);
   assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 404, clipUrl, new Set()), false);
   assert.equal(isExpectedHistoricalClipMiss(baseUrl, "GET", 404, clipUrl, new Set(["2026-11-18"])), false);
