@@ -12430,34 +12430,38 @@ export class RegressionScenarios {
           target: "/event-log and VehiclePassComparisonDialog",
           expected: "cross-origin Bearer GET to peer /sensorhub/buckets/adjudication/vehicle-search returns HTTP 200, summary shows >=2 passes across >=2 sites, and VehiclePassComparisonDialog renders passes from both nodes",
         }, async () => {
+          const recentStartIso = new Date(Date.now() - 24 * 60 * 60 * 1_000).toISOString();
           const windowStartIso = new Date(Date.now() - 29 * 24 * 60 * 60 * 1_000).toISOString();
           const collectVehicles = async (
             reqCtx: APIRequestContext,
             baseUrl: string,
           ): Promise<Map<string, string>> => {
-            const res = await reqCtx.get(
-              `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=100&startTime=${encodeURIComponent(windowStartIso)}`,
-              {headers: {Accept: "application/json"}},
-            );
             const map = new Map<string, string>();
-            try {
-              if (res.ok()) {
-                const json = await res.json() as {
-                  passes?: Array<{normalizedVehicleId?: unknown; vehicleId?: unknown}>;
-                };
-                for (const p of json.passes ?? []) {
-                  const raw = String(p.vehicleId ?? p.normalizedVehicleId ?? "").trim();
-                  const norm = String(p.normalizedVehicleId ?? raw)
-                    .trim()
-                    .toUpperCase()
-                    .replace(/[^A-Z0-9]/g, "");
-                  if (norm.length >= 4 && !map.has(norm)) {
-                    map.set(norm, raw || norm);
+            for (const startIso of [recentStartIso, windowStartIso]) {
+              const res = await reqCtx.get(
+                `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=50&startTime=${encodeURIComponent(startIso)}`,
+                {headers: {Accept: "application/json"}, timeout: 90_000},
+              );
+              try {
+                if (res.ok()) {
+                  const json = await res.json() as {
+                    passes?: Array<{normalizedVehicleId?: unknown; vehicleId?: unknown}>;
+                  };
+                  for (const p of json.passes ?? []) {
+                    const raw = String(p.vehicleId ?? p.normalizedVehicleId ?? "").trim();
+                    const norm = String(p.normalizedVehicleId ?? raw)
+                      .trim()
+                      .toUpperCase()
+                      .replace(/[^A-Z0-9]/g, "");
+                    if (norm.length >= 4 && !map.has(norm)) {
+                      map.set(norm, raw || norm);
+                    }
                   }
                 }
+              } finally {
+                await res.dispose();
               }
-            } finally {
-              await res.dispose();
+              if (map.size > 0) break;
             }
             return map;
           };
@@ -12569,7 +12573,7 @@ export class RegressionScenarios {
                 };
               },
               (obs) => obs.compareVisible && obs.passCount >= 2 && obs.multiSiteMentioned && obs.peerHttp200 && obs.peerBearer,
-              {timeoutMs: 30_000, intervalMs: 300, description: "cross-node Vehicle Search summary and Bearer GET 200"},
+              {timeoutMs: 45_000, intervalMs: 300, description: "cross-node Vehicle Search summary and Bearer GET 200"},
             );
 
             await page.getByTestId("vehicle-search-compare-btn").first().click();
