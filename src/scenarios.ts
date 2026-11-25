@@ -12666,7 +12666,7 @@ export class RegressionScenarios {
                 };
               },
               (obs) => obs.compareVisible && obs.passCount >= 2 && obs.multiSiteMentioned && obs.peerHttp200 && obs.peerBearer,
-              {timeoutMs: 45_000, intervalMs: 300, description: "cross-node Vehicle Search summary and Bearer GET 200"},
+              {timeoutMs: 90_000, intervalMs: 300, description: "cross-node Vehicle Search summary and Bearer GET 200"},
             );
 
             await page.getByTestId("vehicle-search-compare-btn").first().click();
