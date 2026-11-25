@@ -5,7 +5,7 @@ import {mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync} from "node:fs
 import {tmpdir} from "node:os";
 import {join} from "node:path";
 import test from "node:test";
-import {remoteLeaseShell} from "../src/remote-suite-lease.js";
+import {remoteLeaseShell, windowsLeasePowerShell} from "../src/remote-suite-lease.js";
 
 function startLease(
   script: string,
@@ -117,4 +117,13 @@ test("remote lease refuses a symlinked release directory before creating the loc
   } finally {
     rmSync(root, {recursive: true, force: true});
   }
+});
+
+test("windows lease PowerShell polls release signal and parent SSH liveness without stdin blocking", () => {
+  const token = "a".repeat(64);
+  const script = windowsLeasePowerShell("C:\\oscar\\3.12.0-rc1\\oscar-3.11.15", token);
+  assert.match(script, /FileShare\]::None/);
+  assert.match(script, /release-.*\+.*\.signal/);
+  assert.match(script, /ParentProcessId/);
+  assert.doesNotMatch(script, /ReadLine\(\)/);
 });

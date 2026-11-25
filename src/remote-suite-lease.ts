@@ -79,7 +79,7 @@ function waitForExit(child: ChildProcessWithoutNullStreams): Promise<number | nu
   });
 }
 
-function windowsLeasePowerShell(releaseDirectory: string, token: string): string {
+export function windowsLeasePowerShell(releaseDirectory: string, token: string): string {
   const escapedDir = releaseDirectory.replaceAll("'", "''");
   const escapedToken = token.replaceAll("'", "''");
   return [
@@ -93,6 +93,10 @@ function windowsLeasePowerShell(releaseDirectory: string, token: string): string
     "$lockRoot = 'C:\\ProgramData\\oscar-regression-suite'",
     "New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null",
     "$lockFile = Join-Path $lockRoot 'suite.lock'",
+    "$signalFile = Join-Path $lockRoot (\"release-\" + $token + \".signal\")",
+    "Remove-Item -LiteralPath $signalFile -Force -ErrorAction SilentlyContinue",
+    "$selfCim = Get-CimInstance Win32_Process -Filter (\"ProcessId = \" + $PID) -ErrorAction SilentlyContinue",
+    "$parentPid = if ($null -ne $selfCim) { [int]$selfCim.ParentProcessId } else { 0 }",
     "try {",
     "  $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)",
     "} catch [System.IO.IOException] {",
@@ -103,12 +107,31 @@ function windowsLeasePowerShell(releaseDirectory: string, token: string): string
     "try {",
     "  [Console]::Out.WriteLine(\"OSCAR_REGRESSION_LEASE_ACQUIRED:$token\")",
     "  [Console]::Out.Flush()",
-    "  $line = [Console]::In.ReadLine()",
-    "  if ($null -eq $line -or $line.Trim() -ne \"release:$token\") { exit 76 }",
-    "  exit 0",
+    "  while ($true) {",
+    "    if (Test-Path -LiteralPath $signalFile) {",
+    "      Remove-Item -LiteralPath $signalFile -Force -ErrorAction SilentlyContinue",
+    "      exit 0",
+    "    }",
+    "    if ($parentPid -gt 0 -and -not (Get-Process -Id $parentPid -ErrorAction SilentlyContinue)) {",
+    "      exit 76",
+    "    }",
+    "    Start-Sleep -Milliseconds 250",
+    "  }",
     "} finally {",
+    "  Remove-Item -LiteralPath $signalFile -Force -ErrorAction SilentlyContinue",
     "  if ($null -ne $stream) { $stream.Dispose() }",
     "}",
+  ].join("\n");
+}
+
+function windowsReleaseSignalPowerShell(token: string): string {
+  const escapedToken = token.replaceAll("'", "''");
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$lockRoot = 'C:\\ProgramData\\oscar-regression-suite'",
+    "New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null",
+    `$signalFile = Join-Path $lockRoot 'release-${escapedToken}.signal'`,
+    "New-Item -ItemType File -Force -Path $signalFile | Out-Null",
   ].join("\n");
 }
 
@@ -202,6 +225,18 @@ export class RemoteSuiteLease {
     if (!child) return;
     this.child = undefined;
     const exited = waitForExit(child);
+    if (this.windowsHost) {
+      const releaseCommand = `powershell -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(
+        windowsReleaseSignalPowerShell(this.token),
+        "utf16le",
+      ).toString("base64")}`;
+      const signalChild = spawn("ssh", [
+        ...sshOptions(this.config.sshIdentityFile),
+        this.config.oscarSshTarget,
+        releaseCommand,
+      ], {stdio: ["ignore", "ignore", "ignore"]});
+      signalChild.once("error", () => {});
+    }
     child.stdin.end(`release:${this.token}\n`);
     const result = await Promise.race([
       exited.then(code => ({kind: "exit" as const, code})),
@@ -214,9 +249,6 @@ export class RemoteSuiteLease {
         new Promise<{kind: "timeout"}>((resolve) => setTimeout(() => resolve({kind: "timeout"}), 3_000)),
       ]);
       if (terminated.kind === "timeout") child.kill("SIGKILL");
-      if (this.windowsHost) {
-        return;
-      }
       throw new Error("Remote regression lease did not release cleanly");
     }
     if (result.code !== 0) {
