@@ -104,7 +104,7 @@ function windowsLeasePowerShell(releaseDirectory: string, token: string): string
     "  [Console]::Out.WriteLine(\"OSCAR_REGRESSION_LEASE_ACQUIRED:$token\")",
     "  [Console]::Out.Flush()",
     "  $line = [Console]::In.ReadLine()",
-    "  if ($line -ne \"release:$token\") { exit 76 }",
+    "  if ($null -eq $line -or $line.Trim() -ne \"release:$token\") { exit 76 }",
     "  exit 0",
     "} finally {",
     "  if ($null -ne $stream) { $stream.Dispose() }",
@@ -166,10 +166,11 @@ export class RemoteSuiteLease {
         const expected = `OSCAR_REGRESSION_LEASE_ACQUIRED:${this.token}\n`;
         const timer = setTimeout(() => reject(new Error("Timed out acquiring remote regression lease")), timeoutMs);
         const inspect = () => {
-          if (stdout.includes(expected)) {
+          const normalized = stdout.replaceAll("\r\n", "\n");
+          if (normalized.includes(expected)) {
             clearTimeout(timer);
             resolve();
-          } else if (stdout.includes("OSCAR_REGRESSION_LEASE_CONTENDED")) {
+          } else if (normalized.includes("OSCAR_REGRESSION_LEASE_CONTENDED")) {
             clearTimeout(timer);
             reject(new Error(
               `Another regression run holds the remote suite lease for ${this.config.oscarReleaseDirectory}`,
