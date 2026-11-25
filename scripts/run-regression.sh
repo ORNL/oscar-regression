@@ -54,9 +54,11 @@ if [[ "${OSCAR_SKIP_ENDURANCE_HANDOFF:-0}" != "1" ]] \
   done
   if [[ "${#endurance_units_to_restore[@]}" -gt 0 ]]; then
     trap restore_endurance_services EXIT INT TERM
-    if systemctl --user is-active oscar-ui-endurance.service >/dev/null 2>&1; then
-      systemctl --user stop oscar-ui-endurance.service >/dev/null 2>&1 || true
-    fi
+    for unit in "${endurance_units_to_restore[@]}"; do
+      if systemctl --user is-active "$unit" >/dev/null 2>&1; then
+        systemctl --user stop "$unit" >/dev/null 2>&1 || true
+      fi
+    done
   fi
 fi
 
