@@ -3,6 +3,7 @@ import {randomBytes} from "node:crypto";
 
 const TARGET_PATTERN = /^(?:[A-Za-z0-9_.-]+@)?(?:[A-Za-z0-9_.-]+|\[[0-9A-Fa-f:]+\])$/;
 const RELEASE_PATTERN = /^\/[A-Za-z0-9._/-]+$/;
+const WINDOWS_RELEASE_PATTERN = /^[A-Za-z]:\\(?:[A-Za-z0-9._-]+\\)*[A-Za-z0-9._-]+$/;
 const LOCK_ROOT_PATTERN = /^\/[A-Za-z0-9._/-]+$/;
 
 export interface RemoteLeaseConfig {
@@ -78,28 +79,70 @@ function waitForExit(child: ChildProcessWithoutNullStreams): Promise<number | nu
   });
 }
 
+function windowsLeasePowerShell(releaseDirectory: string, token: string): string {
+  const escapedDir = releaseDirectory.replaceAll("'", "''");
+  const escapedToken = token.replaceAll("'", "''");
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    "$ProgressPreference = 'SilentlyContinue'",
+    `$releaseDir = '${escapedDir}'`,
+    `$token = '${escapedToken}'`,
+    "if (-not (Test-Path -LiteralPath $releaseDir -PathType Container)) { throw 'Missing OSCAR_RELEASE_DIR' }",
+    "$item = Get-Item -LiteralPath $releaseDir -Force",
+    "if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Linked OSCAR_RELEASE_DIR refused' }",
+    "$lockRoot = 'C:\\ProgramData\\oscar-regression-suite'",
+    "New-Item -ItemType Directory -Force -Path $lockRoot | Out-Null",
+    "$lockFile = Join-Path $lockRoot 'suite.lock'",
+    "try {",
+    "  $stream = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)",
+    "} catch [System.IO.IOException] {",
+    "  [Console]::Out.WriteLine('OSCAR_REGRESSION_LEASE_CONTENDED')",
+    "  [Console]::Out.Flush()",
+    "  exit 75",
+    "}",
+    "try {",
+    "  [Console]::Out.WriteLine(\"OSCAR_REGRESSION_LEASE_ACQUIRED:$token\")",
+    "  [Console]::Out.Flush()",
+    "  $line = [Console]::In.ReadLine()",
+    "  if ($line -ne \"release:$token\") { exit 76 }",
+    "  exit 0",
+    "} finally {",
+    "  if ($null -ne $stream) { $stream.Dispose() }",
+    "}",
+  ].join("\n");
+}
+
 /** A host-wide lease that coordinates mutating suite runs from different runners. */
 export class RemoteSuiteLease {
   private child: ChildProcessWithoutNullStreams | undefined;
   private readonly token = randomBytes(32).toString("hex");
+  private readonly windowsHost: boolean;
 
   constructor(private readonly config: RemoteLeaseConfig) {
     if (!TARGET_PATTERN.test(config.oscarSshTarget)) {
       throw new Error("OSCAR_SSH_TARGET must be a simple [user@]host for the remote suite lease");
     }
-    if (!RELEASE_PATTERN.test(config.oscarReleaseDirectory) ||
-        config.oscarReleaseDirectory === "/" ||
-        config.oscarReleaseDirectory.includes("/../")) {
+    this.windowsHost = WINDOWS_RELEASE_PATTERN.test(config.oscarReleaseDirectory) &&
+      !config.oscarReleaseDirectory.split("\\").includes("..");
+    const posixValid = RELEASE_PATTERN.test(config.oscarReleaseDirectory) &&
+      config.oscarReleaseDirectory !== "/" &&
+      !config.oscarReleaseDirectory.includes("/../");
+    if (!posixValid && !this.windowsHost) {
       throw new Error("OSCAR_RELEASE_DIR is unsafe for the remote suite lease");
     }
   }
 
   async acquire(timeoutMs = 20_000): Promise<void> {
     if (this.child) throw new Error("Remote suite lease is already acquired");
-    const command = [
-      "sudo", "-n", "bash", "-ceu", remoteLeaseShell(), "oscar-regression-lease",
-      this.config.oscarReleaseDirectory, this.token,
-    ].map(shellQuote).join(" ");
+    const command = this.windowsHost
+      ? `powershell -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(
+        windowsLeasePowerShell(this.config.oscarReleaseDirectory, this.token),
+        "utf16le",
+      ).toString("base64")}`
+      : [
+        "sudo", "-n", "bash", "-ceu", remoteLeaseShell(), "oscar-regression-lease",
+        this.config.oscarReleaseDirectory, this.token,
+      ].map(shellQuote).join(" ");
     const child = spawn("ssh", [
       ...sshOptions(this.config.sshIdentityFile),
       this.config.oscarSshTarget,

@@ -122,7 +122,27 @@ function remoteAbsolutePath(name: string): string | undefined {
   return value.replace(/\/+$/, "") || "/";
 }
 
+const WINDOWS_CANONICAL_RELEASE_PATTERN = /^[A-Za-z]:\\(?:[A-Za-z0-9._-]+\\)*[A-Za-z0-9._-]+$/;
+
+export function isWindowsReleasePath(value: string | undefined): boolean {
+  return Boolean(value && WINDOWS_CANONICAL_RELEASE_PATTERN.test(value));
+}
+
 function canonicalReleasePath(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  if (/^[A-Za-z]:[\\/]/.test(raw)) {
+    if (raw.includes("\0") || /[\r\n]/.test(raw)) {
+      throw new Error(`${name} must not contain control characters`);
+    }
+    const normalized = raw.replaceAll("/", "\\").replace(/\\+$/, "");
+    const parts = normalized.slice(3).split("\\");
+    if (parts.length === 0 || parts.some(part => !part || part === "." || part === "..") ||
+        !WINDOWS_CANONICAL_RELEASE_PATTERN.test(normalized)) {
+      throw new Error(`${name} must be a canonical, non-root absolute path using safe path characters`);
+    }
+    return normalized;
+  }
   const value = remoteAbsolutePath(name);
   if (value === undefined) return undefined;
   if (value === "/" || posix.normalize(value) !== value || !/^\/[A-Za-z0-9._/-]+$/.test(value)) {
