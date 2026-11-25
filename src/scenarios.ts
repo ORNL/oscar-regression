@@ -1096,6 +1096,59 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "viewer-navigation",
+        category: "viewer",
+        action: "preserve SPA runtime state across Navbar links without MPA document reload or RSC .txt 404",
+        target: "Navbar client-side navigation",
+        expected: "clicking Navbar links transitions via Next.js index.txt RSC payloads with 0 document reloads, 0 .txt 404s, and intact window runtime state",
+      }, async () => {
+        await this.goto(page, "/");
+        await page.getByTestId("nav-item-events").first().waitFor({timeout: this.config.uiTimeoutMs});
+        const bootSentinel = await page.evaluate(() => {
+          const token = `spa-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          (window as unknown as {__oscarSpaNavSentinel?: string}).__oscarSpaNavSentinel = token;
+          return token;
+        });
+
+        let documentNavigations = 0;
+        const rsc404Urls: string[] = [];
+        const onReq = (req: Request) => {
+          if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+            documentNavigations += 1;
+          }
+        };
+        const onRes = (res: Response) => {
+          if (res.status() === 404 && /\.txt(?:\?|$)/.test(res.url())) {
+            rsc404Urls.push(res.url());
+          }
+        };
+        page.on("request", onReq);
+        page.on("response", onRes);
+        try {
+          const steps: Array<[string, string]> = [
+            ["nav-item-events", "/event-log"],
+            ["nav-item-national", "/national-view"],
+            ["nav-item-servers", "/servers"],
+            ["nav-item-dashboard", "/"],
+          ];
+          for (const [testId, expectedPath] of steps) {
+            await this.clickSpaNavItem(page, testId, expectedPath);
+          }
+          const survivingSentinel = await page.evaluate(
+            () => (window as unknown as {__oscarSpaNavSentinel?: string}).__oscarSpaNavSentinel ?? "",
+          );
+          const passed = survivingSentinel === bootSentinel && documentNavigations === 0 && rsc404Urls.length === 0;
+          return {
+            passed,
+            observed: `sentinelIntact=${survivingSentinel === bootSentinel}; documentNavigations=${documentNavigations}; rsc404Count=${rsc404Urls.length}`,
+          };
+        } finally {
+          page.off("request", onReq);
+          page.off("response", onRes);
+        }
+      });
+
+      await this.check({
+        scenario: "viewer-navigation",
         category: "performance",
         action: "verify Dashboard initial load, datastream/count SLOs, and single-click Next-page latency",
         target: "/ and /sensorhub/api/observations",
@@ -12371,56 +12424,80 @@ export class RegressionScenarios {
           category: "national",
           action: "render unified multi-node statistics on /national-view",
           target: "/national-view",
-          expected: "both the local primary site row and the federated peer site row render in .MuiDataGrid-row with valid numeric statistics",
+          expected: "both the local primary site row and the federated peer site row render in .MuiDataGrid-row with valid numeric statistics and Bearer token preserved across SPA navigation",
         }, async () => {
-          await this.clickSpaNavItem(page, "nav-item-national", "/national-view");
-          await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
-
-          const readSiteRowStats = async (siteName: string) => {
-            const row = page.locator(".MuiDataGrid-row").filter({
-              has: page.locator('[data-field="site"]', {hasText: siteName}),
-            }).first();
-            if ((await row.count()) === 0) return null;
-            const values = {} as Record<NationalStatisticsField, string>;
-            for (const field of NATIONAL_STATISTICS_FIELDS) {
-              values[field] = await row.locator(`[data-field="${field}"]`).innerText();
+          let peerNationalBearerVerified = false;
+          const onNationalPeerRes = (res: Response) => {
+            try {
+              const parsed = new URL(res.url());
+              if (parsed.origin !== peerOrigin) return;
+              const checkHdr = (hdrs: Record<string, string>) => {
+                const authHdr = hdrs["authorization"] ?? hdrs["Authorization"] ?? "";
+                if (/^Bearer\s+oscar_fed_/i.test(authHdr) && res.status() === 200) {
+                  peerNationalBearerVerified = true;
+                }
+              };
+              checkHdr(res.request().headers());
+              if (!peerNationalBearerVerified) {
+                void res.request().allHeaders().then(checkHdr).catch(() => undefined);
+              }
+            } catch {
+              // Ignore malformed URLs
             }
-            return parseRenderedNationalStatistics(values);
           };
+          page.on("response", onNationalPeerRes);
+          try {
+            await this.clickSpaNavItem(page, "nav-item-national", "/national-view");
+            await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
 
-          const rendered = await poll(
-            async () => {
-              const rowCount = await page.locator(".MuiDataGrid-row").count();
-              let localStats = null;
-              let peerStats = null;
-              try {
-                localStats = await readSiteRowStats(localNodeName);
-              } catch {
-                localStats = null;
+            const readSiteRowStats = async (siteName: string) => {
+              const row = page.locator(".MuiDataGrid-row").filter({
+                has: page.locator('[data-field="site"]', {hasText: siteName}),
+              }).first();
+              if ((await row.count()) === 0) return null;
+              const values = {} as Record<NationalStatisticsField, string>;
+              for (const field of NATIONAL_STATISTICS_FIELDS) {
+                values[field] = await row.locator(`[data-field="${field}"]`).innerText();
               }
-              try {
-                peerStats = await readSiteRowStats(expectedPeerNodeName);
-              } catch {
-                peerStats = null;
-              }
-              return {rowCount, localStats, peerStats};
-            },
-            (candidate) => candidate.rowCount >= 2 && candidate.localStats !== null && candidate.peerStats !== null,
-            {
-              timeoutMs: this.config.eventTimeoutMs,
-              intervalMs: 400,
-              description: `both ${localNodeName} and ${expectedPeerNodeName} rows on /national-view`,
-            },
-          );
+              return parseRenderedNationalStatistics(values);
+            };
 
-          const passed = rendered.rowCount >= 2 && rendered.localStats !== null && rendered.peerStats !== null;
-          const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-national-view-failed");
-          return {
-            passed,
-            observed: `rows=${rendered.rowCount}; local(${localNodeName})=${JSON.stringify(rendered.localStats)}; ` +
-              `peer(${expectedPeerNodeName})=${JSON.stringify(rendered.peerStats)}`,
-            evidence,
-          };
+            const rendered = await poll(
+              async () => {
+                const rowCount = await page.locator(".MuiDataGrid-row").count();
+                let localStats = null;
+                let peerStats = null;
+                try {
+                  localStats = await readSiteRowStats(localNodeName);
+                } catch {
+                  localStats = null;
+                }
+                try {
+                  peerStats = await readSiteRowStats(expectedPeerNodeName);
+                } catch {
+                  peerStats = null;
+                }
+                return {rowCount, localStats, peerStats, peerBearer: peerNationalBearerVerified};
+              },
+              (candidate) => candidate.rowCount >= 2 && candidate.localStats !== null && candidate.peerStats !== null && candidate.peerBearer,
+              {
+                timeoutMs: this.config.eventTimeoutMs,
+                intervalMs: 400,
+                description: `both ${localNodeName} and ${expectedPeerNodeName} rows on /national-view with Bearer auth`,
+              },
+            );
+
+            const passed = rendered.rowCount >= 2 && rendered.localStats !== null && rendered.peerStats !== null && rendered.peerBearer;
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-national-view-failed");
+            return {
+              passed,
+              observed: `rows=${rendered.rowCount}; peerBearer=${rendered.peerBearer}; local(${localNodeName})=${JSON.stringify(rendered.localStats)}; ` +
+                `peer(${expectedPeerNodeName})=${JSON.stringify(rendered.peerStats)}`,
+              evidence,
+            };
+          } finally {
+            page.off("response", onNationalPeerRes);
+          }
         });
 
         await this.check({
@@ -12475,49 +12552,54 @@ export class RegressionScenarios {
           let targetVehicleId = "";
           let correlationSeedSource = "existing-both-portals";
 
-          for (const [norm, raw] of peerVehicles.entries()) {
-            if (localVehicles.has(norm)) {
+          for (const [norm] of peerVehicles.entries()) {
+            if (norm.length >= 7 && localVehicles.has(norm)) {
               targetNorm = norm;
               targetVehicleId = norm;
-              void raw;
               break;
             }
           }
 
-          if (!targetNorm && peerVehicles.size > 0) {
-            const preferredIso = [...peerVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm));
-            targetNorm = preferredIso ?? [...peerVehicles.keys()][0]!;
-            targetVehicleId = targetNorm;
-            await this.adjudicateRecentOccupancyViaApi({
-              reqCtx: page.context().request,
-              baseUrl: this.config.oscarBaseUrl,
-              vehicleId: targetVehicleId,
-              preferredLaneName: this.config.testLaneLabel,
-              allowReservedRpmTrigger: true,
-              windowStartIso,
-            });
-            correlationSeedSource = `reused-peer-vehicle-adjudicated-${this.config.testLaneLabel}`;
-          } else if (!targetNorm) {
-            const preferredLocalIso = [...localVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm));
-            targetNorm = preferredLocalIso ?? "EGHU3972694";
-            targetVehicleId = targetNorm;
-            await this.adjudicateRecentOccupancyViaApi({
-              reqCtx: peerContext,
-              baseUrl: peerBaseUrl,
-              vehicleId: targetVehicleId,
-              windowStartIso,
-            });
-            if (!localVehicles.has(targetNorm)) {
+          if (!targetNorm) {
+            const preferredPeer = [...peerVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm))
+              ?? [...peerVehicles.keys()].find((norm) => norm.length >= 7);
+            if (preferredPeer) {
+              targetNorm = preferredPeer;
+              targetVehicleId = preferredPeer;
+              if (!localVehicles.has(targetNorm)) {
+                await this.adjudicateRecentOccupancyViaApi({
+                  reqCtx: page.context().request,
+                  baseUrl: this.config.oscarBaseUrl,
+                  vehicleId: targetVehicleId,
+                  preferredLaneName: this.config.testLaneLabel,
+                  allowReservedRpmTrigger: true,
+                  windowStartIso,
+                });
+              }
+              correlationSeedSource = `reused-peer-vehicle-adjudicated-${this.config.testLaneLabel}`;
+            } else {
+              const preferredLocalIso = [...localVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm))
+                ?? [...localVehicles.keys()].find((norm) => norm.length >= 7);
+              targetNorm = preferredLocalIso ?? "EGHU3972694";
+              targetVehicleId = targetNorm;
               await this.adjudicateRecentOccupancyViaApi({
-                reqCtx: page.context().request,
-                baseUrl: this.config.oscarBaseUrl,
+                reqCtx: peerContext,
+                baseUrl: peerBaseUrl,
                 vehicleId: targetVehicleId,
-                preferredLaneName: this.config.testLaneLabel,
-                allowReservedRpmTrigger: true,
                 windowStartIso,
               });
+              if (!localVehicles.has(targetNorm)) {
+                await this.adjudicateRecentOccupancyViaApi({
+                  reqCtx: page.context().request,
+                  baseUrl: this.config.oscarBaseUrl,
+                  vehicleId: targetVehicleId,
+                  preferredLaneName: this.config.testLaneLabel,
+                  allowReservedRpmTrigger: true,
+                  windowStartIso,
+                });
+              }
+              correlationSeedSource = "seeded-peer-and-local";
             }
-            correlationSeedSource = "seeded-empty-peer-and-local";
           }
 
           let peerVehicleSearchHttp200 = false;
@@ -12529,13 +12611,20 @@ export class RegressionScenarios {
               if (parsed.origin !== peerOrigin) return;
               if (res.request().method() !== "GET") return;
               if (!parsed.pathname.endsWith("/sensorhub/buckets/adjudication/vehicle-search")) return;
-              peerSearchStatuses.push(res.status());
-              const authHdr = res.request().headers()["authorization"] ?? "";
-              if (/^Bearer\s+oscar_fed_/i.test(authHdr)) {
-                peerVehicleSearchBearerVerified = true;
-                if (res.status() === 200) {
-                  peerVehicleSearchHttp200 = true;
+              const status = res.status();
+              peerSearchStatuses.push(status);
+              const checkAuthHeader = (hdrs: Record<string, string>) => {
+                const authHdr = hdrs["authorization"] ?? hdrs["Authorization"] ?? "";
+                if (/^Bearer\s+oscar_fed_/i.test(authHdr)) {
+                  peerVehicleSearchBearerVerified = true;
+                  if (status === 200) {
+                    peerVehicleSearchHttp200 = true;
+                  }
                 }
+              };
+              checkAuthHeader(res.request().headers());
+              if (!peerVehicleSearchBearerVerified) {
+                void res.request().allHeaders().then(checkAuthHeader).catch(() => undefined);
               }
             } catch {
               // Ignore malformed URLs
@@ -12557,14 +12646,18 @@ export class RegressionScenarios {
                 const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
                 const compareVisible = await compareBtn.isVisible().catch(() => false);
                 const compareText = compareVisible ? (await compareBtn.innerText().catch(() => "")).trim() : "";
+                const chip = page.getByTestId("vehicle-search-summary-chip").first();
+                const chipVisible = await chip.isVisible().catch(() => false);
+                const chipText = chipVisible ? (await chip.innerText().catch(() => "")).trim() : "";
                 const statusTexts = await page.locator('[role="status"]').allInnerTexts().catch(() => []);
-                const combinedStatus = statusTexts.join(" | ").replace(/\s+/g, " ").trim();
+                const combinedStatus = [chipText, ...statusTexts].filter(Boolean).join(" | ").replace(/\s+/g, " ").trim();
                 const countMatch = /\((\d+)\)/.exec(compareText);
                 const passCount = countMatch?.[1] ? Number(countMatch[1]) : 0;
-                const multiSiteMentioned = /\b([2-9]|\d{2,})\s+sites?\b/i.test(combinedStatus);
+                const multiSiteMentioned = /\b([2-9]|\d{2,})\s+(?:node\(s\)|nodes?|sites?)\b/i.test(combinedStatus);
                 return {
                   compareVisible,
                   compareText,
+                  chipText,
                   combinedStatus,
                   passCount,
                   multiSiteMentioned,
