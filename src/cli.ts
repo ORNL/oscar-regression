@@ -4,7 +4,7 @@ import {mkdirSync, rmSync, writeFileSync} from "node:fs";
 import {arch, hostname, platform, tmpdir} from "node:os";
 import {join} from "node:path";
 import {BrowserHarness} from "./browser.js";
-import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease} from "./config.js";
+import {assertMutationAllowed, loadConfig, requiresRemoteSuiteLease, suiteReporterSecrets} from "./config.js";
 import {RpmEmulatorClient} from "./emulator.js";
 import {suiteGitCommit as resolveSuiteGitCommit} from "./git-state.js";
 import {REQUIRED_OPERATIONAL_VIEW_KEYS} from "./lane-config.js";
@@ -72,7 +72,7 @@ async function main(): Promise<number> {
       oscarReleaseDirectory: config.oscarReleaseDirectory ?? "",
     })
     : undefined;
-  const reporter = new RunReporter(runIdentifier(), config.resultsRoot, [config.oscarPassword], {
+  const reporter = new RunReporter(runIdentifier(), config.resultsRoot, suiteReporterSecrets(config), {
     suiteVersion: "1.1.0",
     suiteGitCommit,
     profile: config.profile,
@@ -108,6 +108,10 @@ async function main(): Promise<number> {
     vehicleOcrWorkflow: config.vehicleOcrWorkflow,
     cargoUffWorkflow: config.cargoUffWorkflow,
     cargoUffSmbConfigured: Boolean(config.cargoUffSmbShare),
+    federationWorkflow: config.federationWorkflow,
+    federationPeerConfigured: Boolean(config.oscarFederatedPeerBaseUrl),
+    ...(config.oscarFederatedPeerBaseUrl
+      ? {oscarFederatedPeerBaseUrl: config.oscarFederatedPeerBaseUrl} : {}),
     storageWorkflow: config.storageWorkflow,
     storageExpectedRelease: config.storageExpectedRelease,
     storageBackupWorkflow: config.storageBackupWorkflow,

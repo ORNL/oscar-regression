@@ -7,7 +7,7 @@ import {basename, join} from "node:path";
 import {promisify} from "node:util";
 
 const execFileAsync = promisify(execFile);
-import type {Locator, Page, Request, Response} from "playwright";
+import {request as playwrightRequest, type APIRequestContext, type Locator, type Page, type Request, type Response} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {boundedFetch, type BoundedFetchResult} from "./bounded-fetch.js";
@@ -122,7 +122,7 @@ import {
   assessDailyJournalStatus,
   type DailyJournalStatus,
 } from "./daily-journal-oracle.js";
-import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
+import type {RpmConfig, RpmStatus, StorageExpectedRelease, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
 import {
   assertNationalRefreshCompletedControl,
@@ -296,7 +296,7 @@ const REGRESSION_ARCHIVE_RESOURCES = {
   temporaryDirectory: "/var/lib/oscar/duckdb-tmp",
 } as const;
 
-const PARQUET_PRIMARY_OUTPUT_NAMES = [
+export const PARQUET_PRIMARY_OUTPUT_NAMES_3_11 = [
   "gammaCounts",
   "gammaThreshold",
   "neutronCounts",
@@ -320,6 +320,44 @@ const PARQUET_PRIMARY_OUTPUT_NAMES = [
   "nationalSummary",
   "vehicleOcr",
 ] as const;
+
+export const PARQUET_PRIMARY_OUTPUT_NAMES_3_12 = [
+  ...PARQUET_PRIMARY_OUTPUT_NAMES_3_11,
+  "location",
+  "alarm",
+  "KromekDetectorRadiometricsV1Report",
+  "KromekSerialRadiometricStatusReport",
+] as const;
+
+const PARQUET_PRIMARY_OUTPUT_NAMES = PARQUET_PRIMARY_OUTPUT_NAMES_3_12;
+
+export function expectedParquetPrimaryOutputNames(
+  release: StorageExpectedRelease,
+): readonly string[] {
+  return release.startsWith("3.12.")
+    ? PARQUET_PRIMARY_OUTPUT_NAMES_3_12
+    : PARQUET_PRIMARY_OUTPUT_NAMES_3_11;
+}
+
+export function parquetPrimaryOutputNamesMatchRelease(
+  actual: readonly string[],
+  release: StorageExpectedRelease,
+  packagedDefaults?: readonly string[],
+): boolean {
+  const actualJson = JSON.stringify(actual);
+  const v311Json = JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES_3_11);
+  const v312Json = JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES_3_12);
+  if (release.startsWith("3.12.")) {
+    return actualJson === v312Json &&
+      (packagedDefaults === undefined || JSON.stringify(packagedDefaults) === v312Json);
+  }
+  void PARQUET_PRIMARY_OUTPUT_NAMES;
+  const matchesEither = actualJson === v311Json || actualJson === v312Json;
+  if (!matchesEither) return false;
+  if (packagedDefaults === undefined) return true;
+  const packagedJson = JSON.stringify(packagedDefaults);
+  return packagedJson === v311Json || packagedJson === v312Json;
+}
 
 const REGRESSION_ARCHIVE_POLICY = {
   storageMode: "PARQUET_PRIMARY",
@@ -430,6 +468,7 @@ export class RegressionScenarios {
   private originalRpmStatus: RpmStatus | null | undefined;
   private reservedLanePrepared = false;
   private pendingCargoUffRestorePayload: Record<string, unknown> | undefined;
+  private pendingFederationCleanup: (() => Promise<void>) | undefined;
   private alarmMediaBaselineCreated = false;
   private alarmMediaProbe: StorageProbeClient | undefined;
   private alarmCameraUids: string[] | undefined;
@@ -725,6 +764,11 @@ export class RegressionScenarios {
         await this.scenario("cargo-uff", () => this.cargoUffAdjudication());
         await this.scenario("training-sandbox", () => this.trainingSandbox());
         await this.scenario("lane-webrelay", () => this.laneWebRelay());
+        if (this.config.scenarioFilter.size > 0 ||
+            this.config.federationWorkflow !== "auto" ||
+            Boolean(this.config.oscarFederatedPeerBaseUrl)) {
+          await this.scenario("multi-node-federation", () => this.multiNodeFederation());
+        }
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([
           {reportType: "ADJUDICATION"},
@@ -760,9 +804,24 @@ export class RegressionScenarios {
       try {
         await this.restorePendingCargoUff();
       } finally {
-        await this.alarmMediaProbe?.cleanup();
-        this.alarmMediaProbe = undefined;
+        try {
+          await this.runPendingFederationCleanup();
+        } finally {
+          await this.alarmMediaProbe?.cleanup();
+          this.alarmMediaProbe = undefined;
+        }
       }
+    }
+  }
+
+  private async runPendingFederationCleanup(): Promise<void> {
+    const cleanup = this.pendingFederationCleanup;
+    if (!cleanup) return;
+    this.pendingFederationCleanup = undefined;
+    try {
+      await cleanup();
+    } catch (err) {
+      this.reporter.error("multi-node-federation", "emergency-federation-cleanup", err);
     }
   }
 
@@ -926,6 +985,112 @@ export class RegressionScenarios {
           const passed = status >= 200 && status < 400 && markerVisible && !/application error|internal server error/i.test(body);
           const evidence = passed ? "" : await this.screenshotOnFailure(page, `viewer-${safeName(path)}-failed`);
           return {passed, observed: `HTTP ${status}; marker visible=${markerVisible}`, evidence};
+        });
+      }
+
+      const requireCustomDashboards = this.config.storageExpectedRelease.startsWith("3.12.");
+      const hasCustomDashboardsNav = (await page.getByTestId("nav-item-custom-dashboards").count()) > 0;
+      if (requireCustomDashboards || hasCustomDashboardsNav) {
+        await this.check({
+          scenario: "viewer-navigation",
+          category: "viewer",
+          action: "open /dashboards and verify canonical navbar and zero layout residue",
+          target: "/dashboards",
+          expected: "HTTP 200 on /dashboards with custom-dashboards-page, starter gallery, intact 8 canonical navbar routes, zero uncaught page errors, and clean localStorage teardown",
+        }, async () => {
+          const canonicalNavTestIds = [
+            "nav-item-dashboard",
+            "nav-item-events",
+            "nav-item-health",
+            "nav-item-map",
+            "nav-item-national",
+            "nav-item-report",
+            "nav-item-alarm-transfer",
+            "nav-item-users",
+          ] as const;
+          const beforePageErrors = this.reporter.errors.filter((err) => err.source === "viewer-page").length;
+          const savedLocalStorage = await page.evaluate(() => {
+            const entries: Array<[string, string]> = [];
+            for (let idx = 0; idx < window.localStorage.length; idx++) {
+              const key = window.localStorage.key(idx);
+              if (key !== null) {
+                entries.push([key, window.localStorage.getItem(key) ?? ""]);
+              }
+            }
+            return entries;
+          });
+
+          try {
+            const status = await this.goto(page, "/dashboards");
+            const workspaceVisible = await page.getByTestId("custom-dashboards-page")
+              .waitFor({state: "visible", timeout: this.config.uiTimeoutMs})
+              .then(() => true, () => false);
+            const switcherVisible = await page.getByTestId("custom-dashboards-switcher")
+              .waitFor({state: "visible", timeout: 10_000})
+              .then(() => true, () => false);
+            const galleryVisible = await page.getByTestId("custom-dashboards-gallery")
+              .waitFor({state: "visible", timeout: 10_000})
+              .then(() => true, () => false);
+            const addPageBtnVisible = await page.getByTestId("dashboards-new-page-button")
+              .isVisible()
+              .catch(() => false);
+
+            const initialCustomNavCount = await page.locator('[data-testid^="nav-custom-page-"]').count();
+            const missingCanonicalBefore: string[] = [];
+            for (const navId of canonicalNavTestIds) {
+              if ((await page.getByTestId(navId).count()) === 0) {
+                missingCanonicalBefore.push(navId);
+              }
+            }
+
+            let hostMounted = false;
+            const blankTemplate = page.getByTestId("starter-template-blank");
+            if (await blankTemplate.isVisible().catch(() => false)) {
+              await blankTemplate.click();
+              hostMounted = await page.getByTestId("custom-dashboard-host")
+                .waitFor({state: "visible", timeout: 10_000})
+                .then(() => true, () => false);
+            }
+
+            const missingCanonicalAfter: string[] = [];
+            for (const navId of canonicalNavTestIds) {
+              if ((await page.getByTestId(navId).count()) === 0) {
+                missingCanonicalAfter.push(navId);
+              }
+            }
+            const customDashboardsNavPresent = (await page.getByTestId("nav-item-custom-dashboards").count()) > 0;
+            const body = await page.locator("body").innerText();
+            const afterPageErrors = this.reporter.errors.filter((err) => err.source === "viewer-page").length;
+            const newPageErrors = afterPageErrors - beforePageErrors;
+            const passed = status === 200 &&
+              workspaceVisible &&
+              switcherVisible &&
+              galleryVisible &&
+              addPageBtnVisible &&
+              hostMounted &&
+              initialCustomNavCount === 0 &&
+              missingCanonicalBefore.length === 0 &&
+              missingCanonicalAfter.length === 0 &&
+              customDashboardsNavPresent &&
+              newPageErrors === 0 &&
+              !/application error|internal server error/i.test(body);
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "viewer-custom-dashboards-failed");
+            return {
+              passed,
+              observed: `HTTP ${status}; workspace=${workspaceVisible}; gallery=${galleryVisible}; hostMounted=${hostMounted}; ` +
+                `initialCustomNav=${initialCustomNavCount}; missingCanonical=${missingCanonicalBefore.length + missingCanonicalAfter.length}; ` +
+                `pageErrors=${newPageErrors}`,
+              evidence,
+            };
+          } finally {
+            await page.evaluate((entries) => {
+              window.localStorage.clear();
+              for (const [key, val] of entries) {
+                window.localStorage.setItem(key, val);
+              }
+            }, savedLocalStorage).catch(() => undefined);
+            await this.goto(page, "/").catch(() => undefined);
+          }
         });
       }
 
@@ -2322,6 +2487,144 @@ export class RegressionScenarios {
           evidence,
         };
       });
+
+      const requireMobileDetector = this.config.storageExpectedRelease.startsWith("3.12.");
+      const inspectMobileDetectorProvider = async (): Promise<{
+        found: boolean;
+        windowOpened: boolean;
+        windowClosed: boolean;
+        beforeSystemCount: number;
+        afterSystemCount: number;
+        sampledProviders: number;
+      }> => {
+        const countTopSystems = async (): Promise<number> => {
+          const res = await page.context().request.get(
+            this.viewerUrl("/sensorhub/api/systems?searchMembers=false&validTime=latest&limit=500"),
+          );
+          try {
+            if (!res.ok()) return -1;
+            const json = await res.json() as {items?: unknown[]};
+            return Array.isArray(json.items) ? json.items.length : 0;
+          } finally {
+            await res.dispose();
+          }
+        };
+
+        const beforeSystemCount = await countTopSystems();
+        const sensorsHeader = page.locator(".v-accordion-item-caption").filter({hasText: /\bSensors\b/i}).first();
+        await sensorsHeader.waitFor({timeout: this.config.uiTimeoutMs});
+        if ((await page.locator(".v-accordion-item-open").filter({hasText: /\bSensors\b/i}).count()) === 0) {
+          await sensorsHeader.click();
+          await sleep(250);
+        }
+
+        const firstCell = page.locator(".v-accordion-item-open .v-table-cell-wrapper").first();
+        const rightClickTarget = (await firstCell.count()) > 0
+          ? firstCell
+          : page.locator(".v-accordion-item-open .v-table-body").first();
+        await rightClickTarget.waitFor({timeout: this.config.uiTimeoutMs});
+        await rightClickTarget.click({button: "right"});
+
+        const addModuleItem = page.locator(".v-contextmenu .gwt-MenuItem")
+          .filter({hasText: /Add New Module/i})
+          .first();
+        await addModuleItem.waitFor({state: "visible", timeout: 10_000});
+        await addModuleItem.click();
+
+        const modal = page.locator(".v-window").filter({hasText: /Select Module Type/i}).first();
+        const windowOpened = await modal.waitFor({state: "visible", timeout: 15_000})
+          .then(() => true, () => false);
+        const providerTexts = new Set<string>();
+        let windowClosed = !windowOpened;
+
+        if (windowOpened) {
+          try {
+            const scroller = modal.locator(".v-table-body-wrapper, .v-scrollable").first();
+            const hasScroller = (await scroller.count()) > 0;
+            if (hasScroller) {
+              await scroller.evaluate((el) => { el.scrollTop = 0; }).catch(() => undefined);
+              await sleep(150);
+            }
+            for (let step = 0; step < 24; step++) {
+              const cells = await modal.locator(".v-table-cell-wrapper").allInnerTexts().catch(() => []);
+              for (const cell of cells) {
+                const trimmed = cell.trim();
+                if (trimmed) providerTexts.add(trimmed);
+              }
+              if ([...providerTexts].some((txt) => /Mobile Detector System|MobileDetectorSystem/i.test(txt))) {
+                break;
+              }
+              if (!hasScroller) break;
+              const advanced = await scroller.evaluate((el) => {
+                const prev = el.scrollTop;
+                el.scrollTop = prev + 160;
+                return el.scrollTop > prev;
+              }).catch(() => false);
+              if (!advanced) break;
+              await sleep(150);
+            }
+          } finally {
+            const closeBtn = modal.locator(".v-window-closebox").first();
+            if (await closeBtn.isVisible().catch(() => false)) {
+              await closeBtn.click().catch(() => undefined);
+            } else {
+              await page.keyboard.press("Escape").catch(() => undefined);
+            }
+            windowClosed = await modal.waitFor({state: "hidden", timeout: 10_000})
+              .then(() => true, () => false);
+          }
+        }
+
+        const afterSystemCount = await countTopSystems();
+        const found = [...providerTexts].some((txt) => /Mobile Detector System|MobileDetectorSystem/i.test(txt));
+        return {
+          found,
+          windowOpened,
+          windowClosed,
+          beforeSystemCount,
+          afterSystemCount,
+          sampledProviders: providerTexts.size,
+        };
+      };
+
+      const providerProbe = await inspectMobileDetectorProvider().catch((err) => {
+        if (requireMobileDetector) {
+          this.reporter.error("sensorhub-admin", "mobile-detector-provider", err);
+        }
+        return {
+          found: false,
+          windowOpened: false,
+          windowClosed: true,
+          beforeSystemCount: -1,
+          afterSystemCount: -1,
+          sampledProviders: 0,
+        };
+      });
+
+      if (requireMobileDetector || providerProbe.found) {
+        await this.check({
+          scenario: "sensorhub-admin",
+          category: "admin",
+          action: "verify MobileDetectorSystem module provider availability",
+          target: "/sensorhub/admin",
+          expected: "SensorHub Sensors module provider list includes Mobile Detector System without adding a lane to config.json",
+        }, async () => {
+          const unchangedSystems = providerProbe.beforeSystemCount >= 0 &&
+            providerProbe.beforeSystemCount === providerProbe.afterSystemCount;
+          const passed = providerProbe.windowOpened &&
+            providerProbe.found &&
+            providerProbe.windowClosed &&
+            unchangedSystems;
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "sensorhub-admin-mobile-detector-provider");
+          return {
+            passed,
+            observed: `windowOpened=${providerProbe.windowOpened}; foundMobileDetector=${providerProbe.found}; ` +
+              `sampledCells=${providerProbe.sampledProviders}; windowClosed=${providerProbe.windowClosed}; ` +
+              `topSystems=${providerProbe.beforeSystemCount}->${providerProbe.afterSystemCount}`,
+            evidence,
+          };
+        });
+      }
     } finally { await page.close(); }
   }
 
@@ -8819,9 +9122,11 @@ export class RegressionScenarios {
             value[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
           Object.entries(SHIPPING_STORAGE_POLICY).every(([key, expected]) =>
             value.packagedDefaults[key as keyof typeof SHIPPING_STORAGE_POLICY] === expected) &&
-          JSON.stringify(value.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
-          JSON.stringify(value.packagedDefaults.outputNames) ===
-            JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+          parquetPrimaryOutputNamesMatchRelease(
+            value.outputNames,
+            release,
+            value.packagedDefaults.outputNames,
+          ) &&
           indexes.genericPayloadGinAbsent && indexes.requiredCount === 15 &&
           indexes.requiredPresent === indexes.requiredCount && indexes.missingNames.length === 0 &&
           indexes.eventPathGinExact && indexes.numericEventIndexesExact &&
@@ -9036,7 +9341,10 @@ export class RegressionScenarios {
             platform.archiveEnabled === true && platform.deleteHotAfterArchive === true &&
             Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
               platform[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
-            JSON.stringify(platform.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+            parquetPrimaryOutputNamesMatchRelease(
+              platform.outputNames,
+              this.config.storageExpectedRelease,
+            ) &&
             platform.observationIndexes.genericPayloadGinAbsent &&
             platform.observationIndexes.requiredPresent ===
               platform.observationIndexes.requiredCount &&
@@ -11392,5 +11700,986 @@ export class RegressionScenarios {
         observed: `restoredEnabled=${String(restored?.enabled)}; expected=${String(Boolean(targetLaneEntry.enabled))}`,
       };
     });
+  }
+
+  private async clickSpaNavItem(page: Page, testId: string, expectedPathname: string): Promise<void> {
+    const target = page.getByTestId(testId).first();
+    if (!(await target.isVisible().catch(() => false))) {
+      const toggle = page.getByTestId("navbar-drawer-toggle").first();
+      if (await toggle.isVisible().catch(() => false)) {
+        await toggle.click();
+        await target.waitFor({state: "visible", timeout: 10_000});
+      }
+    }
+    await Promise.all([
+      page.waitForURL(
+        (url) => normalizePathname(url.pathname) === normalizePathname(expectedPathname),
+        {timeout: this.config.uiTimeoutMs},
+      ),
+      target.click(),
+    ]);
+  }
+
+  private async resolvePortalServerNodeName(reqCtx: APIRequestContext, baseUrl: string): Promise<string> {
+    const sysRes = await reqCtx.get(`${baseUrl}/sensorhub/api/systems?format=application%2Fjson&limit=200`);
+    try {
+      if (!sysRes.ok()) return "";
+      const payload = await sysRes.json() as {
+        items?: Array<{
+          uid?: string;
+          name?: string;
+          validTime?: string[];
+          properties?: {uid?: string; name?: string; validTime?: string[]};
+        }>;
+      };
+      const oscarSystems = (payload.items ?? []).filter((item) =>
+        String(item?.uid ?? item?.properties?.uid ?? "").includes("urn:ornl:oscar:system:"),
+      );
+      oscarSystems.sort((a, b) => {
+        const va = String(a?.validTime?.[0] ?? a?.properties?.validTime?.[0] ?? "");
+        const vb = String(b?.validTime?.[0] ?? b?.properties?.validTime?.[0] ?? "");
+        return vb.localeCompare(va);
+      });
+      const rawName = String(oscarSystems[0]?.name ?? oscarSystems[0]?.properties?.name ?? "").trim();
+      return rawName && rawName !== "OSCAR System" ? rawName : "";
+    } finally {
+      await sysRes.dispose();
+    }
+  }
+
+  private async ensurePortalNationalStatisticsObservation(
+    reqCtx: APIRequestContext,
+    baseUrl: string,
+  ): Promise<void> {
+    const obsRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/observations?observedProperty=${encodeURIComponent(NATIONAL_STATISTICS_OBSERVED_PROPERTY)}&resultTime=latest&limit=1`,
+      {headers: {Accept: "application/om+json, application/json"}},
+    );
+    try {
+      if (obsRes.ok()) {
+        const obsJson = await obsRes.json() as {items?: unknown[]};
+        if (Array.isArray(obsJson.items) && obsJson.items.length > 0) {
+          return;
+        }
+      }
+    } finally {
+      await obsRes.dispose();
+    }
+
+    const csRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/controlstreams?validTime=latest&limit=200`,
+      {headers: {Accept: "application/json"}},
+    );
+    let natCsId = "";
+    try {
+      if (csRes.ok()) {
+        const csJson = await csRes.json() as {items?: Array<Record<string, unknown>>};
+        for (const item of csJson.items ?? []) {
+          const text = JSON.stringify(item);
+          if (/startDateTime/i.test(text) && /endDateTime/i.test(text) && !/reportType/i.test(text)) {
+            natCsId = String(item.id ?? "");
+            if (natCsId) break;
+          }
+        }
+      }
+    } finally {
+      await csRes.dispose();
+    }
+    if (!natCsId) return;
+
+    const cmdRes = await reqCtx.post(
+      `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(natCsId)}/commands`,
+      {
+        headers: {"Content-Type": "application/json", Accept: "application/json"},
+        data: {parameters: {startDateTime: null, endDateTime: null, laneUID: null}},
+      },
+    );
+    try {
+      if (!cmdRes.ok()) return;
+      let progress = assessNationalStatisticsCommandSubmission(await cmdRes.json());
+      const deadline = Date.now() + 60_000;
+      while (progress.state !== "complete" && Date.now() < deadline) {
+        await sleep(1_000);
+        const stRes = await reqCtx.get(
+          `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(natCsId)}/commands/${encodeURIComponent(progress.commandId)}/status?format=application%2Fjson&offset=0&limit=100`,
+        );
+        try {
+          if (stRes.ok()) {
+            progress = assessNationalStatisticsCommandStatus(await stRes.json(), progress.commandId);
+          }
+        } finally {
+          await stRes.dispose();
+        }
+      }
+    } finally {
+      await cmdRes.dispose();
+    }
+  }
+
+  private async adjudicateRecentOccupancyViaApi(options: {
+    reqCtx: APIRequestContext;
+    baseUrl: string;
+    vehicleId: string;
+    preferredLaneName?: string;
+    allowReservedRpmTrigger?: boolean;
+    windowStartIso: string;
+  }): Promise<{laneName: string; occupancyObsId: string}> {
+    const {reqCtx, baseUrl, vehicleId, preferredLaneName, allowReservedRpmTrigger, windowStartIso} = options;
+    const sysRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500`,
+      {headers: {Accept: "application/json"}},
+    );
+    let laneSystemId = "";
+    let laneName = preferredLaneName ?? "";
+    try {
+      if (!sysRes.ok()) {
+        throw new Error(`Lane system lookup on ${baseUrl} returned HTTP ${sysRes.status()}`);
+      }
+      const sysJson = await sysRes.json() as {
+        items?: Array<{
+          id?: string;
+          uid?: string;
+          name?: string;
+          properties?: {id?: string; uid?: string; name?: string};
+        }>;
+      };
+      const laneSystems = (sysJson.items ?? []).filter((item) => {
+        const uid = String(item?.uid ?? item?.properties?.uid ?? "");
+        return uid.startsWith("urn:osh:system:lane:");
+      });
+      const chosen = (preferredLaneName
+        ? laneSystems.find((item) =>
+          String(item?.name ?? item?.properties?.name ?? "").toLowerCase() === preferredLaneName.toLowerCase())
+        : undefined) ?? laneSystems[0];
+      if (!chosen) {
+        throw new Error(`No urn:osh:system:lane:* system found on ${baseUrl}`);
+      }
+      laneSystemId = String(chosen.id ?? chosen.properties?.id ?? "");
+      laneName = String(chosen.name ?? chosen.properties?.name ?? (preferredLaneName || "Lane"));
+    } finally {
+      await sysRes.dispose();
+    }
+
+    const dsRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/datastreams?system=${encodeURIComponent(laneSystemId)}&validTime=latest&limit=200`,
+      {headers: {Accept: "application/json"}},
+    );
+    let occDsId = "";
+    try {
+      if (dsRes.ok()) {
+        const dsJson = await dsRes.json() as {items?: Array<{id?: string; outputName?: string}>};
+        occDsId = String((dsJson.items ?? []).find((ds) => ds.outputName === "occupancy")?.id ?? "");
+      }
+    } finally {
+      await dsRes.dispose();
+    }
+    if (!occDsId) {
+      const fallbackDsRes = await reqCtx.get(
+        `${baseUrl}/sensorhub/api/datastreams?validTime=latest&limit=2500`,
+        {headers: {Accept: "application/json"}},
+      );
+      try {
+        if (fallbackDsRes.ok()) {
+          const dsJson = await fallbackDsRes.json() as {
+            items?: Array<{id?: string; outputName?: string; "system@link"?: {uid?: string; title?: string}}>;
+          };
+          const occItems = (dsJson.items ?? []).filter((ds) => ds.outputName === "occupancy");
+          const matched = (preferredLaneName
+            ? occItems.find((ds) =>
+              String(ds["system@link"]?.title ?? ds["system@link"]?.uid ?? "")
+                .toLowerCase()
+                .includes(preferredLaneName.toLowerCase()))
+            : undefined) ?? occItems[0];
+          occDsId = String(matched?.id ?? "");
+        }
+      } finally {
+        await fallbackDsRes.dispose();
+      }
+    }
+    if (!occDsId) {
+      throw new Error(`No occupancy datastream found on ${baseUrl} for lane ${laneName}`);
+    }
+
+    const findRecentObsId = async (): Promise<string> => {
+      const endIso = new Date(Date.now() + 60_000).toISOString();
+      const obsRes = await reqCtx.get(
+        `${baseUrl}/sensorhub/api/observations?datastream=${encodeURIComponent(occDsId)}&phenomenonTime=${encodeURIComponent(windowStartIso)}/${encodeURIComponent(endIso)}&limit=5`,
+        {headers: {Accept: "application/om+json, application/json"}},
+      );
+      try {
+        if (!obsRes.ok()) return "";
+        const obsJson = await obsRes.json() as {items?: Array<{id?: string}>};
+        return String(obsJson.items?.[0]?.id ?? "");
+      } finally {
+        await obsRes.dispose();
+      }
+    };
+
+    let occupancyObsId = await findRecentObsId();
+    if (!occupancyObsId && allowReservedRpmTrigger) {
+      occupancyObsId = [...this.resolvedAlarmEventIds][0] ?? "";
+    }
+    if (!occupancyObsId && allowReservedRpmTrigger && this.originalRpmConfig) {
+      await this.emulator.replaceConfig(
+        this.config.testRpmId,
+        this.emulator.shortAlarmConfig(this.originalRpmConfig, 3),
+      );
+      try {
+        await this.triggerAlarm("gamma", "multi-node-federation");
+        occupancyObsId = await poll(
+          findRecentObsId,
+          (id) => id.length > 0,
+          {timeoutMs: 30_000, intervalMs: 500, description: "generated occupancy observation on reserved lane"},
+        );
+      } finally {
+        await this.emulator.replaceConfig(
+          this.config.testRpmId,
+          this.emulator.quietConfig(this.originalRpmConfig),
+        ).catch((err) => this.reporter.error("multi-node-federation", "restore-quiet-config", err));
+      }
+    }
+    if (!occupancyObsId) {
+      throw new Error(`No recent occupancy observation available on ${baseUrl} (${laneName}) within 30d window`);
+    }
+
+    const findAdjCsId = async (url: string, matchLane?: string): Promise<string> => {
+      const csRes = await reqCtx.get(url, {headers: {Accept: "application/json"}});
+      try {
+        if (!csRes.ok()) return "";
+        const csJson = await csRes.json() as {
+          items?: Array<{
+            id?: string;
+            inputName?: string;
+            "system@link"?: {uid?: string; title?: string};
+            schema?: unknown;
+          }>;
+        };
+        const adjStreams = (csJson.items ?? []).filter(
+          (cs) => cs.inputName === "adjudicationControl" || /Adjudication/i.test(JSON.stringify(cs.schema ?? "")),
+        );
+        const chosen = (matchLane
+          ? adjStreams.find((cs) =>
+            String(cs["system@link"]?.title ?? cs["system@link"]?.uid ?? "")
+              .toLowerCase()
+              .includes(matchLane.toLowerCase()))
+          : undefined) ?? adjStreams[0];
+        return String(chosen?.id ?? "");
+      } finally {
+        await csRes.dispose();
+      }
+    };
+
+    let adjCsId = await findAdjCsId(
+      `${baseUrl}/sensorhub/api/controlstreams?system=${encodeURIComponent(laneSystemId)}&validTime=latest&limit=200`,
+    );
+    if (!adjCsId) {
+      adjCsId = await findAdjCsId(
+        `${baseUrl}/sensorhub/api/controlstreams?validTime=latest&limit=1000`,
+        preferredLaneName,
+      );
+    }
+    if (!adjCsId) {
+      throw new Error(`No adjudicationControl stream found on ${baseUrl} for lane ${laneName}`);
+    }
+
+    const cmdRes = await reqCtx.post(
+      `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(adjCsId)}/commands`,
+      {
+        headers: {"Content-Type": "application/json", Accept: "application/json"},
+        data: {
+          parameters: {
+            feedback: `Cross-node federation regression ${this.reporter.runId.slice(-12)}`,
+            adjudicationCode: 9,
+            isotopesCount: 0,
+            isotopes: [],
+            secondaryInspectionStatus: "NONE",
+            filePathCount: 0,
+            filePaths: [],
+            occupancyObsId,
+            vehicleId,
+          },
+        },
+      },
+    );
+    try {
+      if (!cmdRes.ok()) {
+        throw new Error(`Adjudication command on ${baseUrl} returned HTTP ${cmdRes.status()}`);
+      }
+      const cmdJson = await cmdRes.json() as {statusCode?: string; "command@id"?: string; id?: string};
+      const cmdId = String(cmdJson["command@id"] ?? cmdJson.id ?? "");
+      if (cmdJson.statusCode === "PENDING" && cmdId) {
+        await poll(
+          async () => {
+            const stRes = await reqCtx.get(
+              `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(adjCsId)}/commands/${encodeURIComponent(cmdId)}/status?format=application%2Fjson`,
+            );
+            try {
+              if (!stRes.ok()) return "";
+              const stJson = await stRes.json() as {items?: Array<{statusCode?: string}>; statusCode?: string};
+              const items = Array.isArray(stJson.items) ? stJson.items : [stJson];
+              return items.map((it) => String(it?.statusCode ?? "")).find((s) => s === "COMPLETED" || s === "ACCEPTED") ?? "";
+            } finally {
+              await stRes.dispose();
+            }
+          },
+          (code) => code === "COMPLETED" || code === "ACCEPTED",
+          {timeoutMs: 30_000, intervalMs: 400, description: `adjudication command ${cmdId} completion`},
+        );
+      }
+    } finally {
+      await cmdRes.dispose();
+    }
+
+    await poll(
+      async () => {
+        const vsRes = await reqCtx.get(
+          `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(vehicleId)}&matchMode=equals&limit=20`,
+          {headers: {Accept: "application/json"}},
+        );
+        try {
+          if (!vsRes.ok()) return 0;
+          const vsJson = await vsRes.json() as {passes?: unknown[]};
+          return Array.isArray(vsJson.passes) ? vsJson.passes.length : 0;
+        } finally {
+          await vsRes.dispose();
+        }
+      },
+      (count) => count >= 1,
+      {timeoutMs: 30_000, intervalMs: 500, description: `vehicle-search indexing of ${vehicleId} on ${baseUrl}`},
+    );
+
+    return {laneName, occupancyObsId};
+  }
+
+  private async multiNodeFederation(): Promise<void> {
+    const capabilityMeta: CheckMetadata = {
+      scenario: "multi-node-federation",
+      category: "federation",
+      action: "authenticate federated peer portal and mint short-lived Federation Service Token",
+      target: this.config.oscarFederatedPeerBaseUrl ?? "OSCAR_FEDERATED_PEER_BASE_URL",
+      expected: "peer portal authenticates session, resolves authoritative node identity, and mints a revocable oscar_fed_ token",
+    };
+
+    if (this.config.federationWorkflow === "disabled") {
+      this.skip(capabilityMeta, "FEDERATION_WORKFLOW=disabled");
+      return;
+    }
+    const peerBaseUrl = this.config.oscarFederatedPeerBaseUrl;
+    if (!peerBaseUrl) {
+      if (this.config.federationWorkflow === "auto") {
+        this.skip(capabilityMeta, "OSCAR_FEDERATED_PEER_BASE_URL is not configured (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario,
+          capabilityMeta.category,
+          capabilityMeta.action,
+          capabilityMeta.target,
+          capabilityMeta.expected,
+          "OSCAR_FEDERATED_PEER_BASE_URL is missing",
+          "incorrect",
+          0,
+        );
+      }
+      return;
+    }
+
+    const parsedPeerUrl = new URL(peerBaseUrl);
+    const peerHost = parsedPeerUrl.hostname;
+    const peerPort = parsedPeerUrl.port || "443";
+    const peerOrigin = parsedPeerUrl.origin;
+    const peerUsername = this.config.oscarFederatedPeerUsername ?? this.config.oscarUsername;
+    const peerPassword = this.config.oscarFederatedPeerPassword ?? this.config.oscarPassword;
+    const tokenLabel = `Regression Cross-Node Fed ${this.reporter.runId}`.slice(0, 76);
+
+    const peerContext = await playwrightRequest.newContext({
+      baseURL: peerBaseUrl,
+      ignoreHTTPSErrors: true,
+      httpCredentials: {
+        username: peerUsername,
+        password: peerPassword,
+      },
+    });
+    const page = await this.browser.oscarPage();
+    let createdTokenId = "";
+    let mintedRawToken = "";
+    let localNodeName = "Local Node";
+    let expectedPeerNodeName = peerHost;
+
+    const removePeerNodeFromViewer = async (targetPage: Page): Promise<void> => {
+      await this.goto(targetPage, "/servers");
+      await targetPage.getByRole("heading", {name: "Nodes", exact: true})
+        .waitFor({timeout: this.config.uiTimeoutMs})
+        .catch(() => undefined);
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const peerItem = targetPage.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).first();
+        if ((await peerItem.count()) === 0) break;
+        const delBtn = peerItem.getByRole("button", {name: /^Delete$/i}).first();
+        if (!(await delBtn.isVisible().catch(() => false))) break;
+        await delBtn.click();
+        await sleep(250);
+      }
+
+      await targetPage.evaluate((hostToPurge) => {
+        const rawNodes = window.localStorage.getItem("osh_nodes");
+        if (rawNodes) {
+          try {
+            const parsed = JSON.parse(rawNodes);
+            if (Array.isArray(parsed)) {
+              const filtered = parsed.filter(
+                (n: {address?: unknown; isDefaultNode?: unknown}) =>
+                  n?.isDefaultNode === true || String(n?.address ?? "") !== hostToPurge,
+              );
+              window.localStorage.setItem("osh_nodes", JSON.stringify(filtered));
+            }
+          } catch {
+            // Ignore malformed storage
+          }
+        }
+        const rawCfg = window.localStorage.getItem("osh_config_node");
+        if (rawCfg && rawCfg.includes(hostToPurge)) {
+          window.localStorage.removeItem("osh_config_node");
+        }
+        const rawPersistNodes = window.localStorage.getItem("persist:nodes");
+        if (rawPersistNodes && rawPersistNodes.includes(hostToPurge)) {
+          window.localStorage.removeItem("persist:nodes");
+        }
+      }, peerHost);
+
+      await this.goto(targetPage, "/servers");
+      await targetPage.getByRole("heading", {name: "Nodes", exact: true})
+        .waitFor({timeout: this.config.uiTimeoutMs})
+        .catch(() => undefined);
+    };
+
+    const revokePeerToken = async (): Promise<void> => {
+      if (!createdTokenId) return;
+      const tokenToRevoke = createdTokenId;
+      createdTokenId = "";
+      const delRes = await peerContext.delete(
+        `${peerBaseUrl}/sensorhub/session/admin/federation-tokens/${encodeURIComponent(tokenToRevoke)}`,
+        {data: {}},
+      );
+      await delRes.dispose();
+    };
+
+    this.pendingFederationCleanup = async () => {
+      let cleanupPage: Page | undefined;
+      try {
+        cleanupPage = await this.browser.oscarPage();
+        await removePeerNodeFromViewer(cleanupPage);
+      } finally {
+        await cleanupPage?.close().catch(() => undefined);
+        await revokePeerToken().catch(() => undefined);
+        await peerContext.dispose().catch(() => undefined);
+      }
+    };
+
+    let revokedTokenIdForAudit = "";
+
+    try {
+      try {
+        const tokenReady = await this.check(capabilityMeta, async () => {
+          const loginRes = await peerContext.post(`${peerBaseUrl}/login`, {
+            form: {username: peerUsername, password: peerPassword},
+            maxRedirects: 0,
+          });
+          await loginRes.dispose();
+
+          let sessionRes = await peerContext.get(`${peerBaseUrl}/sensorhub/session`, {
+            headers: {Accept: "application/json"},
+          });
+          if (sessionRes.status() === 404) {
+            await sessionRes.dispose();
+            sessionRes = await peerContext.get(`${peerBaseUrl}/session`, {
+              headers: {Accept: "application/json"},
+            });
+          }
+          let sessionUser = "";
+          const sessionStatus = sessionRes.status();
+          try {
+            if (sessionRes.ok()) {
+              const sessionJson = await sessionRes.json() as {username?: string};
+              sessionUser = String(sessionJson.username ?? "");
+            }
+          } finally {
+            await sessionRes.dispose();
+          }
+
+          const [localDiscovered, peerDiscovered] = await Promise.all([
+            this.resolvePortalServerNodeName(page.context().request, this.config.oscarBaseUrl),
+            this.resolvePortalServerNodeName(peerContext, peerBaseUrl),
+          ]);
+          if (localDiscovered) {
+            localNodeName = localDiscovered;
+          }
+          if (peerDiscovered) {
+            expectedPeerNodeName = peerDiscovered;
+          }
+
+          await this.ensurePortalNationalStatisticsObservation(peerContext, peerBaseUrl);
+
+          const createRes = await peerContext.post(
+            `${peerBaseUrl}/sensorhub/session/admin/federation-tokens`,
+            {
+              headers: {"Content-Type": "application/json", Accept: "application/json"},
+              data: {label: tokenLabel, role: "operator", expiresInDays: 1},
+            },
+          );
+          const createStatus = createRes.status();
+          try {
+            if (createRes.ok()) {
+              const payload = await createRes.json() as {token?: string; record?: {id?: string}};
+              createdTokenId = String(payload?.record?.id ?? "");
+              revokedTokenIdForAudit = createdTokenId;
+              mintedRawToken = String(payload?.token ?? "");
+            }
+          } finally {
+            await createRes.dispose();
+          }
+
+          const passed = sessionStatus === 200 &&
+            sessionUser.toLowerCase() === peerUsername.toLowerCase() &&
+            (createStatus === 200 || createStatus === 201) &&
+            createdTokenId.length > 0 &&
+            mintedRawToken.startsWith("oscar_fed_");
+          return {
+            passed,
+            value: passed,
+            observed: `peerSessionHttp=${sessionStatus}; peerUser=${sessionUser}; peerNode=${expectedPeerNodeName}; ` +
+              `tokenCreateHttp=${createStatus}; tokenId=${createdTokenId || "none"}`,
+          };
+        });
+        if (!tokenReady) return;
+
+        const peerConnected = await this.check({
+          scenario: "multi-node-federation",
+          category: "federation",
+          action: "connect federated peer node on /servers?auth=bearer via Bearer Federation Token",
+          target: `${peerHost}:${peerPort}`,
+          expected: "Add Server form submits over HTTPS with Bearer token, peer ConSys API responds HTTP 200, and peer node renders with Federation Token badge",
+        }, async () => {
+          await this.goto(page, "/servers?auth=bearer");
+          await page.getByRole("heading", {name: "Nodes", exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+          await page.getByRole("heading", {name: "Add a New Server", exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+          const storedPrimaryName = await page.evaluate(() => {
+            try {
+              const parsed = JSON.parse(window.localStorage.getItem("osh_nodes") || "[]");
+              if (Array.isArray(parsed) && parsed[0]?.name) {
+                return String(parsed[0].name).trim();
+              }
+            } catch {
+              // Ignore
+            }
+            return "";
+          });
+          if (storedPrimaryName) {
+            localNodeName = storedPrimaryName;
+          }
+
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const staleItem = page.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).first();
+            if ((await staleItem.count()) === 0) break;
+            const delBtn = staleItem.getByRole("button", {name: /^Delete$/i}).first();
+            if (!(await delBtn.isVisible().catch(() => false))) break;
+            await delBtn.click();
+            await sleep(250);
+          }
+
+          let customPeerName = "";
+          if (expectedPeerNodeName === localNodeName) {
+            customPeerName = `${expectedPeerNodeName} (${peerHost})`;
+            expectedPeerNodeName = customPeerName;
+          }
+
+          const tokenInput = page.getByTestId("node-federation-token-input");
+          await tokenInput.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+
+          if (customPeerName) {
+            await page.getByLabel(/^Name$/i).first().fill(customPeerName);
+          }
+          await page.getByLabel(/^Address$/i).first().fill(peerHost);
+          await page.getByLabel(/^Port$/i).first().fill(peerPort);
+          const secureCheckbox = page.getByLabel(/Use a secure connection/i).first();
+          if (!(await secureCheckbox.isChecked())) {
+            await secureCheckbox.check();
+          }
+          await tokenInput.fill(mintedRawToken);
+
+          let peerApiBearer200 = false;
+          let peerDatastreams200 = false;
+          const onPeerRes = (res: Response) => {
+            try {
+              const parsed = new URL(res.url());
+              if (parsed.origin !== peerOrigin) return;
+              const authHdr = res.request().headers()["authorization"] ?? "";
+              if (res.status() === 200 && /^Bearer\s+oscar_fed_/i.test(authHdr)) {
+                if (/\/sensorhub\/api\/?$/.test(parsed.pathname) || /\/sensorhub\/api\/systems/.test(parsed.pathname)) {
+                  peerApiBearer200 = true;
+                }
+                if (/\/sensorhub\/api\/datastreams/.test(parsed.pathname)) {
+                  peerDatastreams200 = true;
+                }
+              }
+            } catch {
+              // Ignore malformed URLs
+            }
+          };
+          page.on("response", onPeerRes);
+          try {
+            await page.getByRole("button", {name: /^Add Node$/i}).click();
+            const cardState = await poll(
+              async () => {
+                const item = page.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).first();
+                const count = await item.count();
+                const text = count > 0 ? await item.innerText().catch(() => "") : "";
+                return {
+                  visible: count > 0,
+                  hasFederationBadge: /Federation Token/i.test(text),
+                  hasExpectedName: text.includes(expectedPeerNodeName),
+                  text: text.replace(/\s+/g, " ").trim(),
+                };
+              },
+              (state) => state.visible && state.hasFederationBadge && state.hasExpectedName,
+              {timeoutMs: this.config.eventTimeoutMs, intervalMs: 300, description: "federated peer card on /servers"},
+            );
+
+            await poll(
+              async () => peerDatastreams200,
+              (ready) => ready,
+              {timeoutMs: 25_000, intervalMs: 300, description: "initial federated peer datastream discovery"},
+            ).catch(() => false);
+
+            const passed = peerApiBearer200 && cardState.visible && cardState.hasFederationBadge && cardState.hasExpectedName;
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-servers-connect-failed");
+            return {
+              passed,
+              value: passed,
+              observed: `peerApiBearer200=${peerApiBearer200}; peerDatastreams200=${peerDatastreams200}; ` +
+                `localNode=${localNodeName}; peerNode=${expectedPeerNodeName}; card="${cardState.text}"`,
+              evidence,
+            };
+          } finally {
+            page.off("response", onPeerRes);
+          }
+        });
+        if (!peerConnected) return;
+
+        await this.check({
+          scenario: "multi-node-federation",
+          category: "national",
+          action: "render unified multi-node statistics on /national-view",
+          target: "/national-view",
+          expected: "both the local primary site row and the federated peer site row render in .MuiDataGrid-row with valid numeric statistics",
+        }, async () => {
+          await this.clickSpaNavItem(page, "nav-item-national", "/national-view");
+          await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+
+          const readSiteRowStats = async (siteName: string) => {
+            const row = page.locator(".MuiDataGrid-row").filter({
+              has: page.locator('[data-field="site"]', {hasText: siteName}),
+            }).first();
+            if ((await row.count()) === 0) return null;
+            const values = {} as Record<NationalStatisticsField, string>;
+            for (const field of NATIONAL_STATISTICS_FIELDS) {
+              values[field] = await row.locator(`[data-field="${field}"]`).innerText();
+            }
+            return parseRenderedNationalStatistics(values);
+          };
+
+          const rendered = await poll(
+            async () => {
+              const rowCount = await page.locator(".MuiDataGrid-row").count();
+              let localStats = null;
+              let peerStats = null;
+              try {
+                localStats = await readSiteRowStats(localNodeName);
+              } catch {
+                localStats = null;
+              }
+              try {
+                peerStats = await readSiteRowStats(expectedPeerNodeName);
+              } catch {
+                peerStats = null;
+              }
+              return {rowCount, localStats, peerStats};
+            },
+            (candidate) => candidate.rowCount >= 2 && candidate.localStats !== null && candidate.peerStats !== null,
+            {
+              timeoutMs: this.config.eventTimeoutMs,
+              intervalMs: 400,
+              description: `both ${localNodeName} and ${expectedPeerNodeName} rows on /national-view`,
+            },
+          );
+
+          const passed = rendered.rowCount >= 2 && rendered.localStats !== null && rendered.peerStats !== null;
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-national-view-failed");
+          return {
+            passed,
+            observed: `rows=${rendered.rowCount}; local(${localNodeName})=${JSON.stringify(rendered.localStats)}; ` +
+              `peer(${expectedPeerNodeName})=${JSON.stringify(rendered.peerStats)}`,
+            evidence,
+          };
+        });
+
+        await this.check({
+          scenario: "multi-node-federation",
+          category: "vehicle-search",
+          action: "correlate cross-node vehicle passes on /event-log and compare both portals in VehiclePassComparisonDialog",
+          target: "/event-log and VehiclePassComparisonDialog",
+          expected: "cross-origin Bearer GET to peer /sensorhub/buckets/adjudication/vehicle-search returns HTTP 200, summary shows >=2 passes across >=2 sites, and VehiclePassComparisonDialog renders passes from both nodes",
+        }, async () => {
+          const windowStartIso = new Date(Date.now() - 29 * 24 * 60 * 60 * 1_000).toISOString();
+          const collectVehicles = async (
+            reqCtx: APIRequestContext,
+            baseUrl: string,
+          ): Promise<Map<string, string>> => {
+            const res = await reqCtx.get(
+              `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=100&startTime=${encodeURIComponent(windowStartIso)}`,
+              {headers: {Accept: "application/json"}},
+            );
+            const map = new Map<string, string>();
+            try {
+              if (res.ok()) {
+                const json = await res.json() as {
+                  passes?: Array<{normalizedVehicleId?: unknown; vehicleId?: unknown}>;
+                };
+                for (const p of json.passes ?? []) {
+                  const raw = String(p.vehicleId ?? p.normalizedVehicleId ?? "").trim();
+                  const norm = String(p.normalizedVehicleId ?? raw)
+                    .trim()
+                    .toUpperCase()
+                    .replace(/[^A-Z0-9]/g, "");
+                  if (norm.length >= 4 && !map.has(norm)) {
+                    map.set(norm, raw || norm);
+                  }
+                }
+              }
+            } finally {
+              await res.dispose();
+            }
+            return map;
+          };
+
+          const [peerVehicles, localVehicles] = await Promise.all([
+            collectVehicles(peerContext, peerBaseUrl),
+            collectVehicles(page.context().request, this.config.oscarBaseUrl),
+          ]);
+
+          let targetNorm = "";
+          let targetVehicleId = "";
+          let correlationSeedSource = "existing-both-portals";
+
+          for (const [norm, raw] of peerVehicles.entries()) {
+            if (localVehicles.has(norm)) {
+              targetNorm = norm;
+              targetVehicleId = norm;
+              void raw;
+              break;
+            }
+          }
+
+          if (!targetNorm && peerVehicles.size > 0) {
+            const preferredIso = [...peerVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm));
+            targetNorm = preferredIso ?? [...peerVehicles.keys()][0]!;
+            targetVehicleId = targetNorm;
+            await this.adjudicateRecentOccupancyViaApi({
+              reqCtx: page.context().request,
+              baseUrl: this.config.oscarBaseUrl,
+              vehicleId: targetVehicleId,
+              preferredLaneName: this.config.testLaneLabel,
+              allowReservedRpmTrigger: true,
+              windowStartIso,
+            });
+            correlationSeedSource = `reused-peer-vehicle-adjudicated-${this.config.testLaneLabel}`;
+          } else if (!targetNorm) {
+            const preferredLocalIso = [...localVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm));
+            targetNorm = preferredLocalIso ?? "EGHU3972694";
+            targetVehicleId = targetNorm;
+            await this.adjudicateRecentOccupancyViaApi({
+              reqCtx: peerContext,
+              baseUrl: peerBaseUrl,
+              vehicleId: targetVehicleId,
+              windowStartIso,
+            });
+            if (!localVehicles.has(targetNorm)) {
+              await this.adjudicateRecentOccupancyViaApi({
+                reqCtx: page.context().request,
+                baseUrl: this.config.oscarBaseUrl,
+                vehicleId: targetVehicleId,
+                preferredLaneName: this.config.testLaneLabel,
+                allowReservedRpmTrigger: true,
+                windowStartIso,
+              });
+            }
+            correlationSeedSource = "seeded-empty-peer-and-local";
+          }
+
+          let peerVehicleSearchHttp200 = false;
+          let peerVehicleSearchBearerVerified = false;
+          const peerSearchStatuses: number[] = [];
+          const onVehicleSearchRes = (res: Response) => {
+            try {
+              const parsed = new URL(res.url());
+              if (parsed.origin !== peerOrigin) return;
+              if (res.request().method() !== "GET") return;
+              if (!parsed.pathname.endsWith("/sensorhub/buckets/adjudication/vehicle-search")) return;
+              peerSearchStatuses.push(res.status());
+              const authHdr = res.request().headers()["authorization"] ?? "";
+              if (/^Bearer\s+oscar_fed_/i.test(authHdr)) {
+                peerVehicleSearchBearerVerified = true;
+                if (res.status() === 200) {
+                  peerVehicleSearchHttp200 = true;
+                }
+              }
+            } catch {
+              // Ignore malformed URLs
+            }
+          };
+
+          page.on("response", onVehicleSearchRes);
+          try {
+            await this.clickSpaNavItem(page, "nav-item-events", "/event-log");
+            await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+
+            const searchInput = page.getByTestId("vehicle-id-search-input");
+            await searchInput.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+            await searchInput.fill(targetVehicleId);
+            await page.getByTestId("vehicle-id-search-submit").click();
+
+            const summaryObs = await poll(
+              async () => {
+                const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
+                const compareVisible = await compareBtn.isVisible().catch(() => false);
+                const compareText = compareVisible ? (await compareBtn.innerText().catch(() => "")).trim() : "";
+                const statusTexts = await page.locator('[role="status"]').allInnerTexts().catch(() => []);
+                const combinedStatus = statusTexts.join(" | ").replace(/\s+/g, " ").trim();
+                const countMatch = /\((\d+)\)/.exec(compareText);
+                const passCount = countMatch?.[1] ? Number(countMatch[1]) : 0;
+                const multiSiteMentioned = /\b([2-9]|\d{2,})\s+sites?\b/i.test(combinedStatus);
+                return {
+                  compareVisible,
+                  compareText,
+                  combinedStatus,
+                  passCount,
+                  multiSiteMentioned,
+                  peerHttp200: peerVehicleSearchHttp200,
+                  peerBearer: peerVehicleSearchBearerVerified,
+                };
+              },
+              (obs) => obs.compareVisible && obs.passCount >= 2 && obs.multiSiteMentioned && obs.peerHttp200 && obs.peerBearer,
+              {timeoutMs: 30_000, intervalMs: 300, description: "cross-node Vehicle Search summary and Bearer GET 200"},
+            );
+
+            await page.getByTestId("vehicle-search-compare-btn").first().click();
+            const dialog = page.getByTestId("vehicle-pass-comparison-dialog");
+            await dialog.waitFor({state: "visible", timeout: 15_000});
+            await dialog.getByTestId("vehicle-pass-table-region").waitFor({state: "visible", timeout: 15_000});
+
+            const dialogObs = await poll(
+              async () => {
+                const rows = dialog.locator('[data-testid^="vehicle-pass-row-"]');
+                const rowCount = await rows.count();
+                const rowTexts = await rows.allInnerTexts().catch(() => []);
+                const hasLocalNodePass = rowTexts.some((txt) => txt.includes(localNodeName));
+                const hasPeerNodePass = rowTexts.some((txt) => txt.includes(expectedPeerNodeName));
+                const hasFederatedBadge = rowTexts.some((txt) => /Federated/i.test(txt));
+                return {rowCount, hasLocalNodePass, hasPeerNodePass, hasFederatedBadge};
+              },
+              (obs) => obs.rowCount >= 2 && obs.hasLocalNodePass && obs.hasPeerNodePass && obs.hasFederatedBadge,
+              {timeoutMs: 20_000, intervalMs: 300, description: "VehiclePassComparisonDialog rows from both nodes"},
+            );
+
+            await dialog.getByRole("button", {name: /^close$/i}).last().click();
+            await dialog.waitFor({state: "hidden", timeout: 10_000});
+            await page.getByTestId("vehicle-id-search-clear").click();
+
+            const passed = summaryObs.peerHttp200 &&
+              summaryObs.peerBearer &&
+              summaryObs.passCount >= 2 &&
+              summaryObs.multiSiteMentioned &&
+              dialogObs.rowCount >= 2 &&
+              dialogObs.hasLocalNodePass &&
+              dialogObs.hasPeerNodePass &&
+              dialogObs.hasFederatedBadge;
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-vehicle-comparison-failed");
+            return {
+              passed,
+              observed: `vehicleId=${targetVehicleId} (${correlationSeedSource}); peerSearchStatuses=${JSON.stringify(peerSearchStatuses)}; ` +
+                `bearerVerified=${summaryObs.peerBearer}; compare="${summaryObs.compareText}"; ` +
+                `dialogRows=${dialogObs.rowCount}; localPass=${dialogObs.hasLocalNodePass}; peerPass=${dialogObs.hasPeerNodePass}; federatedBadge=${dialogObs.hasFederatedBadge}`,
+              evidence,
+            };
+          } finally {
+            page.off("response", onVehicleSearchRes);
+          }
+        });
+      } finally {
+        await removePeerNodeFromViewer(page).catch((err) =>
+          this.reporter.error("multi-node-federation", "remove-peer-node", err));
+        await revokePeerToken().catch((err) =>
+          this.reporter.error("multi-node-federation", "revoke-peer-token", err));
+      }
+
+      await this.check({
+        scenario: "multi-node-federation",
+        category: "teardown",
+        action: "verify zero federated node or service-token residue after teardown",
+        target: `${this.config.targetHost} and ${peerHost}`,
+        expected: "primary Viewer /servers and localStorage contain zero peer host entries, and peer /sensorhub/session/admin/overview excludes the revoked Federation Service Token",
+      }, async () => {
+        const storageState = await page.evaluate((hostToCheck) => {
+          const keys = ["osh_nodes", "osh_config_node", "persist:nodes", "persist:root"];
+          const leakedKeys = keys.filter((k) => (window.localStorage.getItem(k) ?? "").includes(hostToCheck));
+          let nodeCount = 0;
+          try {
+            const parsed = JSON.parse(window.localStorage.getItem("osh_nodes") || "[]");
+            if (Array.isArray(parsed)) nodeCount = parsed.length;
+          } catch {
+            nodeCount = -1;
+          }
+          return {leakedKeys, nodeCount};
+        }, peerHost);
+        const peerCardRemaining = await page.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).count();
+
+        const ovRes = await peerContext.get(`${peerBaseUrl}/sensorhub/session/admin/overview`, {
+          headers: {Accept: "application/json"},
+        });
+        const ovStatus = ovRes.status();
+        let tokenAbsentOnPeer = false;
+        try {
+          if (ovRes.ok()) {
+            const ovJson = await ovRes.json() as {
+              federationTokens?: Array<{id?: string; label?: string}>;
+            };
+            tokenAbsentOnPeer = !(ovJson.federationTokens ?? []).some(
+              (tok) =>
+                (revokedTokenIdForAudit && tok.id === revokedTokenIdForAudit) ||
+                tok.label === tokenLabel,
+            );
+          }
+        } finally {
+          await ovRes.dispose();
+        }
+
+        const passed = peerCardRemaining === 0 &&
+          storageState.leakedKeys.length === 0 &&
+          storageState.nodeCount === 1 &&
+          ovStatus === 200 &&
+          tokenAbsentOnPeer;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-federation-teardown-failed");
+        return {
+          passed,
+          observed: `peerCardRemaining=${peerCardRemaining}; leakedStorageKeys=${JSON.stringify(storageState.leakedKeys)}; ` +
+            `oshNodesCount=${storageState.nodeCount}; peerOverviewHttp=${ovStatus}; tokenAbsentOnPeer=${tokenAbsentOnPeer}`,
+          evidence,
+        };
+      });
+    } finally {
+      this.pendingFederationCleanup = undefined;
+      await page.close().catch(() => undefined);
+      await peerContext.dispose().catch(() => undefined);
+    }
   }
 }

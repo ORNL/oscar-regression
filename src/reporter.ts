@@ -151,7 +151,9 @@ export class RunReporter {
   redact(value: unknown): string {
     let text = oneLine(value);
     for (const secret of this.secrets) text = text.replaceAll(secret, "[REDACTED]");
-    return text.replaceAll(/(authorization\s*[:=]\s*basic\s+)[a-z0-9+/=]+/gi, "$1[REDACTED]");
+    text = text.replaceAll(/(authorization\s*[:=]\s*basic\s+)[a-z0-9+/=]+/gi, "$1[REDACTED]");
+    text = text.replaceAll(/(authorization\s*[:=]\s*bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, "$1[REDACTED]");
+    return text.replaceAll(/\boscar_fed_[A-Za-z0-9_-]+/g, "oscar_fed_[REDACTED]");
   }
 
   record(input: Omit<FunctionalResult, "runId" | "timestamp">): void {

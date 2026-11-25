@@ -87,3 +87,48 @@ test("release certification rejects filtered, skipped, or incomplete restore evi
   const skipped = evidenceBundle({counts: {correct: 3, incorrect: 0, skipped: 1}});
   assert.throws(() => validateRestoreEvidenceBundle(skipped, identity), /failed, skipped, or incomplete/);
 });
+
+test("release certification accepts 3.12.0 restore evidence and rejects unsupported major/minor series", () => {
+  const v312 = evidenceBundle({
+    environment: {
+      ...identity,
+      profile: "restore-drill",
+      scenarioFilter: [],
+      storageExpectedRelease: "3.12.0",
+      storageWorkflow: "required",
+      storageBackupWorkflow: "required",
+      storageBackupMode: "single",
+      restoreDrillCertification: {
+        schemaVersion: 2,
+        backupId: "20261125T120000Z-89abcdef",
+        authenticatedBackupReverified: true,
+        allCanariesRestored: true,
+        immutableImageIdentityPreserved: true,
+        preRestoreSafetyCopyVerified: true,
+      },
+    },
+  });
+  const validated = validateRestoreEvidenceBundle(v312, identity);
+  assert.equal(validated.backupId, "20261125T120000Z-89abcdef");
+
+  const v310 = evidenceBundle({
+    environment: {
+      ...identity,
+      profile: "restore-drill",
+      scenarioFilter: [],
+      storageExpectedRelease: "3.10.0",
+      storageWorkflow: "required",
+      storageBackupWorkflow: "required",
+      storageBackupMode: "single",
+      restoreDrillCertification: {
+        schemaVersion: 2,
+        backupId: "20261125T120000Z-89abcdef",
+        authenticatedBackupReverified: true,
+        allCanariesRestored: true,
+        immutableImageIdentityPreserved: true,
+        preRestoreSafetyCopyVerified: true,
+      },
+    },
+  });
+  assert.throws(() => validateRestoreEvidenceBundle(v310, identity), /did not run all required/);
+});

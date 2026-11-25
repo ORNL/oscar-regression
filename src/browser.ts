@@ -375,11 +375,17 @@ export class BrowserHarness {
         // falls back to the legacy MP4 when an event has not been compacted.
         // Suppress only that exact, same-origin GET miss; other 404s remain
         // regression errors and every 5xx remains an error below.
-        const expectedRetainedMediaMiss = isExpectedRetainedMediaMiss(
+        const allowedBaseUrls = [
           this.config.oscarBaseUrl,
-          response.request().method(),
-          response.status(),
-          url,
+          ...(this.config.oscarFederatedPeerBaseUrl ? [this.config.oscarFederatedPeerBaseUrl] : []),
+        ];
+        const expectedRetainedMediaMiss = allowedBaseUrls.some((allowedBaseUrl) =>
+          isExpectedRetainedMediaMiss(
+            allowedBaseUrl,
+            response.request().method(),
+            response.status(),
+            url,
+          ),
         );
         const expectedMissingObservation = [...this.expectedMissingObservationIds].some((observationId) => {
           try {
@@ -389,18 +395,22 @@ export class BrowserHarness {
             return false;
           }
         });
-        const expectedHistoricalClipMiss = isExpectedHistoricalClipMiss(
-          this.config.oscarBaseUrl,
-          response.request().method(),
-          response.status(),
-          url,
-          this.expectedHistoricalClipDates,
+        const expectedHistoricalClipMiss = allowedBaseUrls.some((allowedBaseUrl) =>
+          isExpectedHistoricalClipMiss(
+            allowedBaseUrl,
+            response.request().method(),
+            response.status(),
+            url,
+            this.expectedHistoricalClipDates,
+          ),
         );
-        const expectedHistoricalOcrCropMiss = isExpectedHistoricalOcrCropMiss(
-          this.config.oscarBaseUrl,
-          response.request().method(),
-          response.status(),
-          url,
+        const expectedHistoricalOcrCropMiss = allowedBaseUrls.some((allowedBaseUrl) =>
+          isExpectedHistoricalOcrCropMiss(
+            allowedBaseUrl,
+            response.request().method(),
+            response.status(),
+            url,
+          ),
         );
         if (!expectedPreparingRequest && !expectedRetainedMediaMiss &&
             !expectedMissingObservation && !expectedHistoricalClipMiss &&

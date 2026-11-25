@@ -1344,3 +1344,35 @@ test("storage-health and storage-lifecycle verify ConSys API query latency and d
   assert.match(lifecycle, /const latencyAfter = await this\.measureConSysQueryLatencies\(apiPage\)/);
   assert.match(lifecycle, /dsDelta <= 4 \* 1024 \* 1024/);
 });
+
+test("3.12 platform coverage gates 26-stream PARQUET_PRIMARY, /dashboards, MobileDetectorSystem, and multi-node-federation teardown", () => {
+  for (const streamName of [
+    '"location"',
+    '"alarm"',
+    '"KromekDetectorRadiometricsV1Report"',
+    '"KromekSerialRadiometricStatusReport"',
+  ]) {
+    assert.ok(scenarios.includes(streamName), `missing 3.12 PARQUET_PRIMARY stream ${streamName}`);
+  }
+  assert.ok(scenarios.includes("custom-dashboards-page"));
+  assert.ok(scenarios.includes("nav-item-custom-dashboards"));
+  assert.ok(scenarios.includes("Mobile Detector System"));
+
+  const fedStart = scenarios.indexOf("private async multiNodeFederation");
+  assert.ok(fedStart > 0, "missing multiNodeFederation scenario method");
+  const fedBlock = scenarios.slice(fedStart);
+  for (const required of [
+    "/sensorhub/session/admin/federation-tokens",
+    "/servers?auth=bearer",
+    "node-federation-token-input",
+    "nav-item-national",
+    "/sensorhub/buckets/adjudication/vehicle-search",
+    "vehicle-search-compare-btn",
+    "vehicle-pass-comparison-dialog",
+    "removePeerNodeFromViewer",
+    "revokePeerToken",
+    "/sensorhub/session/admin/overview",
+  ]) {
+    assert.ok(fedBlock.includes(required), `missing multi-node-federation contract element: ${required}`);
+  }
+});
