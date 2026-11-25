@@ -5310,6 +5310,9 @@ export class RegressionScenarios {
         ] as const;
 
         const readFaultRows = async () => {
+          if ((await faultToggle.getAttribute("aria-pressed").catch(() => null)) !== "true") {
+            await faultToggle.click().catch(() => undefined);
+          }
           const grids = page.locator(".MuiDataGrid-root:visible");
           const grid = grids.last();
           const rows = grid.locator(".MuiDataGrid-row");
@@ -8062,10 +8065,10 @@ export class RegressionScenarios {
       if (!enabledCheck) return;
 
       // Ensure the lane's RPM and camera reconnect cleanly after the LaneSystem config update, then configure a
-      // 9-second alarm window so cam_50 captures a full transit of the real container loop (7.2s).
+      // 12-second alarm window so cam_50 captures container transits across multi-scene compilation loops.
       await this.emulator.replaceConfig(
         this.config.testRpmId,
-        this.emulator.shortAlarmConfig(this.originalRpmConfig, 9),
+        this.emulator.shortAlarmConfig(this.originalRpmConfig, 12),
       );
       await this.waitHealthRpmConnection(page, "online", 60_000);
       await sleep(2_500);
@@ -8084,6 +8087,7 @@ export class RegressionScenarios {
       );
       if (!initialEventId) throw new Error("Failed to resolve occupancy UUID for container-transit gamma alarm");
       let eventId: string = initialEventId;
+      const triggeredEventIds = new Set<string>([initialEventId]);
       await this.captureAlarmMedia(page, eventId, "gamma", trigger.occupancyCount, "vehicle-ocr");
 
       const expectedContainer = this.config.expectedVehicleOcrContainer;
@@ -8108,7 +8112,7 @@ export class RegressionScenarios {
         evidenceImagePath: string;
       }
 
-      const fetchMatchingOcrObservationsFor = async (targetEventId: string): Promise<OcrObservationRecord[]> => {
+      const fetchMatchingOcrObservationsFor = async (targetEventIds: ReadonlySet<string>): Promise<OcrObservationRecord[]> => {
         const windowEndIso = new Date(Date.now() + 60_000).toISOString();
         const params = new URLSearchParams({
           resultTime: `${triggerWindowStartIso}/${windowEndIso}`,
@@ -8133,7 +8137,7 @@ export class RegressionScenarios {
           for (const item of json.items ?? []) {
             const r = item.result ?? item.properties?.result ?? {};
             const obsId = String(r.occupancyObsId ?? "").trim();
-            if (obsId !== targetEventId) continue;
+            if (!targetEventIds.has(obsId)) continue;
             matched.push({
               id: String(item.id ?? "").trim(),
               occupancyObsId: obsId,
@@ -8162,9 +8166,9 @@ export class RegressionScenarios {
       }, async () => {
         let candidates: OcrObservationRecord[] = [];
         let best: OcrObservationRecord | undefined;
-        // Free-running container-transit RTSP loops contain brief empty-roadway gaps between passes;
-        // allow up to 3 phase-shifted 9s alarm triggers to capture a container body in frame.
-        for (let passAttempt = 0; passAttempt < 3; passAttempt++) {
+        // Multi-scene container-transit RTSP loops contain ~90s non-box-container segments between
+        // ISO 6346 container passes; allow up to 6 phase-shifted 12s alarm triggers (~180s span).
+        for (let passAttempt = 0; passAttempt < 6; passAttempt++) {
           if (passAttempt > 0) {
             await sleep(3_500);
             const nextTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
@@ -8181,23 +8185,24 @@ export class RegressionScenarios {
             await this.captureAlarmMedia(page, nextEventId, "gamma", nextTrigger.occupancyCount, "vehicle-ocr");
             trigger = nextTrigger;
             eventId = nextEventId;
+            triggeredEventIds.add(nextEventId);
           }
-          const currentEventId = eventId!;
           candidates = await poll(
-            () => fetchMatchingOcrObservationsFor(currentEventId),
+            () => fetchMatchingOcrObservationsFor(triggeredEventIds),
             items => items.some(c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue)),
             {
-              timeoutMs: passAttempt < 2 ? 28_000 : Math.max(this.config.eventTimeoutMs, 45_000),
+              timeoutMs: passAttempt < 5 ? 20_000 : Math.max(this.config.eventTimeoutMs, 45_000),
               intervalMs: 1_000,
-              description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancy ${currentEventId}`,
+              description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancies [${[...triggeredEventIds].join(",")}]`,
             },
-          ).catch(() => fetchMatchingOcrObservationsFor(currentEventId));
+          ).catch(() => fetchMatchingOcrObservationsFor(triggeredEventIds));
 
           const validContainer = candidates.find(
             c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
           );
           if (validContainer) {
             best = validContainer;
+            eventId = validContainer.occupancyObsId;
             break;
           }
           best = candidates[0] ?? best;
@@ -12216,11 +12221,16 @@ export class RegressionScenarios {
             headers: {
               Accept: "application/json",
               Origin: peerBaseUrl,
+              "X-Requested-With": "XMLHttpRequest",
             },
             timeout: 60_000,
           });
+          const delStatus = delRes.status();
           await delRes.dispose();
-          return;
+          if (delStatus >= 200 && delStatus < 300 || delStatus === 404) {
+            return;
+          }
+          throw new Error(`Peer token DELETE returned HTTP ${delStatus}`);
         } catch (err) {
           if (attempt === 2) throw err;
         }
