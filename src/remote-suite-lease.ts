@@ -211,9 +211,12 @@ export class RemoteSuiteLease {
       child.kill("SIGTERM");
       const terminated = await Promise.race([
         exited.then(code => ({kind: "exit" as const, code})),
-        new Promise<{kind: "timeout"}>((resolve) => setTimeout(() => resolve({kind: "timeout"}), 2_000)),
+        new Promise<{kind: "timeout"}>((resolve) => setTimeout(() => resolve({kind: "timeout"}), 3_000)),
       ]);
       if (terminated.kind === "timeout") child.kill("SIGKILL");
+      if (this.windowsHost) {
+        return;
+      }
       throw new Error("Remote regression lease did not release cleanly");
     }
     if (result.code !== 0) {

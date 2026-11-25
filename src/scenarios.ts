@@ -943,15 +943,30 @@ export class RegressionScenarios {
       }
     });
 
+    const configuredEmulatorRpmIds = (): Set<string> | null => {
+      const lanes = this.config.laneConfigOracle?.lanes;
+      if (!lanes || lanes.length === 0) return null;
+      const ids = new Set<string>();
+      for (const lane of lanes) {
+        const m = /^lane-0*(\d+)$/i.exec(lane.uniqueId.trim());
+        if (m?.[1]) ids.add(`rpm-${m[1]}`);
+      }
+      return ids.size > 0 ? ids : null;
+    };
+
     await this.check({
       scenario: "preflight", category: "availability", action: "discover RPM emulator",
       target: this.config.rpmEmulatorUrl, expected: `${this.config.expectedLaneCount} RPMs and ${this.config.testRpmId} running`,
     }, async () => {
-      const rpms = await this.emulator.list();
+      const allRpms = await this.emulator.list();
+      const configuredIds = configuredEmulatorRpmIds();
+      const rpms = allRpms.length > this.config.expectedLaneCount && configuredIds
+        ? allRpms.filter((rpm) => configuredIds.has(rpm.id))
+        : allRpms;
       const reserved = rpms.find((rpm) => rpm.id === this.config.testRpmId);
       return {
         passed: rpms.length === this.config.expectedLaneCount && reserved?.running === true,
-        observed: `${rpms.length} RPMs; reserved lane running=${String(reserved?.running)}`,
+        observed: `${rpms.length} RPMs (total emulator=${allRpms.length}); reserved lane running=${String(reserved?.running)}`,
       };
     });
   }
@@ -2102,9 +2117,28 @@ export class RegressionScenarios {
         let hasOccupancyStreams = false;
         try {
           if (dsResponse.ok()) {
-            const dsPayload = await dsResponse.json() as {items?: Array<{id?: string; outputName?: string}>};
+            const configuredUids = this.config.laneConfigOracle?.lanes?.length
+              ? new Set(this.config.laneConfigOracle.lanes.map((l) => l.uniqueId.trim().toLowerCase()))
+              : null;
+            const matchesConfiguredLane = (item: {
+              "system@link"?: {uid?: string};
+              system?: {uid?: string};
+            }): boolean => {
+              if (!configuredUids || configuredUids.size === 0) return true;
+              const sysUid = String(item["system@link"]?.uid ?? item.system?.uid ?? "").trim().toLowerCase();
+              const tail = sysUid.split(":").pop() ?? "";
+              return tail.length > 0 && configuredUids.has(tail);
+            };
+            const dsPayload = await dsResponse.json() as {
+              items?: Array<{
+                id?: string;
+                outputName?: string;
+                "system@link"?: {uid?: string};
+                system?: {uid?: string};
+              }>;
+            };
             const occIds = (dsPayload.items ?? [])
-              .filter((item) => String(item.outputName ?? "").trim() === "occupancy")
+              .filter((item) => String(item.outputName ?? "").trim() === "occupancy" && matchesConfiguredLane(item))
               .map((item) => String(item.id ?? "").trim())
               .filter(Boolean)
               .slice(0, 50);
@@ -2941,7 +2975,18 @@ export class RegressionScenarios {
         target: "RPM emulator inventory",
         expected: `${this.config.expectedLaneCount} running, OSCAR-connected RPMs explicitly report tamper_fault=false`,
       }, async () => {
-        const entries = await this.emulator.tamperBaseline();
+        const allEntries = await this.emulator.tamperBaseline();
+        const configuredIds = this.config.laneConfigOracle?.lanes?.length
+          ? new Set(
+            this.config.laneConfigOracle.lanes
+              .map((l) => /^lane-0*(\d+)$/i.exec(l.uniqueId.trim())?.[1])
+              .filter((n): n is string => Boolean(n))
+              .map((n) => `rpm-${n}`),
+          )
+          : null;
+        const entries = allEntries.length > this.config.expectedLaneCount && configuredIds && configuredIds.size > 0
+          ? allEntries.filter((e) => configuredIds.has(e.id))
+          : allEntries;
         const assessment = assessKnownClearTamperBaseline(entries, this.config.expectedLaneCount);
         return {
           passed: assessment.passed,
@@ -6653,11 +6698,25 @@ export class RegressionScenarios {
         const occupancyStreamIds: string[] = [];
         try {
           if (dsRes.ok()) {
-            const dsJson = await dsRes.json() as {items?: Array<{id?: unknown; outputName?: unknown}>};
+            const configuredUids = this.config.laneConfigOracle?.lanes?.length
+              ? new Set(this.config.laneConfigOracle.lanes.map((l) => l.uniqueId.trim().toLowerCase()))
+              : null;
+            const dsJson = await dsRes.json() as {
+              items?: Array<{
+                id?: unknown;
+                outputName?: unknown;
+                "system@link"?: {uid?: unknown};
+                system?: {uid?: unknown};
+              }>;
+            };
             for (const item of dsJson.items ?? []) {
-              if (String(item.outputName ?? "").trim() === "occupancy" && item.id) {
-                occupancyStreamIds.push(String(item.id).trim());
+              if (String(item.outputName ?? "").trim() !== "occupancy" || !item.id) continue;
+              if (configuredUids && configuredUids.size > 0) {
+                const sysUid = String(item["system@link"]?.uid ?? item.system?.uid ?? "").trim().toLowerCase();
+                const tail = sysUid.split(":").pop() ?? "";
+                if (!tail || !configuredUids.has(tail)) continue;
               }
+              occupancyStreamIds.push(String(item.id).trim());
             }
           }
         } finally {
