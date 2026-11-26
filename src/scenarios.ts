@@ -2981,11 +2981,11 @@ export class RegressionScenarios {
             this.config.laneConfigOracle.lanes
               .map((l) => /^lane-0*(\d+)$/i.exec(l.uniqueId.trim())?.[1])
               .filter((n): n is string => Boolean(n))
-              .map((n) => `rpm-${n}`),
+              .flatMap((n) => [`rpm-${n}`, `rpm-${n.padStart(2, "0")}`]),
           )
           : null;
         const entries = allEntries.length > this.config.expectedLaneCount && configuredIds && configuredIds.size > 0
-          ? allEntries.filter((e) => configuredIds.has(e.id))
+          ? allEntries.filter((e) => configuredIds.has(e.rpmId))
           : allEntries;
         const assessment = assessKnownClearTamperBaseline(entries, this.config.expectedLaneCount);
         return {
