@@ -1509,6 +1509,8 @@ export interface ArchiveHealthProbe {
 
 export interface CompactionHealthProbe {
   rawGatedGenerations: number;
+  rawEventsGenerations: number;
+  rawTelemetryGenerations: number;
   dailyEventsGenerations: number;
   dailyTelemetryGenerations: number;
   monthlyEventsGenerations: number;
@@ -1516,6 +1518,7 @@ export interface CompactionHealthProbe {
   invalidCompactedGenerations: number;
   nonZeroDeletingRowCount: number;
   unpopulatedCompactedSummaries: number;
+  telemetryOcrBloomViolations: number;
   streamSeparationViolations: number;
   orphanCatalogReferenceCount: number;
 }
@@ -1524,6 +1527,8 @@ export function assessCompactionHealth(value: unknown): CompactionHealthProbe {
   const probe = object(value, "compaction health probe");
   return {
     rawGatedGenerations: integer(probe.rawGatedGenerations, "rawGatedGenerations"),
+    rawEventsGenerations: integer(probe.rawEventsGenerations, "rawEventsGenerations"),
+    rawTelemetryGenerations: integer(probe.rawTelemetryGenerations, "rawTelemetryGenerations"),
     dailyEventsGenerations: integer(probe.dailyEventsGenerations, "dailyEventsGenerations"),
     dailyTelemetryGenerations: integer(probe.dailyTelemetryGenerations, "dailyTelemetryGenerations"),
     monthlyEventsGenerations: integer(probe.monthlyEventsGenerations, "monthlyEventsGenerations"),
@@ -1531,6 +1536,7 @@ export function assessCompactionHealth(value: unknown): CompactionHealthProbe {
     invalidCompactedGenerations: integer(probe.invalidCompactedGenerations, "invalidCompactedGenerations"),
     nonZeroDeletingRowCount: integer(probe.nonZeroDeletingRowCount, "nonZeroDeletingRowCount"),
     unpopulatedCompactedSummaries: integer(probe.unpopulatedCompactedSummaries, "unpopulatedCompactedSummaries"),
+    telemetryOcrBloomViolations: integer(probe.telemetryOcrBloomViolations, "telemetryOcrBloomViolations"),
     streamSeparationViolations: integer(probe.streamSeparationViolations, "streamSeparationViolations"),
     orphanCatalogReferenceCount: integer(probe.orphanCatalogReferenceCount, "orphanCatalogReferenceCount"),
   };
@@ -1540,6 +1546,7 @@ export function compactionHealthIsSafe(probe: CompactionHealthProbe): boolean {
   return probe.invalidCompactedGenerations === 0 &&
     probe.nonZeroDeletingRowCount === 0 &&
     probe.unpopulatedCompactedSummaries === 0 &&
+    probe.telemetryOcrBloomViolations === 0 &&
     probe.streamSeparationViolations === 0 &&
     probe.orphanCatalogReferenceCount === 0;
 }

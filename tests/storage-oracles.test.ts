@@ -592,16 +592,19 @@ test("OSH BigId encoding is deterministic and rejects unsafe IDs", () => {
   assert.throws(() => encodeOshBigId(4, 0n), /positive/);
 });
 
-test("compaction health enforces parity, summary population, stream separation, and catalog integrity", () => {
+test("compaction health enforces split-at-export separation, summary population, selective OCR bloom, and catalog integrity", () => {
   const healthy = assessCompactionHealth({
-    rawGatedGenerations: 48,
+    rawGatedGenerations: 0,
+    rawEventsGenerations: 48,
+    rawTelemetryGenerations: 48,
     dailyEventsGenerations: 14,
-    dailyTelemetryGenerations: 56,
+    dailyTelemetryGenerations: 0,
     monthlyEventsGenerations: 1,
     deletingGenerations: 2,
     invalidCompactedGenerations: 0,
     nonZeroDeletingRowCount: 0,
     unpopulatedCompactedSummaries: 0,
+    telemetryOcrBloomViolations: 0,
     streamSeparationViolations: 0,
     orphanCatalogReferenceCount: 0,
   });
@@ -609,6 +612,7 @@ test("compaction health enforces parity, summary population, stream separation, 
   assert.equal(compactionHealthIsSafe({...healthy, invalidCompactedGenerations: 1}), false);
   assert.equal(compactionHealthIsSafe({...healthy, nonZeroDeletingRowCount: 1}), false);
   assert.equal(compactionHealthIsSafe({...healthy, unpopulatedCompactedSummaries: 1}), false);
+  assert.equal(compactionHealthIsSafe({...healthy, telemetryOcrBloomViolations: 1}), false);
   assert.equal(compactionHealthIsSafe({...healthy, streamSeparationViolations: 1}), false);
   assert.equal(compactionHealthIsSafe({...healthy, orphanCatalogReferenceCount: 1}), false);
 });

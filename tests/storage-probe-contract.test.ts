@@ -605,7 +605,7 @@ test("primary lifecycle samples natural whole-child retirement without product m
     "ownerGenerationRowCount", "generationIds", "pg_sleep(0.1)",
     "stage-lifecycle-status)", "oscar_archive_id_block", "oscar_archive_schema",
     "generation.state IN ('ACTIVE','SEALED')", "parityVerified", "generationRowCount",
-    "windowGenerations", "nonSealedGenerationCount", "profile='RAW_GATED'",
+    "windowGenerations", "nonSealedGenerationCount", "profile IN ('RAW_GATED','RAW_EVENTS','RAW_TELEMETRY')",
     "pg_inherits", "coldHotPresent", "sampleConsistent", "stage-lifecycle-hot)",
     "partition.state='ATTACHED'", "observation.tableoid",
   ]) assert.ok(block.includes(required), `missing read-only whole-child probe: ${required}`);

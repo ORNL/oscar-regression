@@ -9387,9 +9387,9 @@ export class RegressionScenarios {
 
       await this.check({
         scenario: "storage-health", category: "cold-archive",
-        action: "verify multi-tier compaction, stream separation, and catalog referential integrity",
+        action: "verify split-at-export profiles, event-only compaction, and catalog referential integrity",
         target: "oscar_archive_generation/oscar_archive_schema",
-        expected: "every compacted DAILY_EVENTS, DAILY_TELEMETRY, and MONTHLY_EVENTS generation is SEALED, parity-verified, summary-populated, strictly stream-separated, with zero non-zero DELETING row counts and zero orphan catalog references",
+        expected: "every RAW_EVENTS, RAW_TELEMETRY, DAILY_EVENTS, legacy DAILY_TELEMETRY, and MONTHLY_EVENTS generation is strictly stream-separated, summary-populated, leaves RAW_TELEMETRY ocr_bloom NULL, keeps compacted tiers SEALED and parity-verified, with zero non-zero DELETING row counts and zero orphan catalog references",
       }, async () => {
         const value = await poll(
           async () => assessCompactionHealth(await probe.runJson("compaction-health")),
