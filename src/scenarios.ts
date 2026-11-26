@@ -11655,6 +11655,11 @@ export class RegressionScenarios {
 
         const dlg = page.getByTestId("lane-webrelay-dialog");
         await dlg.waitFor({state: "visible", timeout: 10_000});
+        await page.waitForFunction(() => {
+          const btn = document.querySelector('[data-testid="webrelay-btn-test-primary"]') as HTMLButtonElement | null;
+          const opts = document.querySelectorAll('[data-testid="lane-webrelay-dialog"] select option');
+          return Boolean(btn && !btn.disabled && opts.length > 0);
+        }, {timeout: 10_000});
 
         const hostInput = page.getByTestId("webrelay-input-primary-host");
         await hostInput.fill(runnerIp);
