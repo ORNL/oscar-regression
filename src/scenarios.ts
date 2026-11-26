@@ -3977,6 +3977,13 @@ export class RegressionScenarios {
           }
         }
 
+        const windowSelect = page.getByTestId("vehicle-id-search-window");
+        if (await windowSelect.isVisible().catch(() => false)) {
+          await windowSelect.click();
+          const allOption = page.locator('li[data-value="all"]').first();
+          await allOption.waitFor({state: "visible", timeout: 5_000});
+          await allOption.click();
+        }
         await searchInput.fill(formattedVariant);
         await page.getByTestId("vehicle-id-search-submit").click();
         const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
@@ -3998,6 +4005,15 @@ export class RegressionScenarios {
           await dialog.getByRole("button", {name: /^close$/i}).last().click();
           await dialog.waitFor({state: "hidden", timeout: 10_000});
           await page.getByTestId("vehicle-id-search-clear").click();
+        }
+        if (await windowSelect.isVisible().catch(() => false)) {
+          await windowSelect.click();
+          const defaultOption = page.locator('li[data-value="30d"]').first();
+          if (await defaultOption.isVisible({timeout: 5_000}).catch(() => false)) {
+            await defaultOption.click();
+          } else {
+            await page.keyboard.press("Escape");
+          }
         }
 
         const passed = matchedApiCount >= chosenCount && likeModesOk && compareVisible && dialogTableFocusable && historyUpSetVisible;
