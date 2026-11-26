@@ -7,6 +7,7 @@ import {
   assessArchiveHealth,
   assessArchiveScratchRestart,
   assessArchiveScratch,
+  assessCompactionHealth,
   assessImmutableStageHealth,
   assessDailyFilePublication,
   assessJpeg,
@@ -14,6 +15,7 @@ import {
   assessRetainedMediaResponse,
   assessRetentionRuntimeHealth,
   assessStoragePlatform,
+  compactionHealthIsSafe,
   encodeOshBigId,
   immutableStageHealthIsSafe,
   mediaMetadataHealthIsSafe,
@@ -588,4 +590,25 @@ test("OSH BigId encoding is deterministic and rejects unsafe IDs", () => {
   assert.equal(encodeOshBigId(4, 300n), "0im04");
   assert.throws(() => encodeOshBigId(-1, 1n), /scope/);
   assert.throws(() => encodeOshBigId(4, 0n), /positive/);
+});
+
+test("compaction health enforces parity, summary population, stream separation, and catalog integrity", () => {
+  const healthy = assessCompactionHealth({
+    rawGatedGenerations: 48,
+    dailyEventsGenerations: 14,
+    dailyTelemetryGenerations: 56,
+    monthlyEventsGenerations: 1,
+    deletingGenerations: 2,
+    invalidCompactedGenerations: 0,
+    nonZeroDeletingRowCount: 0,
+    unpopulatedCompactedSummaries: 0,
+    streamSeparationViolations: 0,
+    orphanCatalogReferenceCount: 0,
+  });
+  assert.equal(compactionHealthIsSafe(healthy), true);
+  assert.equal(compactionHealthIsSafe({...healthy, invalidCompactedGenerations: 1}), false);
+  assert.equal(compactionHealthIsSafe({...healthy, nonZeroDeletingRowCount: 1}), false);
+  assert.equal(compactionHealthIsSafe({...healthy, unpopulatedCompactedSummaries: 1}), false);
+  assert.equal(compactionHealthIsSafe({...healthy, streamSeparationViolations: 1}), false);
+  assert.equal(compactionHealthIsSafe({...healthy, orphanCatalogReferenceCount: 1}), false);
 });

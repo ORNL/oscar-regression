@@ -99,12 +99,14 @@ import {
   assessArchiveHealth,
   assessArchiveScratchRestart,
   assessArchiveScratch,
+  assessCompactionHealth,
   assessImmutableStageHealth,
   assessJpeg,
   assessMediaMetadataHealth,
   assessRetainedMediaResponse,
   assessRetentionRuntimeHealth,
   assessStoragePlatform,
+  compactionHealthIsSafe,
   encodeOshBigId,
   immutableStageHealthIsSafe,
   MAX_RETAINED_FRAME_BYTES,
@@ -3943,6 +3945,38 @@ export class RegressionScenarios {
           await normRes.dispose();
         }
 
+        let likeModesOk = true;
+        if (chosenNorm.length >= 4) {
+          const prefixQuery = chosenNorm.slice(0, Math.min(4, chosenNorm.length));
+          const substrQuery = chosenNorm.slice(1, Math.min(chosenNorm.length, 5));
+          const [prefixRes, containsRes] = await Promise.all([
+            page.context().request.get(
+              this.viewerUrl(
+                `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(prefixQuery)}&matchMode=startsWith&limit=200`,
+              ),
+              {headers: {Accept: "application/json"}},
+            ),
+            page.context().request.get(
+              this.viewerUrl(
+                `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(substrQuery)}&matchMode=contains&limit=200`,
+              ),
+              {headers: {Accept: "application/json"}},
+            ),
+          ]);
+          try {
+            const prefixJson = prefixRes.ok() ? (await prefixRes.json() as {passes?: Array<{normalizedVehicleId?: unknown}>}) : null;
+            const containsJson = containsRes.ok() ? (await containsRes.json() as {passes?: Array<{normalizedVehicleId?: unknown}>}) : null;
+            const prefixPasses = Array.isArray(prefixJson?.passes) ? prefixJson.passes : [];
+            const containsPasses = Array.isArray(containsJson?.passes) ? containsJson.passes : [];
+            likeModesOk = prefixRes.status() === 200 &&
+              containsRes.status() === 200 &&
+              prefixPasses.some(p => String(p.normalizedVehicleId ?? "").trim() === chosenNorm) &&
+              containsPasses.some(p => String(p.normalizedVehicleId ?? "").trim() === chosenNorm);
+          } finally {
+            await Promise.all([prefixRes.dispose(), containsRes.dispose()]);
+          }
+        }
+
         await searchInput.fill(formattedVariant);
         await page.getByTestId("vehicle-id-search-submit").click();
         const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
@@ -3966,10 +4000,10 @@ export class RegressionScenarios {
           await page.getByTestId("vehicle-id-search-clear").click();
         }
 
-        const passed = matchedApiCount >= chosenCount && compareVisible && dialogTableFocusable && historyUpSetVisible;
+        const passed = matchedApiCount >= chosenCount && likeModesOk && compareVisible && dialogTableFocusable && historyUpSetVisible;
         return {
           passed,
-          observed: `chosenVehicle=${chosenNorm} (query='${formattedVariant}', accumulatedPasses=${matchedApiCount}); ` +
+          observed: `chosenVehicle=${chosenNorm} (query='${formattedVariant}', accumulatedPasses=${matchedApiCount}, likeModesOk=${likeModesOk}); ` +
             `compareVisible=${compareVisible}; historyUpSetVisible=${historyUpSetVisible}; tableTabIndex0=${dialogTableFocusable}`,
           evidence: passed ? "" : await this.screenshotOnFailure(page, "vehicle-search-correlation-failed"),
         };
@@ -9321,11 +9355,33 @@ export class RegressionScenarios {
         target: this.config.targetHost,
         expected: "archive catalog has no failed jobs, parity failures, incomplete objects, checksum errors, or archive partial artifacts",
       }, async () => {
-        const value = assessArchiveHealth(await probe.runJson("archive-health"));
+        const value = await poll(
+          async () => assessArchiveHealth(await probe.runJson("archive-health")),
+          candidate => candidate.failedJobs === 0 && candidate.parityFailures === 0 &&
+            candidate.incompleteActiveObjects === 0 && candidate.archivePartialArtifacts === 0 &&
+            candidate.walPartialArtifacts === 0 && candidate.checksumVerificationPassed,
+          {timeoutMs: 60_000, intervalMs: 2_000,
+            description: "archive verification to reach a quiescent clean boundary"},
+        );
         return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
           value.incompleteActiveObjects === 0 && value.archivePartialArtifacts === 0 &&
           value.walPartialArtifacts === 0 && value.checksumVerificationPassed,
         observed: JSON.stringify(value)};
+      });
+
+      await this.check({
+        scenario: "storage-health", category: "cold-archive",
+        action: "verify multi-tier compaction, stream separation, and catalog referential integrity",
+        target: "oscar_archive_generation/oscar_archive_schema",
+        expected: "every compacted DAILY_EVENTS, DAILY_TELEMETRY, and MONTHLY_EVENTS generation is SEALED, parity-verified, summary-populated, strictly stream-separated, with zero non-zero DELETING row counts and zero orphan catalog references",
+      }, async () => {
+        const value = await poll(
+          async () => assessCompactionHealth(await probe.runJson("compaction-health")),
+          candidate => compactionHealthIsSafe(candidate),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "compaction catalog to reach a consistent boundary"},
+        );
+        return {passed: compactionHealthIsSafe(value), observed: JSON.stringify(value)};
       });
 
       await this.check({
@@ -9953,7 +10009,14 @@ export class RegressionScenarios {
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify lifecycle left no partial archive artifacts", target: this.config.targetHost,
         expected: "post-purge archive verification passes with no archive-object or WAL partial artifacts"}, async () => {
-        const value = assessArchiveHealth(await probe.runJson("archive-health"));
+        const value = await poll(
+          async () => assessArchiveHealth(await probe.runJson("archive-health")),
+          candidate => candidate.failedJobs === 0 && candidate.parityFailures === 0 &&
+            candidate.incompleteActiveObjects === 0 && candidate.archivePartialArtifacts === 0 &&
+            candidate.walPartialArtifacts === 0 && candidate.checksumVerificationPassed,
+          {timeoutMs: 60_000, intervalMs: 2_000,
+            description: "post-lifecycle archive verification to reach a quiescent clean boundary"},
+        );
         return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
           value.incompleteActiveObjects === 0 && value.archivePartialArtifacts === 0 &&
           value.walPartialArtifacts === 0 && value.checksumVerificationPassed,

@@ -1507,6 +1507,43 @@ export interface ArchiveHealthProbe {
   checksumVerificationPassed: boolean;
 }
 
+export interface CompactionHealthProbe {
+  rawGatedGenerations: number;
+  dailyEventsGenerations: number;
+  dailyTelemetryGenerations: number;
+  monthlyEventsGenerations: number;
+  deletingGenerations: number;
+  invalidCompactedGenerations: number;
+  nonZeroDeletingRowCount: number;
+  unpopulatedCompactedSummaries: number;
+  streamSeparationViolations: number;
+  orphanCatalogReferenceCount: number;
+}
+
+export function assessCompactionHealth(value: unknown): CompactionHealthProbe {
+  const probe = object(value, "compaction health probe");
+  return {
+    rawGatedGenerations: integer(probe.rawGatedGenerations, "rawGatedGenerations"),
+    dailyEventsGenerations: integer(probe.dailyEventsGenerations, "dailyEventsGenerations"),
+    dailyTelemetryGenerations: integer(probe.dailyTelemetryGenerations, "dailyTelemetryGenerations"),
+    monthlyEventsGenerations: integer(probe.monthlyEventsGenerations, "monthlyEventsGenerations"),
+    deletingGenerations: integer(probe.deletingGenerations, "deletingGenerations"),
+    invalidCompactedGenerations: integer(probe.invalidCompactedGenerations, "invalidCompactedGenerations"),
+    nonZeroDeletingRowCount: integer(probe.nonZeroDeletingRowCount, "nonZeroDeletingRowCount"),
+    unpopulatedCompactedSummaries: integer(probe.unpopulatedCompactedSummaries, "unpopulatedCompactedSummaries"),
+    streamSeparationViolations: integer(probe.streamSeparationViolations, "streamSeparationViolations"),
+    orphanCatalogReferenceCount: integer(probe.orphanCatalogReferenceCount, "orphanCatalogReferenceCount"),
+  };
+}
+
+export function compactionHealthIsSafe(probe: CompactionHealthProbe): boolean {
+  return probe.invalidCompactedGenerations === 0 &&
+    probe.nonZeroDeletingRowCount === 0 &&
+    probe.unpopulatedCompactedSummaries === 0 &&
+    probe.streamSeparationViolations === 0 &&
+    probe.orphanCatalogReferenceCount === 0;
+}
+
 export function assessArchiveHealth(value: unknown): ArchiveHealthProbe {
   const probe = object(value, "archive health probe");
   return {
