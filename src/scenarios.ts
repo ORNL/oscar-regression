@@ -11727,65 +11727,68 @@ export class RegressionScenarios {
 
       if (this.originalRpmConfig) {
         let webrelayTrigger: Awaited<ReturnType<typeof this.triggerAlarm>> | undefined;
-        await this.check({
-          scenario: "lane-webrelay",
-          category: "auto-alarm-gatekeeper",
-          action: "trigger live RPM gamma alarm on reserved lane and verify AUTO hardware-timed WebRelay pulse",
-          target: this.config.testLaneLabel,
-          expected: "actionable RPM gamma alarm triggers relay1State=1&relay2State=1&relay3State=2&pulseTime3=3 and increments triggeredAlarmCount",
-        }, async () => {
-          const beforeLen = recordedQueries.length;
-          await this.emulator.replaceConfig(
-            this.config.testRpmId,
-            this.emulator.shortAlarmConfig(this.originalRpmConfig!),
-          );
-          await this.waitHealthRpmConnection(page, "online", 60_000);
-          webrelayTrigger = await this.triggerAlarm("gamma", "lane-webrelay");
-
-          let autoPulsed = false;
-          let triggeredCount = 0;
-          const deadline = Date.now() + 20_000;
-          while (Date.now() < deadline) {
-            const newQs = recordedQueries.slice(beforeLen);
-            if (newQs.some((q) => q.includes("relay1State=1&relay2State=1&relay3State=2&pulseTime3=3"))) {
-              autoPulsed = true;
-            }
-            const st = await page.context().request.get(
-              `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
-              {headers: {Accept: "application/json"}},
+        try {
+          await this.check({
+            scenario: "lane-webrelay",
+            category: "auto-alarm-gatekeeper",
+            action: "trigger live RPM gamma alarm on reserved lane and verify AUTO hardware-timed WebRelay pulse",
+            target: this.config.testLaneLabel,
+            expected: "actionable RPM gamma alarm triggers relay1State=1&relay2State=1&relay3State=2&pulseTime3=3 and increments triggeredAlarmCount",
+          }, async () => {
+            const beforeLen = recordedQueries.length;
+            await this.emulator.replaceConfig(
+              this.config.testRpmId,
+              this.emulator.shortAlarmConfig(this.originalRpmConfig!),
             );
-            if (st.ok()) {
-              const stJson = await st.json() as {lanes?: Array<Record<string, any>>};
-              const entry = (stJson.lanes ?? []).find((l) => l.laneName === this.config.testLaneLabel);
-              triggeredCount = Number(entry?.triggeredAlarmCount ?? 0);
-            }
-            await st.dispose();
-            if (autoPulsed && triggeredCount >= 1) {
-              break;
-            }
-            await page.waitForTimeout(500);
-          }
+            await this.waitHealthRpmConnection(page, "online", 60_000);
+            webrelayTrigger = await this.triggerAlarm("gamma", "lane-webrelay");
 
+            let autoPulsed = false;
+            let triggeredCount = 0;
+            const deadline = Date.now() + 20_000;
+            while (Date.now() < deadline) {
+              const newQs = recordedQueries.slice(beforeLen);
+              if (newQs.some((q) => q.includes("relay1State=1&relay2State=1&relay3State=2&pulseTime3=3"))) {
+                autoPulsed = true;
+              }
+              const st = await page.context().request.get(
+                `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
+                {headers: {Accept: "application/json"}},
+              );
+              if (st.ok()) {
+                const stJson = await st.json() as {lanes?: Array<Record<string, any>>};
+                const entry = (stJson.lanes ?? []).find((l) => l.laneName === this.config.testLaneLabel);
+                triggeredCount = Number(entry?.triggeredAlarmCount ?? 0);
+              }
+              await st.dispose();
+              if (autoPulsed && triggeredCount >= 1) {
+                break;
+              }
+              await page.waitForTimeout(500);
+            }
+
+            return {
+              passed: autoPulsed && triggeredCount >= 1,
+              observed: `autoPulsed=${autoPulsed}; triggeredAlarmCount=${triggeredCount}`,
+            };
+          });
+
+          if (webrelayTrigger) {
+            const alarmRow = await this.findAlarmRow(page, /Gamma/i, webrelayTrigger);
+            const eventId = await this.resolveAlarmEventUuid(
+              page,
+              alarmRow,
+              "gamma",
+              webrelayTrigger.occupancyCount,
+              "lane-webrelay",
+            );
+            if (eventId) {
+              await this.captureAlarmMedia(page, eventId, "gamma", webrelayTrigger.occupancyCount, "lane-webrelay");
+            }
+          }
+        } finally {
           if (originalRpmQuieted) {
             await this.emulator.replaceConfig(this.config.testRpmId, originalRpmQuieted);
-          }
-          return {
-            passed: autoPulsed && triggeredCount >= 1,
-            observed: `autoPulsed=${autoPulsed}; triggeredAlarmCount=${triggeredCount}`,
-          };
-        });
-
-        if (webrelayTrigger) {
-          const alarmRow = await this.findAlarmRow(page, /Gamma/i, webrelayTrigger);
-          const eventId = await this.resolveAlarmEventUuid(
-            page,
-            alarmRow,
-            "gamma",
-            webrelayTrigger.occupancyCount,
-            "lane-webrelay",
-          );
-          if (eventId) {
-            await this.captureAlarmMedia(page, eventId, "gamma", webrelayTrigger.occupancyCount, "lane-webrelay");
           }
         }
       }
