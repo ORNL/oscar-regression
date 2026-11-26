@@ -122,7 +122,27 @@ function remoteAbsolutePath(name: string): string | undefined {
   return value.replace(/\/+$/, "") || "/";
 }
 
+const WINDOWS_CANONICAL_RELEASE_PATTERN = /^[A-Za-z]:\\(?:[A-Za-z0-9._-]+\\)*[A-Za-z0-9._-]+$/;
+
+export function isWindowsReleasePath(value: string | undefined): boolean {
+  return Boolean(value && WINDOWS_CANONICAL_RELEASE_PATTERN.test(value));
+}
+
 function canonicalReleasePath(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  if (/^[A-Za-z]:[\\/]/.test(raw)) {
+    if (raw.includes("\0") || /[\r\n]/.test(raw)) {
+      throw new Error(`${name} must not contain control characters`);
+    }
+    const normalized = raw.replaceAll("/", "\\").replace(/\\+$/, "");
+    const parts = normalized.slice(3).split("\\");
+    if (parts.length === 0 || parts.some(part => !part || part === "." || part === "..") ||
+        !WINDOWS_CANONICAL_RELEASE_PATTERN.test(normalized)) {
+      throw new Error(`${name} must be a canonical, non-root absolute path using safe path characters`);
+    }
+    return normalized;
+  }
   const value = remoteAbsolutePath(name);
   if (value === undefined) return undefined;
   if (value === "/" || posix.normalize(value) !== value || !/^\/[A-Za-z0-9._/-]+$/.test(value)) {
@@ -213,7 +233,7 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     "preflight", "viewer-navigation", "map-national-servers", "sensorhub-admin",
     "status-of-health", "dashboard-health", "lane-video", "event-filtering", "operational-views",
     "reporting", "alarm-transfer", "alarm-transfer-camera", "rpm-connection", "rpm-faults", "rpm-alarms",
-    "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "cargo-uff", "training-sandbox", "lane-webrelay", "extended-occupancy", "adjudication-report",
+    "event-uuid", "adjudication", "eml-auto-adjudication", "vehicle-ocr", "cargo-uff", "training-sandbox", "lane-webrelay", "multi-node-federation", "extended-occupancy", "adjudication-report",
     "runtime-extensions",
     "storage-health", "storage-lifecycle",
     "storage-restore-drill",
@@ -296,10 +316,29 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   }
   const trainingSandboxWorkflow = capabilityMode("TRAINING_SANDBOX_WORKFLOW", "auto");
   const laneWebRelayWorkflow = capabilityMode("LANE_WEBRELAY_WORKFLOW", "auto");
+  const federationWorkflow = capabilityMode("FEDERATION_WORKFLOW", "auto");
+  const oscarUsername = required("OSCAR_USERNAME");
+  const oscarPassword = required("OSCAR_PASSWORD");
+  const federatedPeerRaw = process.env.OSCAR_FEDERATED_PEER_BASE_URL?.trim();
+  let oscarFederatedPeerBaseUrl: string | undefined;
+  let oscarFederatedPeerUsername: string | undefined;
+  let oscarFederatedPeerPassword: string | undefined;
+  if (federatedPeerRaw) {
+    const {value: peerValue, parsed: peerParsed} = serviceUrl("OSCAR_FEDERATED_PEER_BASE_URL", true);
+    if (peerParsed.origin === parsed.origin) {
+      throw new Error("OSCAR_FEDERATED_PEER_BASE_URL must not have the same origin as OSCAR_BASE_URL");
+    }
+    oscarFederatedPeerBaseUrl = peerValue;
+    oscarFederatedPeerUsername = process.env.OSCAR_FEDERATED_PEER_USERNAME?.trim() || oscarUsername;
+    oscarFederatedPeerPassword = process.env.OSCAR_FEDERATED_PEER_PASSWORD?.trim() || oscarPassword;
+  }
+  if (federationWorkflow === "required" && !oscarFederatedPeerBaseUrl) {
+    throw new Error("FEDERATION_WORKFLOW=required requires OSCAR_FEDERATED_PEER_BASE_URL");
+  }
   const storageWorkflow = capabilityMode("STORAGE_WORKFLOW", "required");
   const storageExpectedReleaseRaw = process.env.STORAGE_EXPECTED_RELEASE?.trim() || "3.11.0";
-  if (!/^3\.11\.\d+$/.test(storageExpectedReleaseRaw)) {
-    throw new Error("STORAGE_EXPECTED_RELEASE must match 3.11.<patch> (for example 3.11.0 .. 3.11.15)");
+  if (!/^3\.(?:11|12)\.\d+$/.test(storageExpectedReleaseRaw)) {
+    throw new Error("STORAGE_EXPECTED_RELEASE must match 3.11.<patch> or 3.12.<patch> (for example 3.11.15 or 3.12.0)");
   }
   const storageExpectedRelease = storageExpectedReleaseRaw as StorageExpectedRelease;
   const storageBackupWorkflow = capabilityMode("STORAGE_BACKUP_WORKFLOW", "auto");
@@ -335,8 +374,8 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
   return {
     profile,
     oscarBaseUrl,
-    oscarUsername: required("OSCAR_USERNAME"),
-    oscarPassword: required("OSCAR_PASSWORD"),
+    oscarUsername,
+    oscarPassword,
     targetHost: parsed.hostname,
     targetAcknowledgement: required("OSCAR_TEST_TARGET_ACK"),
     rpmEmulatorUrl,
@@ -389,6 +428,10 @@ export function loadConfig(args = process.argv.slice(2)): SuiteConfig {
     ...(cargoUffSmbPassword ? {cargoUffSmbPassword} : {}),
     trainingSandboxWorkflow,
     laneWebRelayWorkflow,
+    federationWorkflow,
+    ...(oscarFederatedPeerBaseUrl ? {oscarFederatedPeerBaseUrl} : {}),
+    ...(oscarFederatedPeerUsername ? {oscarFederatedPeerUsername} : {}),
+    ...(oscarFederatedPeerPassword ? {oscarFederatedPeerPassword} : {}),
     storageWorkflow,
     storageExpectedRelease,
     storageBackupWorkflow,
@@ -558,11 +601,21 @@ export function assertMutationAllowed(config: SuiteConfig): void {
 export function requiresRemoteSuiteLease(config: SuiteConfig): boolean {
   if (["full", "3.9.2-release", "3.11.0-release", "restore-drill"].includes(config.profile)) return true;
   if (config.scenarioFilter.size === 0) return true;
-  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication", "vehicle-ocr", "training-sandbox", "lane-webrelay", "runtime-extensions"].some(
+  if (["map-national-servers", "lane-video", "reporting", "eml-auto-adjudication", "vehicle-ocr", "training-sandbox", "lane-webrelay", "multi-node-federation", "runtime-extensions"].some(
     name => config.scenarioFilter.has(name),
   )) {
     return true;
   }
   return config.storageWorkflow !== "disabled" &&
     (config.scenarioFilter.has("storage-health") || config.scenarioFilter.has("storage-lifecycle"));
+}
+
+export function suiteReporterSecrets(
+  config: Pick<SuiteConfig, "oscarPassword" | "oscarFederatedPeerPassword" | "cargoUffSmbPassword">,
+): string[] {
+  return [
+    config.oscarPassword,
+    ...(config.oscarFederatedPeerPassword ? [config.oscarFederatedPeerPassword] : []),
+    ...(config.cargoUffSmbPassword ? [config.cargoUffSmbPassword] : []),
+  ];
 }

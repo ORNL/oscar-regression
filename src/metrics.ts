@@ -6,6 +6,7 @@ import {
   type OscarComposeService,
   type SuiteConfig,
 } from "./types.js";
+import {isWindowsReleasePath} from "./config.js";
 import {RunReporter} from "./reporter.js";
 
 const execFileAsync = promisify(execFile);
@@ -169,6 +170,44 @@ export function buildOscarMetricsCommand(): string {
     "awk '/MemTotal:/ {print $2 * 1024}' /proc/meminfo",
     "awk '/^cpu / {for (i=2; i<=NF; i++) total += $i; print total, $5 + $6}' /proc/stat",
   ].join("\n");
+}
+
+export function buildWindowsOscarMetricsCommand(): string {
+  const ps = [
+    "$ProgressPreference = 'SilentlyContinue'",
+    "$ErrorActionPreference = 'SilentlyContinue'",
+    "[Console]::Out.WriteLine('__CONTAINERS__')",
+    "$runningIds = New-Object System.Collections.Generic.List[string]",
+    "foreach ($service in @('gateway', 'oscar', 'postgres')) {",
+    "  $ids = @(docker ps --all --quiet --no-trunc --filter 'label=com.docker.compose.project=oscar' --filter \"label=com.docker.compose.service=$service\" --filter 'label=com.docker.compose.oneoff=False' 2>$null)",
+    "  $found = $false",
+    "  foreach ($cid in $ids) {",
+    "    if (-not $cid) { continue }",
+    "    $insp = docker inspect --format '{{json .}}' $cid 2>$null",
+    "    if ($LASTEXITCODE -eq 0 -and $insp) {",
+    "      [Console]::Out.WriteLine($insp)",
+    "      $found = $true",
+    "      $running = docker inspect --format '{{.State.Running}}' $cid 2>$null",
+    "      if ($running -eq 'true') { $runningIds.Add($cid) }",
+    "    }",
+    "  }",
+    "  if (-not $found) { [Console]::Out.WriteLine(\"__MISSING__`t$service\") }",
+    "}",
+    "[Console]::Out.WriteLine('__STATS__')",
+    "if ($runningIds.Count -gt 0) {",
+    "  docker stats --no-stream --format '{{json .}}' $runningIds 2>$null",
+    "}",
+    "[Console]::Out.WriteLine('__HOST__')",
+    "$os = Get-CimInstance Win32_OperatingSystem 2>$null",
+    "$availBytes = if ($os) { [int64]$os.FreePhysicalMemory * 1024 } else { 0 }",
+    "$totalBytes = if ($os) { [int64]$os.TotalVisibleMemorySize * 1024 } else { 0 }",
+    "[Console]::Out.WriteLine('0')",
+    "[Console]::Out.WriteLine($availBytes)",
+    "[Console]::Out.WriteLine($totalBytes)",
+    "[Console]::Out.WriteLine('0 0')",
+    "[Console]::Out.WriteLine('__END__')",
+  ].join("\n");
+  return `powershell -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(ps, "utf16le").toString("base64")}`;
 }
 
 /** Parse the container portions of buildOscarMetricsCommand output. */
@@ -439,7 +478,10 @@ export class MetricsSampler {
   }
 
   private async sampleOscarHost(phase: string, trackHostCpu: boolean): Promise<void> {
-    const output = await this.ssh(buildOscarMetricsCommand());
+    const metricsCmd = isWindowsReleasePath(this.config.oscarReleaseDirectory)
+      ? buildWindowsOscarMetricsCommand()
+      : buildOscarMetricsCommand();
+    const output = await this.ssh(metricsCmd);
     const hostLines = outputSection(output, "__HOST__", "__END__").trim().split(/\r?\n/);
     const load1m = Number.parseFloat(hostLines[0] ?? "");
     const available = Number.parseFloat(hostLines[1] ?? "");

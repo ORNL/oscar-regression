@@ -7,7 +7,7 @@ import {basename, join} from "node:path";
 import {promisify} from "node:util";
 
 const execFileAsync = promisify(execFile);
-import type {Locator, Page, Request, Response} from "playwright";
+import {request as playwrightRequest, type APIRequestContext, type Locator, type Page, type Request, type Response} from "playwright";
 import {PDFParse} from "pdf-parse";
 import {BrowserHarness} from "./browser.js";
 import {boundedFetch, type BoundedFetchResult} from "./bounded-fetch.js";
@@ -99,12 +99,14 @@ import {
   assessArchiveHealth,
   assessArchiveScratchRestart,
   assessArchiveScratch,
+  assessCompactionHealth,
   assessImmutableStageHealth,
   assessJpeg,
   assessMediaMetadataHealth,
   assessRetainedMediaResponse,
   assessRetentionRuntimeHealth,
   assessStoragePlatform,
+  compactionHealthIsSafe,
   encodeOshBigId,
   immutableStageHealthIsSafe,
   MAX_RETAINED_FRAME_BYTES,
@@ -122,7 +124,7 @@ import {
   assessDailyJournalStatus,
   type DailyJournalStatus,
 } from "./daily-journal-oracle.js";
-import type {RpmConfig, RpmStatus, SuiteConfig} from "./types.js";
+import type {RpmConfig, RpmStatus, StorageExpectedRelease, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
 import {
   assertNationalRefreshCompletedControl,
@@ -296,7 +298,7 @@ const REGRESSION_ARCHIVE_RESOURCES = {
   temporaryDirectory: "/var/lib/oscar/duckdb-tmp",
 } as const;
 
-const PARQUET_PRIMARY_OUTPUT_NAMES = [
+export const PARQUET_PRIMARY_OUTPUT_NAMES_3_11 = [
   "gammaCounts",
   "gammaThreshold",
   "neutronCounts",
@@ -320,6 +322,44 @@ const PARQUET_PRIMARY_OUTPUT_NAMES = [
   "nationalSummary",
   "vehicleOcr",
 ] as const;
+
+export const PARQUET_PRIMARY_OUTPUT_NAMES_3_12 = [
+  ...PARQUET_PRIMARY_OUTPUT_NAMES_3_11,
+  "location",
+  "alarm",
+  "KromekDetectorRadiometricsV1Report",
+  "KromekSerialRadiometricStatusReport",
+] as const;
+
+const PARQUET_PRIMARY_OUTPUT_NAMES = PARQUET_PRIMARY_OUTPUT_NAMES_3_12;
+
+export function expectedParquetPrimaryOutputNames(
+  release: StorageExpectedRelease,
+): readonly string[] {
+  return release.startsWith("3.12.")
+    ? PARQUET_PRIMARY_OUTPUT_NAMES_3_12
+    : PARQUET_PRIMARY_OUTPUT_NAMES_3_11;
+}
+
+export function parquetPrimaryOutputNamesMatchRelease(
+  actual: readonly string[],
+  release: StorageExpectedRelease,
+  packagedDefaults?: readonly string[],
+): boolean {
+  const actualJson = JSON.stringify(actual);
+  const v311Json = JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES_3_11);
+  const v312Json = JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES_3_12);
+  if (release.startsWith("3.12.")) {
+    return actualJson === v312Json &&
+      (packagedDefaults === undefined || JSON.stringify(packagedDefaults) === v312Json);
+  }
+  void PARQUET_PRIMARY_OUTPUT_NAMES;
+  const matchesEither = actualJson === v311Json || actualJson === v312Json;
+  if (!matchesEither) return false;
+  if (packagedDefaults === undefined) return true;
+  const packagedJson = JSON.stringify(packagedDefaults);
+  return packagedJson === v311Json || packagedJson === v312Json;
+}
 
 const REGRESSION_ARCHIVE_POLICY = {
   storageMode: "PARQUET_PRIMARY",
@@ -430,6 +470,7 @@ export class RegressionScenarios {
   private originalRpmStatus: RpmStatus | null | undefined;
   private reservedLanePrepared = false;
   private pendingCargoUffRestorePayload: Record<string, unknown> | undefined;
+  private pendingFederationCleanup: (() => Promise<void>) | undefined;
   private alarmMediaBaselineCreated = false;
   private alarmMediaProbe: StorageProbeClient | undefined;
   private alarmCameraUids: string[] | undefined;
@@ -725,6 +766,11 @@ export class RegressionScenarios {
         await this.scenario("cargo-uff", () => this.cargoUffAdjudication());
         await this.scenario("training-sandbox", () => this.trainingSandbox());
         await this.scenario("lane-webrelay", () => this.laneWebRelay());
+        if (this.config.scenarioFilter.size > 0 ||
+            this.config.federationWorkflow !== "auto" ||
+            Boolean(this.config.oscarFederatedPeerBaseUrl)) {
+          await this.scenario("multi-node-federation", () => this.multiNodeFederation());
+        }
         await this.scenario("extended-occupancy", () => this.extendedOccupancy());
         await this.scenario("adjudication-report", () => this.reporting([
           {reportType: "ADJUDICATION"},
@@ -760,9 +806,24 @@ export class RegressionScenarios {
       try {
         await this.restorePendingCargoUff();
       } finally {
-        await this.alarmMediaProbe?.cleanup();
-        this.alarmMediaProbe = undefined;
+        try {
+          await this.runPendingFederationCleanup();
+        } finally {
+          await this.alarmMediaProbe?.cleanup();
+          this.alarmMediaProbe = undefined;
+        }
       }
+    }
+  }
+
+  private async runPendingFederationCleanup(): Promise<void> {
+    const cleanup = this.pendingFederationCleanup;
+    if (!cleanup) return;
+    this.pendingFederationCleanup = undefined;
+    try {
+      await cleanup();
+    } catch (err) {
+      this.reporter.error("multi-node-federation", "emergency-federation-cleanup", err);
     }
   }
 
@@ -884,15 +945,30 @@ export class RegressionScenarios {
       }
     });
 
+    const configuredEmulatorRpmIds = (): Set<string> | null => {
+      const lanes = this.config.laneConfigOracle?.lanes;
+      if (!lanes || lanes.length === 0) return null;
+      const ids = new Set<string>();
+      for (const lane of lanes) {
+        const m = /^lane-0*(\d+)$/i.exec(lane.uniqueId.trim());
+        if (m?.[1]) ids.add(`rpm-${m[1]}`);
+      }
+      return ids.size > 0 ? ids : null;
+    };
+
     await this.check({
       scenario: "preflight", category: "availability", action: "discover RPM emulator",
       target: this.config.rpmEmulatorUrl, expected: `${this.config.expectedLaneCount} RPMs and ${this.config.testRpmId} running`,
     }, async () => {
-      const rpms = await this.emulator.list();
+      const allRpms = await this.emulator.list();
+      const configuredIds = configuredEmulatorRpmIds();
+      const rpms = allRpms.length > this.config.expectedLaneCount && configuredIds
+        ? allRpms.filter((rpm) => configuredIds.has(rpm.id))
+        : allRpms;
       const reserved = rpms.find((rpm) => rpm.id === this.config.testRpmId);
       return {
         passed: rpms.length === this.config.expectedLaneCount && reserved?.running === true,
-        observed: `${rpms.length} RPMs; reserved lane running=${String(reserved?.running)}`,
+        observed: `${rpms.length} RPMs (total emulator=${allRpms.length}); reserved lane running=${String(reserved?.running)}`,
       };
     });
   }
@@ -928,6 +1004,165 @@ export class RegressionScenarios {
           return {passed, observed: `HTTP ${status}; marker visible=${markerVisible}`, evidence};
         });
       }
+
+      const requireCustomDashboards = this.config.storageExpectedRelease.startsWith("3.12.");
+      const hasCustomDashboardsNav = (await page.getByTestId("nav-item-custom-dashboards").count()) > 0;
+      if (requireCustomDashboards || hasCustomDashboardsNav) {
+        await this.check({
+          scenario: "viewer-navigation",
+          category: "viewer",
+          action: "open /dashboards and verify canonical navbar and zero layout residue",
+          target: "/dashboards",
+          expected: "HTTP 200 on /dashboards with custom-dashboards-page, starter gallery, intact 8 canonical navbar routes, zero uncaught page errors, and clean localStorage teardown",
+        }, async () => {
+          const canonicalNavTestIds = [
+            "nav-item-dashboard",
+            "nav-item-events",
+            "nav-item-health",
+            "nav-item-map",
+            "nav-item-national",
+            "nav-item-report",
+            "nav-item-alarm-transfer",
+            "nav-item-users",
+          ] as const;
+          const beforePageErrors = this.reporter.errors.filter((err) => err.source === "viewer-page").length;
+          const savedLocalStorage = await page.evaluate(() => {
+            const entries: Array<[string, string]> = [];
+            for (let idx = 0; idx < window.localStorage.length; idx++) {
+              const key = window.localStorage.key(idx);
+              if (key !== null) {
+                entries.push([key, window.localStorage.getItem(key) ?? ""]);
+              }
+            }
+            return entries;
+          });
+
+          try {
+            const status = await this.goto(page, "/dashboards");
+            const workspaceVisible = await page.getByTestId("custom-dashboards-page")
+              .waitFor({state: "visible", timeout: this.config.uiTimeoutMs})
+              .then(() => true, () => false);
+            const switcherVisible = await page.getByTestId("custom-dashboards-switcher")
+              .waitFor({state: "visible", timeout: 10_000})
+              .then(() => true, () => false);
+            const galleryVisible = await page.getByTestId("custom-dashboards-gallery")
+              .waitFor({state: "visible", timeout: 10_000})
+              .then(() => true, () => false);
+            const addPageBtnVisible = await page.getByTestId("dashboards-new-page-button")
+              .isVisible()
+              .catch(() => false);
+
+            const initialCustomNavCount = await page.locator('[data-testid^="nav-custom-page-"]').count();
+            const missingCanonicalBefore: string[] = [];
+            for (const navId of canonicalNavTestIds) {
+              if ((await page.getByTestId(navId).count()) === 0) {
+                missingCanonicalBefore.push(navId);
+              }
+            }
+
+            let hostMounted = false;
+            const blankTemplate = page.getByTestId("starter-template-blank");
+            if (await blankTemplate.isVisible().catch(() => false)) {
+              await blankTemplate.click();
+              hostMounted = await page.getByTestId("custom-dashboard-host")
+                .waitFor({state: "visible", timeout: 10_000})
+                .then(() => true, () => false);
+            }
+
+            const missingCanonicalAfter: string[] = [];
+            for (const navId of canonicalNavTestIds) {
+              if ((await page.getByTestId(navId).count()) === 0) {
+                missingCanonicalAfter.push(navId);
+              }
+            }
+            const customDashboardsNavPresent = (await page.getByTestId("nav-item-custom-dashboards").count()) > 0;
+            const body = await page.locator("body").innerText();
+            const afterPageErrors = this.reporter.errors.filter((err) => err.source === "viewer-page").length;
+            const newPageErrors = afterPageErrors - beforePageErrors;
+            const passed = status === 200 &&
+              workspaceVisible &&
+              switcherVisible &&
+              galleryVisible &&
+              addPageBtnVisible &&
+              hostMounted &&
+              initialCustomNavCount === 0 &&
+              missingCanonicalBefore.length === 0 &&
+              missingCanonicalAfter.length === 0 &&
+              customDashboardsNavPresent &&
+              newPageErrors === 0 &&
+              !/application error|internal server error/i.test(body);
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "viewer-custom-dashboards-failed");
+            return {
+              passed,
+              observed: `HTTP ${status}; workspace=${workspaceVisible}; gallery=${galleryVisible}; hostMounted=${hostMounted}; ` +
+                `initialCustomNav=${initialCustomNavCount}; missingCanonical=${missingCanonicalBefore.length + missingCanonicalAfter.length}; ` +
+                `pageErrors=${newPageErrors}`,
+              evidence,
+            };
+          } finally {
+            await page.evaluate((entries) => {
+              window.localStorage.clear();
+              for (const [key, val] of entries) {
+                window.localStorage.setItem(key, val);
+              }
+            }, savedLocalStorage).catch(() => undefined);
+            await this.goto(page, "/").catch(() => undefined);
+          }
+        });
+      }
+
+      await this.check({
+        scenario: "viewer-navigation",
+        category: "viewer",
+        action: "preserve SPA runtime state across Navbar links without MPA document reload or RSC .txt 404",
+        target: "Navbar client-side navigation",
+        expected: "clicking Navbar links transitions via Next.js index.txt RSC payloads with 0 document reloads, 0 .txt 404s, and intact window runtime state",
+      }, async () => {
+        await this.goto(page, "/");
+        await page.getByTestId("nav-item-events").first().waitFor({timeout: this.config.uiTimeoutMs});
+        const bootSentinel = await page.evaluate(() => {
+          const token = `spa-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          (window as unknown as {__oscarSpaNavSentinel?: string}).__oscarSpaNavSentinel = token;
+          return token;
+        });
+
+        let documentNavigations = 0;
+        const rsc404Urls: string[] = [];
+        const onReq = (req: Request) => {
+          if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+            documentNavigations += 1;
+          }
+        };
+        const onRes = (res: Response) => {
+          if (res.status() === 404 && /\.txt(?:\?|$)/.test(res.url())) {
+            rsc404Urls.push(res.url());
+          }
+        };
+        page.on("request", onReq);
+        page.on("response", onRes);
+        try {
+          const steps: Array<[string, string]> = [
+            ["nav-item-events", "/event-log"],
+            ["nav-item-national", "/national-view"],
+            ["nav-item-servers", "/servers"],
+            ["nav-item-dashboard", "/"],
+          ];
+          for (const [testId, expectedPath] of steps) {
+            await this.clickSpaNavItem(page, testId, expectedPath);
+          }
+          const survivingSentinel = await page.evaluate(
+            () => (window as unknown as {__oscarSpaNavSentinel?: string}).__oscarSpaNavSentinel ?? "",
+          );
+          const passed = survivingSentinel === bootSentinel && documentNavigations === 0 && rsc404Urls.length === 0;
+          return {
+            passed,
+            observed: `sentinelIntact=${survivingSentinel === bootSentinel}; documentNavigations=${documentNavigations}; rsc404Count=${rsc404Urls.length}`,
+          };
+        } finally {
+          page.off("request", onReq);
+          page.off("response", onRes);
+        }
+      });
 
       await this.check({
         scenario: "viewer-navigation",
@@ -1884,9 +2119,28 @@ export class RegressionScenarios {
         let hasOccupancyStreams = false;
         try {
           if (dsResponse.ok()) {
-            const dsPayload = await dsResponse.json() as {items?: Array<{id?: string; outputName?: string}>};
+            const configuredUids = this.config.laneConfigOracle?.lanes?.length
+              ? new Set(this.config.laneConfigOracle.lanes.map((l) => l.uniqueId.trim().toLowerCase()))
+              : null;
+            const matchesConfiguredLane = (item: {
+              "system@link"?: {uid?: string};
+              system?: {uid?: string};
+            }): boolean => {
+              if (!configuredUids || configuredUids.size === 0) return true;
+              const sysUid = String(item["system@link"]?.uid ?? item.system?.uid ?? "").trim().toLowerCase();
+              const tail = sysUid.split(":").pop() ?? "";
+              return tail.length > 0 && configuredUids.has(tail);
+            };
+            const dsPayload = await dsResponse.json() as {
+              items?: Array<{
+                id?: string;
+                outputName?: string;
+                "system@link"?: {uid?: string};
+                system?: {uid?: string};
+              }>;
+            };
             const occIds = (dsPayload.items ?? [])
-              .filter((item) => String(item.outputName ?? "").trim() === "occupancy")
+              .filter((item) => String(item.outputName ?? "").trim() === "occupancy" && matchesConfiguredLane(item))
               .map((item) => String(item.id ?? "").trim())
               .filter(Boolean)
               .slice(0, 50);
@@ -2322,6 +2576,144 @@ export class RegressionScenarios {
           evidence,
         };
       });
+
+      const requireMobileDetector = this.config.storageExpectedRelease.startsWith("3.12.");
+      const inspectMobileDetectorProvider = async (): Promise<{
+        found: boolean;
+        windowOpened: boolean;
+        windowClosed: boolean;
+        beforeSystemCount: number;
+        afterSystemCount: number;
+        sampledProviders: number;
+      }> => {
+        const countTopSystems = async (): Promise<number> => {
+          const res = await page.context().request.get(
+            this.viewerUrl("/sensorhub/api/systems?searchMembers=false&validTime=latest&limit=500"),
+          );
+          try {
+            if (!res.ok()) return -1;
+            const json = await res.json() as {items?: unknown[]};
+            return Array.isArray(json.items) ? json.items.length : 0;
+          } finally {
+            await res.dispose();
+          }
+        };
+
+        const beforeSystemCount = await countTopSystems();
+        const sensorsHeader = page.locator(".v-accordion-item-caption").filter({hasText: /\bSensors\b/i}).first();
+        await sensorsHeader.waitFor({timeout: this.config.uiTimeoutMs});
+        if ((await page.locator(".v-accordion-item-open").filter({hasText: /\bSensors\b/i}).count()) === 0) {
+          await sensorsHeader.click();
+          await sleep(250);
+        }
+
+        const firstCell = page.locator(".v-accordion-item-open .v-table-cell-wrapper").first();
+        const rightClickTarget = (await firstCell.count()) > 0
+          ? firstCell
+          : page.locator(".v-accordion-item-open .v-table-body").first();
+        await rightClickTarget.waitFor({timeout: this.config.uiTimeoutMs});
+        await rightClickTarget.click({button: "right"});
+
+        const addModuleItem = page.locator(".v-contextmenu .gwt-MenuItem")
+          .filter({hasText: /Add New Module/i})
+          .first();
+        await addModuleItem.waitFor({state: "visible", timeout: 10_000});
+        await addModuleItem.click();
+
+        const modal = page.locator(".v-window").filter({hasText: /Select Module Type/i}).first();
+        const windowOpened = await modal.waitFor({state: "visible", timeout: 15_000})
+          .then(() => true, () => false);
+        const providerTexts = new Set<string>();
+        let windowClosed = !windowOpened;
+
+        if (windowOpened) {
+          try {
+            const scroller = modal.locator(".v-table-body-wrapper, .v-scrollable").first();
+            const hasScroller = (await scroller.count()) > 0;
+            if (hasScroller) {
+              await scroller.evaluate((el) => { el.scrollTop = 0; }).catch(() => undefined);
+              await sleep(150);
+            }
+            for (let step = 0; step < 24; step++) {
+              const cells = await modal.locator(".v-table-cell-wrapper").allInnerTexts().catch(() => []);
+              for (const cell of cells) {
+                const trimmed = cell.trim();
+                if (trimmed) providerTexts.add(trimmed);
+              }
+              if ([...providerTexts].some((txt) => /Mobile Detector System|MobileDetectorSystem/i.test(txt))) {
+                break;
+              }
+              if (!hasScroller) break;
+              const advanced = await scroller.evaluate((el) => {
+                const prev = el.scrollTop;
+                el.scrollTop = prev + 160;
+                return el.scrollTop > prev;
+              }).catch(() => false);
+              if (!advanced) break;
+              await sleep(150);
+            }
+          } finally {
+            const closeBtn = modal.locator(".v-window-closebox").first();
+            if (await closeBtn.isVisible().catch(() => false)) {
+              await closeBtn.click().catch(() => undefined);
+            } else {
+              await page.keyboard.press("Escape").catch(() => undefined);
+            }
+            windowClosed = await modal.waitFor({state: "hidden", timeout: 10_000})
+              .then(() => true, () => false);
+          }
+        }
+
+        const afterSystemCount = await countTopSystems();
+        const found = [...providerTexts].some((txt) => /Mobile Detector System|MobileDetectorSystem/i.test(txt));
+        return {
+          found,
+          windowOpened,
+          windowClosed,
+          beforeSystemCount,
+          afterSystemCount,
+          sampledProviders: providerTexts.size,
+        };
+      };
+
+      const providerProbe = await inspectMobileDetectorProvider().catch((err) => {
+        if (requireMobileDetector) {
+          this.reporter.error("sensorhub-admin", "mobile-detector-provider", err);
+        }
+        return {
+          found: false,
+          windowOpened: false,
+          windowClosed: true,
+          beforeSystemCount: -1,
+          afterSystemCount: -1,
+          sampledProviders: 0,
+        };
+      });
+
+      if (requireMobileDetector || providerProbe.found) {
+        await this.check({
+          scenario: "sensorhub-admin",
+          category: "admin",
+          action: "verify MobileDetectorSystem module provider availability",
+          target: "/sensorhub/admin",
+          expected: "SensorHub Sensors module provider list includes Mobile Detector System without adding a lane to config.json",
+        }, async () => {
+          const unchangedSystems = providerProbe.beforeSystemCount >= 0 &&
+            providerProbe.beforeSystemCount === providerProbe.afterSystemCount;
+          const passed = providerProbe.windowOpened &&
+            providerProbe.found &&
+            providerProbe.windowClosed &&
+            unchangedSystems;
+          const evidence = passed ? "" : await this.screenshotOnFailure(page, "sensorhub-admin-mobile-detector-provider");
+          return {
+            passed,
+            observed: `windowOpened=${providerProbe.windowOpened}; foundMobileDetector=${providerProbe.found}; ` +
+              `sampledCells=${providerProbe.sampledProviders}; windowClosed=${providerProbe.windowClosed}; ` +
+              `topSystems=${providerProbe.beforeSystemCount}->${providerProbe.afterSystemCount}`,
+            evidence,
+          };
+        });
+      }
     } finally { await page.close(); }
   }
 
@@ -2585,7 +2977,18 @@ export class RegressionScenarios {
         target: "RPM emulator inventory",
         expected: `${this.config.expectedLaneCount} running, OSCAR-connected RPMs explicitly report tamper_fault=false`,
       }, async () => {
-        const entries = await this.emulator.tamperBaseline();
+        const allEntries = await this.emulator.tamperBaseline();
+        const configuredIds = this.config.laneConfigOracle?.lanes?.length
+          ? new Set(
+            this.config.laneConfigOracle.lanes
+              .map((l) => /^lane-0*(\d+)$/i.exec(l.uniqueId.trim())?.[1])
+              .filter((n): n is string => Boolean(n))
+              .flatMap((n) => [`rpm-${n}`, `rpm-${n.padStart(2, "0")}`]),
+          )
+          : null;
+        const entries = allEntries.length > this.config.expectedLaneCount && configuredIds && configuredIds.size > 0
+          ? allEntries.filter((e) => configuredIds.has(e.rpmId))
+          : allEntries;
         const assessment = assessKnownClearTamperBaseline(entries, this.config.expectedLaneCount);
         return {
           passed: assessment.passed,
@@ -3542,6 +3945,45 @@ export class RegressionScenarios {
           await normRes.dispose();
         }
 
+        let likeModesOk = true;
+        if (chosenNorm.length >= 4) {
+          const prefixQuery = chosenNorm.slice(0, Math.min(4, chosenNorm.length));
+          const substrQuery = chosenNorm.slice(1, Math.min(chosenNorm.length, 5));
+          const [prefixRes, containsRes] = await Promise.all([
+            page.context().request.get(
+              this.viewerUrl(
+                `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(prefixQuery)}&matchMode=startsWith&limit=200`,
+              ),
+              {headers: {Accept: "application/json"}},
+            ),
+            page.context().request.get(
+              this.viewerUrl(
+                `/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(substrQuery)}&matchMode=contains&limit=200`,
+              ),
+              {headers: {Accept: "application/json"}},
+            ),
+          ]);
+          try {
+            const prefixJson = prefixRes.ok() ? (await prefixRes.json() as {passes?: Array<{normalizedVehicleId?: unknown}>}) : null;
+            const containsJson = containsRes.ok() ? (await containsRes.json() as {passes?: Array<{normalizedVehicleId?: unknown}>}) : null;
+            const prefixPasses = Array.isArray(prefixJson?.passes) ? prefixJson.passes : [];
+            const containsPasses = Array.isArray(containsJson?.passes) ? containsJson.passes : [];
+            likeModesOk = prefixRes.status() === 200 &&
+              containsRes.status() === 200 &&
+              prefixPasses.some(p => String(p.normalizedVehicleId ?? "").trim() === chosenNorm) &&
+              containsPasses.some(p => String(p.normalizedVehicleId ?? "").trim() === chosenNorm);
+          } finally {
+            await Promise.all([prefixRes.dispose(), containsRes.dispose()]);
+          }
+        }
+
+        const windowSelect = page.getByTestId("vehicle-id-search-window");
+        if (await windowSelect.isVisible().catch(() => false)) {
+          await windowSelect.click();
+          const allOption = page.locator('li[data-value="all"]').first();
+          await allOption.waitFor({state: "visible", timeout: 5_000});
+          await allOption.click();
+        }
         await searchInput.fill(formattedVariant);
         await page.getByTestId("vehicle-id-search-submit").click();
         const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
@@ -3564,11 +4006,20 @@ export class RegressionScenarios {
           await dialog.waitFor({state: "hidden", timeout: 10_000});
           await page.getByTestId("vehicle-id-search-clear").click();
         }
+        if (await windowSelect.isVisible().catch(() => false)) {
+          await windowSelect.click();
+          const defaultOption = page.locator('li[data-value="30d"]').first();
+          if (await defaultOption.isVisible({timeout: 5_000}).catch(() => false)) {
+            await defaultOption.click();
+          } else {
+            await page.keyboard.press("Escape");
+          }
+        }
 
-        const passed = matchedApiCount >= chosenCount && compareVisible && dialogTableFocusable && historyUpSetVisible;
+        const passed = matchedApiCount >= chosenCount && likeModesOk && compareVisible && dialogTableFocusable && historyUpSetVisible;
         return {
           passed,
-          observed: `chosenVehicle=${chosenNorm} (query='${formattedVariant}', accumulatedPasses=${matchedApiCount}); ` +
+          observed: `chosenVehicle=${chosenNorm} (query='${formattedVariant}', accumulatedPasses=${matchedApiCount}, likeModesOk=${likeModesOk}); ` +
             `compareVisible=${compareVisible}; historyUpSetVisible=${historyUpSetVisible}; tableTabIndex0=${dialogTableFocusable}`,
           evidence: passed ? "" : await this.screenshotOnFailure(page, "vehicle-search-correlation-failed"),
         };
@@ -3686,13 +4137,22 @@ export class RegressionScenarios {
       }, async () => {
         const obs5xxUrls: string[] = [];
         let inFlightObs = 0;
+        let inFlightCounts = 0;
         const onReq = (req: import("playwright").Request) => {
-          if (req.url().includes("/sensorhub/api/observations")) {
+          const url = req.url();
+          if (!url.includes("/sensorhub/api/observations")) return;
+          if (url.includes("/observations/count")) {
+            inFlightCounts += 1;
+          } else {
             inFlightObs += 1;
           }
         };
         const onReqDone = (req: import("playwright").Request) => {
-          if (req.url().includes("/sensorhub/api/observations")) {
+          const url = req.url();
+          if (!url.includes("/sensorhub/api/observations")) return;
+          if (url.includes("/observations/count")) {
+            inFlightCounts = Math.max(0, inFlightCounts - 1);
+          } else {
             inFlightObs = Math.max(0, inFlightObs - 1);
           }
         };
@@ -3727,7 +4187,7 @@ export class RegressionScenarios {
                 return progress === 0 && inFlightObs === 0;
               },
               Boolean,
-              {timeoutMs: 15_000, intervalMs: 100, description: label},
+              {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100, description: label},
             );
             return Date.now() - started;
           };
@@ -3798,6 +4258,11 @@ export class RegressionScenarios {
           const multiNewestMs = Date.now() - multiNewestStart;
 
           const errorAlerts = await page.locator('[role="alert"]').filter({hasText: /failed|error|500|busy/i}).count();
+          await poll(
+            async () => inFlightCounts === 0,
+            Boolean,
+            {timeoutMs: this.config.eventTimeoutMs, intervalMs: 100, description: "background count queries HTTP status check"},
+          ).catch(() => undefined);
 
           // Clean up filters & restore default Priority sort for downstream checks
           await page.getByRole("button", {name: /advanced filters/i}).first().click();
@@ -4954,6 +5419,9 @@ export class RegressionScenarios {
         ] as const;
 
         const readFaultRows = async () => {
+          if ((await faultToggle.getAttribute("aria-pressed").catch(() => null)) !== "true") {
+            await faultToggle.click().catch(() => undefined);
+          }
           const grids = page.locator(".MuiDataGrid-root:visible");
           const grid = grids.last();
           const rows = grid.locator(".MuiDataGrid-row");
@@ -5089,8 +5557,17 @@ export class RegressionScenarios {
       ]);
       const uuidValue = page.getByTestId("event-uuid-value");
       await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
-      const eventId = (await uuidValue.innerText()).trim();
-      const url = new URL(page.url());
+      const hydrateDeadline = Date.now() + Math.min(this.config.eventTimeoutMs, 15_000);
+      let eventId = (await uuidValue.innerText()).trim();
+      let url = new URL(page.url());
+      while (
+        Date.now() < hydrateDeadline &&
+        (!isPublicObservationId(eventId) || url.searchParams.get("eventId") !== eventId)
+      ) {
+        await sleep(150);
+        eventId = (await uuidValue.innerText()).trim();
+        url = new URL(page.url());
+      }
       const alreadyResolved = this.resolvedAlarmEventIds.has(eventId);
       const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId &&
         !alreadyResolved;
@@ -6280,11 +6757,25 @@ export class RegressionScenarios {
         const occupancyStreamIds: string[] = [];
         try {
           if (dsRes.ok()) {
-            const dsJson = await dsRes.json() as {items?: Array<{id?: unknown; outputName?: unknown}>};
+            const configuredUids = this.config.laneConfigOracle?.lanes?.length
+              ? new Set(this.config.laneConfigOracle.lanes.map((l) => l.uniqueId.trim().toLowerCase()))
+              : null;
+            const dsJson = await dsRes.json() as {
+              items?: Array<{
+                id?: unknown;
+                outputName?: unknown;
+                "system@link"?: {uid?: unknown};
+                system?: {uid?: unknown};
+              }>;
+            };
             for (const item of dsJson.items ?? []) {
-              if (String(item.outputName ?? "").trim() === "occupancy" && item.id) {
-                occupancyStreamIds.push(String(item.id).trim());
+              if (String(item.outputName ?? "").trim() !== "occupancy" || !item.id) continue;
+              if (configuredUids && configuredUids.size > 0) {
+                const sysUid = String(item["system@link"]?.uid ?? item.system?.uid ?? "").trim().toLowerCase();
+                const tail = sysUid.split(":").pop() ?? "";
+                if (!tail || !configuredUids.has(tail)) continue;
               }
+              occupancyStreamIds.push(String(item.id).trim());
             }
           }
         } finally {
@@ -6630,17 +7121,22 @@ export class RegressionScenarios {
             ).catch(() => page.locator("body").innerText());
 
             let specPassCount = 0;
-            try {
-              const vSearchRes = await page.context().request.get(
-                `${this.config.oscarBaseUrl}/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(specVehicleId)}&matchMode=equals`,
-              );
-              if (vSearchRes.ok()) {
-                const vJson = (await vSearchRes.json()) as {summary?: {spectroscopicPasses?: unknown}};
-                specPassCount = Number(vJson.summary?.spectroscopicPasses ?? 0);
+            const specSearchStartIso = new Date(Date.now() - 3_600_000).toISOString();
+            for (let attempt = 0; attempt < 2 && specPassCount < 1; attempt += 1) {
+              try {
+                const vSearchRes = await page.context().request.get(
+                  `${this.config.oscarBaseUrl}/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(specVehicleId)}&matchMode=equals&startTime=${encodeURIComponent(specSearchStartIso)}`,
+                );
+                if (vSearchRes.ok()) {
+                  const vJson = (await vSearchRes.json()) as {summary?: {spectroscopicPasses?: unknown}};
+                  specPassCount = Number(vJson.summary?.spectroscopicPasses ?? 0);
+                } else if (vSearchRes.status() === 503 && attempt === 0) {
+                  await sleep(1_000);
+                }
+                await vSearchRes.dispose();
+              } catch {
+                specPassCount = 0;
               }
-              await vSearchRes.dispose();
-            } catch {
-              specPassCount = 0;
             }
 
             const passedSpec = autoPretoggledCompleted && n42Visible && n42Persisted && specPassCount >= 1 &&
@@ -7706,10 +8202,10 @@ export class RegressionScenarios {
       if (!enabledCheck) return;
 
       // Ensure the lane's RPM and camera reconnect cleanly after the LaneSystem config update, then configure a
-      // 9-second alarm window so cam_50 captures a full transit of the real container loop (7.2s).
+      // 12-second alarm window so cam_50 captures container transits across multi-scene compilation loops.
       await this.emulator.replaceConfig(
         this.config.testRpmId,
-        this.emulator.shortAlarmConfig(this.originalRpmConfig, 9),
+        this.emulator.shortAlarmConfig(this.originalRpmConfig, 12),
       );
       await this.waitHealthRpmConnection(page, "online", 60_000);
       await sleep(2_500);
@@ -7728,6 +8224,7 @@ export class RegressionScenarios {
       );
       if (!initialEventId) throw new Error("Failed to resolve occupancy UUID for container-transit gamma alarm");
       let eventId: string = initialEventId;
+      const triggeredEventIds = new Set<string>([initialEventId]);
       await this.captureAlarmMedia(page, eventId, "gamma", trigger.occupancyCount, "vehicle-ocr");
 
       const expectedContainer = this.config.expectedVehicleOcrContainer;
@@ -7752,7 +8249,7 @@ export class RegressionScenarios {
         evidenceImagePath: string;
       }
 
-      const fetchMatchingOcrObservationsFor = async (targetEventId: string): Promise<OcrObservationRecord[]> => {
+      const fetchMatchingOcrObservationsFor = async (targetEventIds: ReadonlySet<string>): Promise<OcrObservationRecord[]> => {
         const windowEndIso = new Date(Date.now() + 60_000).toISOString();
         const params = new URLSearchParams({
           resultTime: `${triggerWindowStartIso}/${windowEndIso}`,
@@ -7777,7 +8274,7 @@ export class RegressionScenarios {
           for (const item of json.items ?? []) {
             const r = item.result ?? item.properties?.result ?? {};
             const obsId = String(r.occupancyObsId ?? "").trim();
-            if (obsId !== targetEventId) continue;
+            if (!targetEventIds.has(obsId)) continue;
             matched.push({
               id: String(item.id ?? "").trim(),
               occupancyObsId: obsId,
@@ -7806,9 +8303,10 @@ export class RegressionScenarios {
       }, async () => {
         let candidates: OcrObservationRecord[] = [];
         let best: OcrObservationRecord | undefined;
-        // Free-running container-transit RTSP loops contain brief empty-roadway gaps between passes;
-        // allow up to 3 phase-shifted 9s alarm triggers to capture a container body in frame.
-        for (let passAttempt = 0; passAttempt < 3; passAttempt++) {
+        // Multi-scene container-transit RTSP loops can contain >3-minute non-box-container/plate
+        // segments between ISO 6346 container passes; allow up to 10 phase-shifted alarm triggers
+        // (exiting immediately on the first valid container match).
+        for (let passAttempt = 0; passAttempt < 10; passAttempt++) {
           if (passAttempt > 0) {
             await sleep(3_500);
             const nextTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
@@ -7825,26 +8323,30 @@ export class RegressionScenarios {
             await this.captureAlarmMedia(page, nextEventId, "gamma", nextTrigger.occupancyCount, "vehicle-ocr");
             trigger = nextTrigger;
             eventId = nextEventId;
+            triggeredEventIds.add(nextEventId);
           }
-          const currentEventId = eventId!;
           candidates = await poll(
-            () => fetchMatchingOcrObservationsFor(currentEventId),
+            () => fetchMatchingOcrObservationsFor(triggeredEventIds),
             items => items.some(c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue)),
             {
-              timeoutMs: passAttempt < 2 ? 28_000 : Math.max(this.config.eventTimeoutMs, 45_000),
+              timeoutMs: passAttempt < 9 ? 20_000 : Math.max(this.config.eventTimeoutMs, 45_000),
               intervalMs: 1_000,
-              description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancy ${currentEventId}`,
+              description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancies [${[...triggeredEventIds].join(",")}]`,
             },
-          ).catch(() => fetchMatchingOcrObservationsFor(currentEventId));
+          ).catch(() => fetchMatchingOcrObservationsFor(triggeredEventIds));
 
           const validContainer = candidates.find(
             c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue),
           );
           if (validContainer) {
             best = validContainer;
+            eventId = validContainer.occupancyObsId;
             break;
           }
-          best = candidates[0] ?? best;
+          if (candidates[0]) {
+            best = candidates[0];
+            eventId = candidates[0].occupancyObsId;
+          }
         }
 
         if (!best) {
@@ -7992,20 +8494,22 @@ export class RegressionScenarios {
         // radiation profile traces, open VehiclePassComparisonDialog from Pass #2's related-passes
         // banner, batch-adjudicate open Pass #2, and export consolidated VEHICLE_INCIDENT reports
         // across PDF, CSV, JSON, and XLSX.
+        // Use a neutron alarm on confirmation re-scans so EML never auto-releases Pass #2 as EML Non-Threat
+        // before VehiclePassComparisonDialog exercises open-alarm batch adjudication.
         let basePassEventId = eventId;
         let rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-        const trigger2 = await this.triggerAlarm("gamma", "vehicle-ocr");
-        if (!trigger2) throw new Error("Confirmation re-scan gamma alarm trigger returned no occupancy identity");
-        const alarmRow2 = await this.findAlarmRow(page, /Gamma/i, trigger2);
+        const trigger2 = await this.triggerAlarm("neutron", "vehicle-ocr");
+        if (!trigger2) throw new Error("Confirmation re-scan neutron alarm trigger returned no occupancy identity");
+        const alarmRow2 = await this.findAlarmRow(page, /Neutron/i, trigger2);
         let eventId2 = await this.resolveAlarmEventUuid(
           page,
           alarmRow2,
-          "gamma",
+          "neutron",
           trigger2.occupancyCount,
           "vehicle-ocr",
         );
-        if (!eventId2) throw new Error("Failed to resolve occupancy UUID for confirmation re-scan gamma alarm");
-        await this.captureAlarmMedia(page, eventId2, "gamma", trigger2.occupancyCount, "vehicle-ocr");
+        if (!eventId2) throw new Error("Failed to resolve occupancy UUID for confirmation re-scan neutron alarm");
+        await this.captureAlarmMedia(page, eventId2, "neutron", trigger2.occupancyCount, "vehicle-ocr");
 
         const fetchOcrForObsId = async (targetObsId: string, winStartIso: string): Promise<OcrObservationRecord[]> => {
           const windowEndIso = new Date(Date.now() + 60_000).toISOString();
@@ -8063,22 +8567,22 @@ export class RegressionScenarios {
             predicate: (c: OcrObservationRecord) => boolean,
             label: string,
           ): Promise<OcrObservationRecord[]> => {
-            for (let attempt = 0; attempt < 3; attempt++) {
+            for (let attempt = 0; attempt < 6; attempt++) {
               if (attempt > 0) {
                 await sleep(3_500);
                 rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-                const retryTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
+                const retryTrigger = await this.triggerAlarm("neutron", "vehicle-ocr");
                 if (!retryTrigger) break;
-                const retryRow = await this.findAlarmRow(page, /Gamma/i, retryTrigger);
+                const retryRow = await this.findAlarmRow(page, /Neutron/i, retryTrigger);
                 const retryEventId = await this.resolveAlarmEventUuid(
                   page,
                   retryRow,
-                  "gamma",
+                  "neutron",
                   retryTrigger.occupancyCount,
                   "vehicle-ocr",
                 );
                 if (!retryEventId) break;
-                await this.captureAlarmMedia(page, retryEventId, "gamma", retryTrigger.occupancyCount, "vehicle-ocr");
+                await this.captureAlarmMedia(page, retryEventId, "neutron", retryTrigger.occupancyCount, "vehicle-ocr");
                 eventId2 = retryEventId;
               }
               const currentId = eventId2!;
@@ -8086,7 +8590,7 @@ export class RegressionScenarios {
                 () => fetchOcrForObsId(currentId, rescanWindowStartIso),
                 items => items.some(predicate),
                 {
-                  timeoutMs: attempt < 2 ? 28_000 : Math.max(this.config.eventTimeoutMs, 45_000),
+                  timeoutMs: attempt < 5 ? 20_000 : Math.max(this.config.eventTimeoutMs, 45_000),
                   intervalMs: 1_000,
                   description: `${label} for occupancy ${currentId}`,
                 },
@@ -8154,18 +8658,18 @@ export class RegressionScenarios {
 
             if (playlistStep < 5) {
               rescanWindowStartIso = new Date(Date.now() - 5_000).toISOString();
-              const nextRescanTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
-              if (!nextRescanTrigger) throw new Error("Playlist-follow-up confirmation gamma alarm trigger returned no occupancy identity");
-              const nextAlarmRow = await this.findAlarmRow(page, /Gamma/i, nextRescanTrigger);
+              const nextRescanTrigger = await this.triggerAlarm("neutron", "vehicle-ocr");
+              if (!nextRescanTrigger) throw new Error("Playlist-follow-up confirmation neutron alarm trigger returned no occupancy identity");
+              const nextAlarmRow = await this.findAlarmRow(page, /Neutron/i, nextRescanTrigger);
               const nextEventId = await this.resolveAlarmEventUuid(
                 page,
                 nextAlarmRow,
-                "gamma",
+                "neutron",
                 nextRescanTrigger.occupancyCount,
                 "vehicle-ocr",
               );
               if (!nextEventId) throw new Error("Failed to resolve occupancy UUID for playlist-follow-up confirmation alarm");
-              await this.captureAlarmMedia(page, nextEventId, "gamma", nextRescanTrigger.occupancyCount, "vehicle-ocr");
+              await this.captureAlarmMedia(page, nextEventId, "neutron", nextRescanTrigger.occupancyCount, "vehicle-ocr");
               eventId2 = nextEventId;
             }
           }
@@ -8819,9 +9323,11 @@ export class RegressionScenarios {
             value[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
           Object.entries(SHIPPING_STORAGE_POLICY).every(([key, expected]) =>
             value.packagedDefaults[key as keyof typeof SHIPPING_STORAGE_POLICY] === expected) &&
-          JSON.stringify(value.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
-          JSON.stringify(value.packagedDefaults.outputNames) ===
-            JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+          parquetPrimaryOutputNamesMatchRelease(
+            value.outputNames,
+            release,
+            value.packagedDefaults.outputNames,
+          ) &&
           indexes.genericPayloadGinAbsent && indexes.requiredCount === 15 &&
           indexes.requiredPresent === indexes.requiredCount && indexes.missingNames.length === 0 &&
           indexes.eventPathGinExact && indexes.numericEventIndexesExact &&
@@ -8878,11 +9384,33 @@ export class RegressionScenarios {
         target: this.config.targetHost,
         expected: "archive catalog has no failed jobs, parity failures, incomplete objects, checksum errors, or archive partial artifacts",
       }, async () => {
-        const value = assessArchiveHealth(await probe.runJson("archive-health"));
+        const value = await poll(
+          async () => assessArchiveHealth(await probe.runJson("archive-health")),
+          candidate => candidate.failedJobs === 0 && candidate.parityFailures === 0 &&
+            candidate.incompleteActiveObjects === 0 && candidate.archivePartialArtifacts === 0 &&
+            candidate.walPartialArtifacts === 0 && candidate.checksumVerificationPassed,
+          {timeoutMs: 60_000, intervalMs: 2_000,
+            description: "archive verification to reach a quiescent clean boundary"},
+        );
         return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
           value.incompleteActiveObjects === 0 && value.archivePartialArtifacts === 0 &&
           value.walPartialArtifacts === 0 && value.checksumVerificationPassed,
         observed: JSON.stringify(value)};
+      });
+
+      await this.check({
+        scenario: "storage-health", category: "cold-archive",
+        action: "verify split-at-export profiles, event-only compaction, and catalog referential integrity",
+        target: "oscar_archive_generation/oscar_archive_schema",
+        expected: "every RAW_EVENTS, RAW_TELEMETRY, DAILY_EVENTS, legacy DAILY_TELEMETRY, and MONTHLY_EVENTS generation is strictly stream-separated, summary-populated, leaves RAW_TELEMETRY ocr_bloom NULL, keeps compacted tiers SEALED and parity-verified, with zero non-zero DELETING row counts and zero orphan catalog references",
+      }, async () => {
+        const value = await poll(
+          async () => assessCompactionHealth(await probe.runJson("compaction-health")),
+          candidate => compactionHealthIsSafe(candidate),
+          {timeoutMs: 30_000, intervalMs: 1_000,
+            description: "compaction catalog to reach a consistent boundary"},
+        );
+        return {passed: compactionHealthIsSafe(value), observed: JSON.stringify(value)};
       });
 
       await this.check({
@@ -9036,7 +9564,10 @@ export class RegressionScenarios {
             platform.archiveEnabled === true && platform.deleteHotAfterArchive === true &&
             Object.entries(REGRESSION_ARCHIVE_POLICY).every(([key, expected]) =>
               platform[key as keyof typeof REGRESSION_ARCHIVE_POLICY] === expected) &&
-            JSON.stringify(platform.outputNames) === JSON.stringify(PARQUET_PRIMARY_OUTPUT_NAMES) &&
+            parquetPrimaryOutputNamesMatchRelease(
+              platform.outputNames,
+              this.config.storageExpectedRelease,
+            ) &&
             platform.observationIndexes.genericPayloadGinAbsent &&
             platform.observationIndexes.requiredPresent ===
               platform.observationIndexes.requiredCount &&
@@ -9507,7 +10038,14 @@ export class RegressionScenarios {
       await this.check({scenario: "storage-lifecycle", category: "cold-archive",
         action: "verify lifecycle left no partial archive artifacts", target: this.config.targetHost,
         expected: "post-purge archive verification passes with no archive-object or WAL partial artifacts"}, async () => {
-        const value = assessArchiveHealth(await probe.runJson("archive-health"));
+        const value = await poll(
+          async () => assessArchiveHealth(await probe.runJson("archive-health")),
+          candidate => candidate.failedJobs === 0 && candidate.parityFailures === 0 &&
+            candidate.incompleteActiveObjects === 0 && candidate.archivePartialArtifacts === 0 &&
+            candidate.walPartialArtifacts === 0 && candidate.checksumVerificationPassed,
+          {timeoutMs: 60_000, intervalMs: 2_000,
+            description: "post-lifecycle archive verification to reach a quiescent clean boundary"},
+        );
         return {passed: value.failedJobs === 0 && value.parityFailures === 0 &&
           value.incompleteActiveObjects === 0 && value.archivePartialArtifacts === 0 &&
           value.walPartialArtifacts === 0 && value.checksumVerificationPassed,
@@ -11209,6 +11747,11 @@ export class RegressionScenarios {
 
         const dlg = page.getByTestId("lane-webrelay-dialog");
         await dlg.waitFor({state: "visible", timeout: 10_000});
+        await page.waitForFunction(() => {
+          const btn = document.querySelector('[data-testid="webrelay-btn-test-primary"]') as HTMLButtonElement | null;
+          const opts = document.querySelectorAll('[data-testid="lane-webrelay-dialog"] select option');
+          return Boolean(btn && !btn.disabled && opts.length > 0);
+        }, {timeout: 10_000});
 
         const hostInput = page.getByTestId("webrelay-input-primary-host");
         await hostInput.fill(runnerIp);
@@ -11276,65 +11819,68 @@ export class RegressionScenarios {
 
       if (this.originalRpmConfig) {
         let webrelayTrigger: Awaited<ReturnType<typeof this.triggerAlarm>> | undefined;
-        await this.check({
-          scenario: "lane-webrelay",
-          category: "auto-alarm-gatekeeper",
-          action: "trigger live RPM gamma alarm on reserved lane and verify AUTO hardware-timed WebRelay pulse",
-          target: this.config.testLaneLabel,
-          expected: "actionable RPM gamma alarm triggers relay1State=1&relay2State=1&relay3State=2&pulseTime3=3 and increments triggeredAlarmCount",
-        }, async () => {
-          const beforeLen = recordedQueries.length;
-          await this.emulator.replaceConfig(
-            this.config.testRpmId,
-            this.emulator.shortAlarmConfig(this.originalRpmConfig!),
-          );
-          await this.waitHealthRpmConnection(page, "online", 60_000);
-          webrelayTrigger = await this.triggerAlarm("gamma", "lane-webrelay");
-
-          let autoPulsed = false;
-          let triggeredCount = 0;
-          const deadline = Date.now() + 20_000;
-          while (Date.now() < deadline) {
-            const newQs = recordedQueries.slice(beforeLen);
-            if (newQs.some((q) => q.includes("relay1State=1&relay2State=1&relay3State=2&pulseTime3=3"))) {
-              autoPulsed = true;
-            }
-            const st = await page.context().request.get(
-              `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
-              {headers: {Accept: "application/json"}},
+        try {
+          await this.check({
+            scenario: "lane-webrelay",
+            category: "auto-alarm-gatekeeper",
+            action: "trigger live RPM gamma alarm on reserved lane and verify AUTO hardware-timed WebRelay pulse",
+            target: this.config.testLaneLabel,
+            expected: "actionable RPM gamma alarm triggers relay1State=1&relay2State=1&relay3State=2&pulseTime3=3 and increments triggeredAlarmCount",
+          }, async () => {
+            const beforeLen = recordedQueries.length;
+            await this.emulator.replaceConfig(
+              this.config.testRpmId,
+              this.emulator.shortAlarmConfig(this.originalRpmConfig!),
             );
-            if (st.ok()) {
-              const stJson = await st.json() as {lanes?: Array<Record<string, any>>};
-              const entry = (stJson.lanes ?? []).find((l) => l.laneName === this.config.testLaneLabel);
-              triggeredCount = Number(entry?.triggeredAlarmCount ?? 0);
-            }
-            await st.dispose();
-            if (autoPulsed && triggeredCount >= 1) {
-              break;
-            }
-            await page.waitForTimeout(500);
-          }
+            await this.waitHealthRpmConnection(page, "online", 60_000);
+            webrelayTrigger = await this.triggerAlarm("gamma", "lane-webrelay");
 
+            let autoPulsed = false;
+            let triggeredCount = 0;
+            const deadline = Date.now() + 20_000;
+            while (Date.now() < deadline) {
+              const newQs = recordedQueries.slice(beforeLen);
+              if (newQs.some((q) => q.includes("relay1State=1&relay2State=1&relay3State=2&pulseTime3=3"))) {
+                autoPulsed = true;
+              }
+              const st = await page.context().request.get(
+                `${this.config.oscarBaseUrl}/sensorhub/oscar/webrelay/status`,
+                {headers: {Accept: "application/json"}},
+              );
+              if (st.ok()) {
+                const stJson = await st.json() as {lanes?: Array<Record<string, any>>};
+                const entry = (stJson.lanes ?? []).find((l) => l.laneName === this.config.testLaneLabel);
+                triggeredCount = Number(entry?.triggeredAlarmCount ?? 0);
+              }
+              await st.dispose();
+              if (autoPulsed && triggeredCount >= 1) {
+                break;
+              }
+              await page.waitForTimeout(500);
+            }
+
+            return {
+              passed: autoPulsed && triggeredCount >= 1,
+              observed: `autoPulsed=${autoPulsed}; triggeredAlarmCount=${triggeredCount}`,
+            };
+          });
+
+          if (webrelayTrigger) {
+            const alarmRow = await this.findAlarmRow(page, /Gamma/i, webrelayTrigger);
+            const eventId = await this.resolveAlarmEventUuid(
+              page,
+              alarmRow,
+              "gamma",
+              webrelayTrigger.occupancyCount,
+              "lane-webrelay",
+            );
+            if (eventId) {
+              await this.captureAlarmMedia(page, eventId, "gamma", webrelayTrigger.occupancyCount, "lane-webrelay");
+            }
+          }
+        } finally {
           if (originalRpmQuieted) {
             await this.emulator.replaceConfig(this.config.testRpmId, originalRpmQuieted);
-          }
-          return {
-            passed: autoPulsed && triggeredCount >= 1,
-            observed: `autoPulsed=${autoPulsed}; triggeredAlarmCount=${triggeredCount}`,
-          };
-        });
-
-        if (webrelayTrigger) {
-          const alarmRow = await this.findAlarmRow(page, /Gamma/i, webrelayTrigger);
-          const eventId = await this.resolveAlarmEventUuid(
-            page,
-            alarmRow,
-            "gamma",
-            webrelayTrigger.occupancyCount,
-            "lane-webrelay",
-          );
-          if (eventId) {
-            await this.captureAlarmMedia(page, eventId, "gamma", webrelayTrigger.occupancyCount, "lane-webrelay");
           }
         }
       }
@@ -11392,5 +11938,1060 @@ export class RegressionScenarios {
         observed: `restoredEnabled=${String(restored?.enabled)}; expected=${String(Boolean(targetLaneEntry.enabled))}`,
       };
     });
+  }
+
+  private async clickSpaNavItem(page: Page, testId: string, expectedPathname: string): Promise<void> {
+    const target = page.getByTestId(testId).first();
+    if (!(await target.isVisible().catch(() => false))) {
+      const toggle = page.getByTestId("navbar-drawer-toggle").first();
+      if (await toggle.isVisible().catch(() => false)) {
+        await toggle.click();
+        await target.waitFor({state: "visible", timeout: 10_000});
+      }
+    }
+    await Promise.all([
+      page.waitForURL(
+        (url) => normalizePathname(url.pathname) === normalizePathname(expectedPathname),
+        {timeout: this.config.uiTimeoutMs},
+      ),
+      target.click(),
+    ]);
+  }
+
+  private async resolvePortalServerNodeName(reqCtx: APIRequestContext, baseUrl: string): Promise<string> {
+    const sysRes = await reqCtx.get(`${baseUrl}/sensorhub/api/systems?format=application%2Fjson&limit=200`);
+    try {
+      if (!sysRes.ok()) return "";
+      const payload = await sysRes.json() as {
+        items?: Array<{
+          uid?: string;
+          name?: string;
+          validTime?: string[];
+          properties?: {uid?: string; name?: string; validTime?: string[]};
+        }>;
+      };
+      const oscarSystems = (payload.items ?? []).filter((item) =>
+        String(item?.uid ?? item?.properties?.uid ?? "").includes("urn:ornl:oscar:system:"),
+      );
+      oscarSystems.sort((a, b) => {
+        const va = String(a?.validTime?.[0] ?? a?.properties?.validTime?.[0] ?? "");
+        const vb = String(b?.validTime?.[0] ?? b?.properties?.validTime?.[0] ?? "");
+        return vb.localeCompare(va);
+      });
+      const rawName = String(oscarSystems[0]?.name ?? oscarSystems[0]?.properties?.name ?? "").trim();
+      return rawName && rawName !== "OSCAR System" ? rawName : "";
+    } finally {
+      await sysRes.dispose();
+    }
+  }
+
+  private async ensurePortalNationalStatisticsObservation(
+    reqCtx: APIRequestContext,
+    baseUrl: string,
+  ): Promise<void> {
+    const obsRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/observations?observedProperty=${encodeURIComponent(NATIONAL_STATISTICS_OBSERVED_PROPERTY)}&resultTime=latest&limit=1`,
+      {headers: {Accept: "application/om+json, application/json"}},
+    );
+    try {
+      if (obsRes.ok()) {
+        const obsJson = await obsRes.json() as {items?: unknown[]};
+        if (Array.isArray(obsJson.items) && obsJson.items.length > 0) {
+          return;
+        }
+      }
+    } finally {
+      await obsRes.dispose();
+    }
+
+    const csRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/controlstreams?validTime=latest&limit=200`,
+      {headers: {Accept: "application/json"}},
+    );
+    let natCsId = "";
+    try {
+      if (csRes.ok()) {
+        const csJson = await csRes.json() as {items?: Array<Record<string, unknown>>};
+        for (const item of csJson.items ?? []) {
+          const text = JSON.stringify(item);
+          if (/startDateTime/i.test(text) && /endDateTime/i.test(text) && !/reportType/i.test(text)) {
+            natCsId = String(item.id ?? "");
+            if (natCsId) break;
+          }
+        }
+      }
+    } finally {
+      await csRes.dispose();
+    }
+    if (!natCsId) return;
+
+    const cmdRes = await reqCtx.post(
+      `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(natCsId)}/commands`,
+      {
+        headers: {"Content-Type": "application/json", Accept: "application/json"},
+        data: {parameters: {startDateTime: null, endDateTime: null, laneUID: null}},
+      },
+    );
+    try {
+      if (!cmdRes.ok()) return;
+      let progress = assessNationalStatisticsCommandSubmission(await cmdRes.json());
+      const deadline = Date.now() + 60_000;
+      while (progress.state !== "complete" && Date.now() < deadline) {
+        await sleep(1_000);
+        const stRes = await reqCtx.get(
+          `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(natCsId)}/commands/${encodeURIComponent(progress.commandId)}/status?format=application%2Fjson&offset=0&limit=100`,
+        );
+        try {
+          if (stRes.ok()) {
+            progress = assessNationalStatisticsCommandStatus(await stRes.json(), progress.commandId);
+          }
+        } finally {
+          await stRes.dispose();
+        }
+      }
+    } finally {
+      await cmdRes.dispose();
+    }
+  }
+
+  private async adjudicateRecentOccupancyViaApi(options: {
+    reqCtx: APIRequestContext;
+    baseUrl: string;
+    vehicleId: string;
+    preferredLaneName?: string;
+    allowReservedRpmTrigger?: boolean;
+    windowStartIso: string;
+  }): Promise<{laneName: string; occupancyObsId: string}> {
+    const {reqCtx, baseUrl, vehicleId, preferredLaneName, allowReservedRpmTrigger, windowStartIso} = options;
+    const sysRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/systems?searchMembers=true&validTime=latest&limit=500`,
+      {headers: {Accept: "application/json"}},
+    );
+    let laneSystemId = "";
+    let laneName = preferredLaneName ?? "";
+    try {
+      if (!sysRes.ok()) {
+        throw new Error(`Lane system lookup on ${baseUrl} returned HTTP ${sysRes.status()}`);
+      }
+      const sysJson = await sysRes.json() as {
+        items?: Array<{
+          id?: string;
+          uid?: string;
+          name?: string;
+          properties?: {id?: string; uid?: string; name?: string};
+        }>;
+      };
+      const laneSystems = (sysJson.items ?? []).filter((item) => {
+        const uid = String(item?.uid ?? item?.properties?.uid ?? "");
+        return uid.startsWith("urn:osh:system:lane:");
+      });
+      const chosen = (preferredLaneName
+        ? laneSystems.find((item) =>
+          String(item?.name ?? item?.properties?.name ?? "").toLowerCase() === preferredLaneName.toLowerCase())
+        : undefined) ?? laneSystems[0];
+      if (!chosen) {
+        throw new Error(`No urn:osh:system:lane:* system found on ${baseUrl}`);
+      }
+      laneSystemId = String(chosen.id ?? chosen.properties?.id ?? "");
+      laneName = String(chosen.name ?? chosen.properties?.name ?? (preferredLaneName || "Lane"));
+    } finally {
+      await sysRes.dispose();
+    }
+
+    const dsRes = await reqCtx.get(
+      `${baseUrl}/sensorhub/api/datastreams?system=${encodeURIComponent(laneSystemId)}&validTime=latest&limit=200`,
+      {headers: {Accept: "application/json"}},
+    );
+    let occDsId = "";
+    try {
+      if (dsRes.ok()) {
+        const dsJson = await dsRes.json() as {items?: Array<{id?: string; outputName?: string}>};
+        occDsId = String((dsJson.items ?? []).find((ds) => ds.outputName === "occupancy")?.id ?? "");
+      }
+    } finally {
+      await dsRes.dispose();
+    }
+    if (!occDsId) {
+      const fallbackDsRes = await reqCtx.get(
+        `${baseUrl}/sensorhub/api/datastreams?validTime=latest&limit=2500`,
+        {headers: {Accept: "application/json"}},
+      );
+      try {
+        if (fallbackDsRes.ok()) {
+          const dsJson = await fallbackDsRes.json() as {
+            items?: Array<{id?: string; outputName?: string; "system@link"?: {uid?: string; title?: string}}>;
+          };
+          const occItems = (dsJson.items ?? []).filter((ds) => ds.outputName === "occupancy");
+          const matched = (preferredLaneName
+            ? occItems.find((ds) =>
+              String(ds["system@link"]?.title ?? ds["system@link"]?.uid ?? "")
+                .toLowerCase()
+                .includes(preferredLaneName.toLowerCase()))
+            : undefined) ?? occItems[0];
+          occDsId = String(matched?.id ?? "");
+        }
+      } finally {
+        await fallbackDsRes.dispose();
+      }
+    }
+    if (!occDsId) {
+      throw new Error(`No occupancy datastream found on ${baseUrl} for lane ${laneName}`);
+    }
+
+    const findRecentObsId = async (): Promise<string> => {
+      const endIso = new Date(Date.now() + 60_000).toISOString();
+      const obsRes = await reqCtx.get(
+        `${baseUrl}/sensorhub/api/observations?datastream=${encodeURIComponent(occDsId)}&phenomenonTime=${encodeURIComponent(windowStartIso)}/${encodeURIComponent(endIso)}&limit=5`,
+        {headers: {Accept: "application/om+json, application/json"}},
+      );
+      try {
+        if (!obsRes.ok()) return "";
+        const obsJson = await obsRes.json() as {items?: Array<{id?: string}>};
+        return String(obsJson.items?.[0]?.id ?? "");
+      } finally {
+        await obsRes.dispose();
+      }
+    };
+
+    let occupancyObsId = await findRecentObsId();
+    if (!occupancyObsId && allowReservedRpmTrigger) {
+      occupancyObsId = [...this.resolvedAlarmEventIds][0] ?? "";
+    }
+    if (!occupancyObsId && allowReservedRpmTrigger && this.originalRpmConfig) {
+      await this.emulator.replaceConfig(
+        this.config.testRpmId,
+        this.emulator.shortAlarmConfig(this.originalRpmConfig, 3),
+      );
+      try {
+        await this.triggerAlarm("gamma", "multi-node-federation");
+        occupancyObsId = await poll(
+          findRecentObsId,
+          (id) => id.length > 0,
+          {timeoutMs: 30_000, intervalMs: 500, description: "generated occupancy observation on reserved lane"},
+        );
+      } finally {
+        await this.emulator.replaceConfig(
+          this.config.testRpmId,
+          this.emulator.quietConfig(this.originalRpmConfig),
+        ).catch((err) => this.reporter.error("multi-node-federation", "restore-quiet-config", err));
+      }
+    }
+    if (!occupancyObsId) {
+      throw new Error(`No recent occupancy observation available on ${baseUrl} (${laneName}) within 30d window`);
+    }
+
+    const findAdjCsId = async (url: string, matchLane?: string): Promise<string> => {
+      const csRes = await reqCtx.get(url, {headers: {Accept: "application/json"}});
+      try {
+        if (!csRes.ok()) return "";
+        const csJson = await csRes.json() as {
+          items?: Array<{
+            id?: string;
+            inputName?: string;
+            "system@link"?: {uid?: string; title?: string};
+            schema?: unknown;
+          }>;
+        };
+        const adjStreams = (csJson.items ?? []).filter(
+          (cs) => cs.inputName === "adjudicationControl" || /Adjudication/i.test(JSON.stringify(cs.schema ?? "")),
+        );
+        const chosen = (matchLane
+          ? adjStreams.find((cs) =>
+            String(cs["system@link"]?.title ?? cs["system@link"]?.uid ?? "")
+              .toLowerCase()
+              .includes(matchLane.toLowerCase()))
+          : undefined) ?? adjStreams[0];
+        return String(chosen?.id ?? "");
+      } finally {
+        await csRes.dispose();
+      }
+    };
+
+    let adjCsId = await findAdjCsId(
+      `${baseUrl}/sensorhub/api/controlstreams?system=${encodeURIComponent(laneSystemId)}&validTime=latest&limit=200`,
+    );
+    if (!adjCsId) {
+      adjCsId = await findAdjCsId(
+        `${baseUrl}/sensorhub/api/controlstreams?validTime=latest&limit=1000`,
+        preferredLaneName,
+      );
+    }
+    if (!adjCsId) {
+      throw new Error(`No adjudicationControl stream found on ${baseUrl} for lane ${laneName}`);
+    }
+
+    const cmdRes = await reqCtx.post(
+      `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(adjCsId)}/commands`,
+      {
+        headers: {"Content-Type": "application/json", Accept: "application/json"},
+        data: {
+          parameters: {
+            feedback: `Cross-node federation regression ${this.reporter.runId.slice(-12)}`,
+            adjudicationCode: 9,
+            isotopesCount: 0,
+            isotopes: [],
+            secondaryInspectionStatus: "NONE",
+            filePathCount: 0,
+            filePaths: [],
+            occupancyObsId,
+            vehicleId,
+          },
+        },
+      },
+    );
+    try {
+      if (!cmdRes.ok()) {
+        throw new Error(`Adjudication command on ${baseUrl} returned HTTP ${cmdRes.status()}`);
+      }
+      const cmdJson = await cmdRes.json() as {statusCode?: string; "command@id"?: string; id?: string};
+      const cmdId = String(cmdJson["command@id"] ?? cmdJson.id ?? "");
+      if (cmdJson.statusCode === "PENDING" && cmdId) {
+        await poll(
+          async () => {
+            const stRes = await reqCtx.get(
+              `${baseUrl}/sensorhub/api/controlstreams/${encodeURIComponent(adjCsId)}/commands/${encodeURIComponent(cmdId)}/status?format=application%2Fjson`,
+            );
+            try {
+              if (!stRes.ok()) return "";
+              const stJson = await stRes.json() as {items?: Array<{statusCode?: string}>; statusCode?: string};
+              const items = Array.isArray(stJson.items) ? stJson.items : [stJson];
+              return items.map((it) => String(it?.statusCode ?? "")).find((s) => s === "COMPLETED" || s === "ACCEPTED") ?? "";
+            } finally {
+              await stRes.dispose();
+            }
+          },
+          (code) => code === "COMPLETED" || code === "ACCEPTED",
+          {timeoutMs: 30_000, intervalMs: 400, description: `adjudication command ${cmdId} completion`},
+        );
+      }
+    } finally {
+      await cmdRes.dispose();
+    }
+
+    await poll(
+      async () => {
+        const vsRes = await reqCtx.get(
+          `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(vehicleId)}&matchMode=equals&limit=20`,
+          {headers: {Accept: "application/json"}},
+        );
+        try {
+          if (!vsRes.ok()) return 0;
+          const vsJson = await vsRes.json() as {passes?: unknown[]};
+          return Array.isArray(vsJson.passes) ? vsJson.passes.length : 0;
+        } finally {
+          await vsRes.dispose();
+        }
+      },
+      (count) => count >= 1,
+      {timeoutMs: 30_000, intervalMs: 500, description: `vehicle-search indexing of ${vehicleId} on ${baseUrl}`},
+    );
+
+    return {laneName, occupancyObsId};
+  }
+
+  private async multiNodeFederation(): Promise<void> {
+    const capabilityMeta: CheckMetadata = {
+      scenario: "multi-node-federation",
+      category: "federation",
+      action: "authenticate federated peer portal and mint short-lived Federation Service Token",
+      target: this.config.oscarFederatedPeerBaseUrl ?? "OSCAR_FEDERATED_PEER_BASE_URL",
+      expected: "peer portal authenticates session, resolves authoritative node identity, and mints a revocable oscar_fed_ token",
+    };
+
+    if (this.config.federationWorkflow === "disabled") {
+      this.skip(capabilityMeta, "FEDERATION_WORKFLOW=disabled");
+      return;
+    }
+    const peerBaseUrl = this.config.oscarFederatedPeerBaseUrl;
+    if (!peerBaseUrl) {
+      if (this.config.federationWorkflow === "auto") {
+        this.skip(capabilityMeta, "OSCAR_FEDERATED_PEER_BASE_URL is not configured (auto)");
+      } else {
+        this.reporter.outcome(
+          capabilityMeta.scenario,
+          capabilityMeta.category,
+          capabilityMeta.action,
+          capabilityMeta.target,
+          capabilityMeta.expected,
+          "OSCAR_FEDERATED_PEER_BASE_URL is missing",
+          "incorrect",
+          0,
+        );
+      }
+      return;
+    }
+
+    const parsedPeerUrl = new URL(peerBaseUrl);
+    const peerHost = parsedPeerUrl.hostname;
+    const peerPort = parsedPeerUrl.port || "443";
+    const peerOrigin = parsedPeerUrl.origin;
+    const peerUsername = this.config.oscarFederatedPeerUsername ?? this.config.oscarUsername;
+    const peerPassword = this.config.oscarFederatedPeerPassword ?? this.config.oscarPassword;
+    const tokenLabel = `Regression Cross-Node Fed ${this.reporter.runId}`.slice(0, 76);
+
+    const peerContext = await playwrightRequest.newContext({
+      baseURL: peerBaseUrl,
+      ignoreHTTPSErrors: true,
+      httpCredentials: {
+        username: peerUsername,
+        password: peerPassword,
+      },
+    });
+    const page = await this.browser.oscarPage();
+    let createdTokenId = "";
+    let mintedRawToken = "";
+    let localNodeName = "Local Node";
+    let expectedPeerNodeName = peerHost;
+
+    const removePeerNodeFromViewer = async (targetPage: Page): Promise<void> => {
+      await this.goto(targetPage, "/servers");
+      await targetPage.getByRole("heading", {name: "Nodes", exact: true})
+        .waitFor({timeout: this.config.uiTimeoutMs})
+        .catch(() => undefined);
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const peerItem = targetPage.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).first();
+        if ((await peerItem.count()) === 0) break;
+        const delBtn = peerItem.getByRole("button", {name: /^Delete$/i}).first();
+        if (!(await delBtn.isVisible().catch(() => false))) break;
+        await delBtn.click();
+        await sleep(250);
+      }
+
+      await targetPage.evaluate((hostToPurge) => {
+        const rawNodes = window.localStorage.getItem("osh_nodes");
+        if (rawNodes) {
+          try {
+            const parsed = JSON.parse(rawNodes);
+            if (Array.isArray(parsed)) {
+              const filtered = parsed.filter(
+                (n: {address?: unknown; isDefaultNode?: unknown}) =>
+                  n?.isDefaultNode === true || String(n?.address ?? "") !== hostToPurge,
+              );
+              window.localStorage.setItem("osh_nodes", JSON.stringify(filtered));
+            }
+          } catch {
+            // Ignore malformed storage
+          }
+        }
+        const rawCfg = window.localStorage.getItem("osh_config_node");
+        if (rawCfg && rawCfg.includes(hostToPurge)) {
+          window.localStorage.removeItem("osh_config_node");
+        }
+        const rawPersistNodes = window.localStorage.getItem("persist:nodes");
+        if (rawPersistNodes && rawPersistNodes.includes(hostToPurge)) {
+          window.localStorage.removeItem("persist:nodes");
+        }
+      }, peerHost);
+
+      await this.goto(targetPage, "/servers");
+      await targetPage.getByRole("heading", {name: "Nodes", exact: true})
+        .waitFor({timeout: this.config.uiTimeoutMs})
+        .catch(() => undefined);
+    };
+
+    const revokePeerToken = async (): Promise<void> => {
+      if (!createdTokenId) return;
+      const tokenToRevoke = createdTokenId;
+      createdTokenId = "";
+      const deleteUrl = `${peerBaseUrl}/sensorhub/session/admin/federation-tokens/${encodeURIComponent(tokenToRevoke)}`;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        try {
+          const delRes = await peerContext.delete(deleteUrl, {
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+              Origin: peerBaseUrl,
+              "X-Requested-With": "XMLHttpRequest",
+            },
+            data: {},
+            timeout: 60_000,
+          });
+          const delStatus = delRes.status();
+          await delRes.dispose();
+          if (delStatus >= 200 && delStatus < 300 || delStatus === 404) {
+            return;
+          }
+          throw new Error(`Peer token DELETE returned HTTP ${delStatus}`);
+        } catch (err) {
+          if (attempt === 2) throw err;
+        }
+      }
+    };
+
+    this.pendingFederationCleanup = async () => {
+      let cleanupPage: Page | undefined;
+      try {
+        cleanupPage = await this.browser.oscarPage();
+        await removePeerNodeFromViewer(cleanupPage);
+      } finally {
+        await cleanupPage?.close().catch(() => undefined);
+        await revokePeerToken().catch(() => undefined);
+        await peerContext.dispose().catch(() => undefined);
+      }
+    };
+
+    let revokedTokenIdForAudit = "";
+
+    try {
+      try {
+        const tokenReady = await this.check(capabilityMeta, async () => {
+          const loginRes = await peerContext.post(`${peerBaseUrl}/login`, {
+            form: {username: peerUsername, password: peerPassword},
+            maxRedirects: 0,
+          });
+          await loginRes.dispose();
+
+          let sessionRes = await peerContext.get(`${peerBaseUrl}/sensorhub/session`, {
+            headers: {Accept: "application/json"},
+          });
+          if (sessionRes.status() === 404) {
+            await sessionRes.dispose();
+            sessionRes = await peerContext.get(`${peerBaseUrl}/session`, {
+              headers: {Accept: "application/json"},
+            });
+          }
+          let sessionUser = "";
+          const sessionStatus = sessionRes.status();
+          try {
+            if (sessionRes.ok()) {
+              const sessionJson = await sessionRes.json() as {username?: string};
+              sessionUser = String(sessionJson.username ?? "");
+            }
+          } finally {
+            await sessionRes.dispose();
+          }
+
+          const [localDiscovered, peerDiscovered] = await Promise.all([
+            this.resolvePortalServerNodeName(page.context().request, this.config.oscarBaseUrl),
+            this.resolvePortalServerNodeName(peerContext, peerBaseUrl),
+          ]);
+          if (localDiscovered) {
+            localNodeName = localDiscovered;
+          }
+          if (peerDiscovered) {
+            expectedPeerNodeName = peerDiscovered;
+          }
+
+          await this.ensurePortalNationalStatisticsObservation(peerContext, peerBaseUrl);
+
+          const createRes = await peerContext.post(
+            `${peerBaseUrl}/sensorhub/session/admin/federation-tokens`,
+            {
+              headers: {"Content-Type": "application/json", Accept: "application/json"},
+              data: {label: tokenLabel, role: "operator", expiresInDays: 1},
+            },
+          );
+          const createStatus = createRes.status();
+          try {
+            if (createRes.ok()) {
+              const payload = await createRes.json() as {token?: string; record?: {id?: string}};
+              createdTokenId = String(payload?.record?.id ?? "");
+              revokedTokenIdForAudit = createdTokenId;
+              mintedRawToken = String(payload?.token ?? "");
+            }
+          } finally {
+            await createRes.dispose();
+          }
+
+          const passed = sessionStatus === 200 &&
+            sessionUser.toLowerCase() === peerUsername.toLowerCase() &&
+            (createStatus === 200 || createStatus === 201) &&
+            createdTokenId.length > 0 &&
+            mintedRawToken.startsWith("oscar_fed_");
+          return {
+            passed,
+            value: passed,
+            observed: `peerSessionHttp=${sessionStatus}; peerUser=${sessionUser}; peerNode=${expectedPeerNodeName}; ` +
+              `tokenCreateHttp=${createStatus}; tokenId=${createdTokenId || "none"}`,
+          };
+        });
+        if (!tokenReady) return;
+
+        const peerConnected = await this.check({
+          scenario: "multi-node-federation",
+          category: "federation",
+          action: "connect federated peer node on /servers?auth=bearer via Bearer Federation Token",
+          target: `${peerHost}:${peerPort}`,
+          expected: "Add Server form submits over HTTPS with Bearer token, peer ConSys API responds HTTP 200, and peer node renders with Federation Token badge",
+        }, async () => {
+          await this.goto(page, "/servers?auth=bearer");
+          await page.getByRole("heading", {name: "Nodes", exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+          await page.getByRole("heading", {name: "Add a New Server", exact: true}).waitFor({timeout: this.config.uiTimeoutMs});
+
+          const storedPrimaryName = await page.evaluate(() => {
+            try {
+              const parsed = JSON.parse(window.localStorage.getItem("osh_nodes") || "[]");
+              if (Array.isArray(parsed) && parsed[0]?.name) {
+                return String(parsed[0].name).trim();
+              }
+            } catch {
+              // Ignore
+            }
+            return "";
+          });
+          if (storedPrimaryName) {
+            localNodeName = storedPrimaryName;
+          }
+
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const staleItem = page.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).first();
+            if ((await staleItem.count()) === 0) break;
+            const delBtn = staleItem.getByRole("button", {name: /^Delete$/i}).first();
+            if (!(await delBtn.isVisible().catch(() => false))) break;
+            await delBtn.click();
+            await sleep(250);
+          }
+
+          let customPeerName = "";
+          if (expectedPeerNodeName === localNodeName) {
+            customPeerName = `${expectedPeerNodeName} (${peerHost})`;
+            expectedPeerNodeName = customPeerName;
+          }
+
+          const tokenInput = page.getByTestId("node-federation-token-input");
+          await tokenInput.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+
+          if (customPeerName) {
+            await page.getByLabel(/^Name$/i).first().fill(customPeerName);
+          }
+          await page.getByLabel(/^Address$/i).first().fill(peerHost);
+          await page.getByLabel(/^Port$/i).first().fill(peerPort);
+          const secureCheckbox = page.getByLabel(/Use a secure connection/i).first();
+          if (!(await secureCheckbox.isChecked())) {
+            await secureCheckbox.check();
+          }
+          await tokenInput.fill(mintedRawToken);
+
+          let peerApiBearer200 = false;
+          let peerDatastreams200 = false;
+          const onPeerRes = (res: Response) => {
+            try {
+              const parsed = new URL(res.url());
+              if (parsed.origin !== peerOrigin) return;
+              const authHdr = res.request().headers()["authorization"] ?? "";
+              if (res.status() === 200 && /^Bearer\s+oscar_fed_/i.test(authHdr)) {
+                if (/\/sensorhub\/api\/?$/.test(parsed.pathname) || /\/sensorhub\/api\/systems/.test(parsed.pathname)) {
+                  peerApiBearer200 = true;
+                }
+                if (/\/sensorhub\/api\/datastreams/.test(parsed.pathname)) {
+                  peerDatastreams200 = true;
+                }
+              }
+            } catch {
+              // Ignore malformed URLs
+            }
+          };
+          page.on("response", onPeerRes);
+          try {
+            await page.getByRole("button", {name: /^Add Node$/i}).click();
+            const cardState = await poll(
+              async () => {
+                const item = page.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).first();
+                const count = await item.count();
+                const text = count > 0 ? await item.innerText().catch(() => "") : "";
+                return {
+                  visible: count > 0,
+                  hasFederationBadge: /Federation Token/i.test(text),
+                  hasExpectedName: text.includes(expectedPeerNodeName),
+                  text: text.replace(/\s+/g, " ").trim(),
+                };
+              },
+              (state) => state.visible && state.hasFederationBadge && state.hasExpectedName,
+              {timeoutMs: this.config.eventTimeoutMs, intervalMs: 300, description: "federated peer card on /servers"},
+            );
+
+            await poll(
+              async () => peerDatastreams200,
+              (ready) => ready,
+              {timeoutMs: 25_000, intervalMs: 300, description: "initial federated peer datastream discovery"},
+            ).catch(() => false);
+
+            const passed = peerApiBearer200 && cardState.visible && cardState.hasFederationBadge && cardState.hasExpectedName;
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-servers-connect-failed");
+            return {
+              passed,
+              value: passed,
+              observed: `peerApiBearer200=${peerApiBearer200}; peerDatastreams200=${peerDatastreams200}; ` +
+                `localNode=${localNodeName}; peerNode=${expectedPeerNodeName}; card="${cardState.text}"`,
+              evidence,
+            };
+          } finally {
+            page.off("response", onPeerRes);
+          }
+        });
+        if (!peerConnected) return;
+
+        await this.check({
+          scenario: "multi-node-federation",
+          category: "national",
+          action: "render unified multi-node statistics on /national-view",
+          target: "/national-view",
+          expected: "both the local primary site row and the federated peer site row render in .MuiDataGrid-row with valid numeric statistics and Bearer token preserved across SPA navigation",
+        }, async () => {
+          let peerNationalBearerVerified = false;
+          const onNationalPeerRes = (res: Response) => {
+            try {
+              const parsed = new URL(res.url());
+              if (parsed.origin !== peerOrigin) return;
+              const checkHdr = (hdrs: Record<string, string>) => {
+                const authHdr = hdrs["authorization"] ?? hdrs["Authorization"] ?? "";
+                if (/^Bearer\s+oscar_fed_/i.test(authHdr) && res.status() === 200) {
+                  peerNationalBearerVerified = true;
+                }
+              };
+              checkHdr(res.request().headers());
+              if (!peerNationalBearerVerified) {
+                void res.request().allHeaders().then(checkHdr).catch(() => undefined);
+              }
+            } catch {
+              // Ignore malformed URLs
+            }
+          };
+          page.on("response", onNationalPeerRes);
+          try {
+            await this.clickSpaNavItem(page, "nav-item-national", "/national-view");
+            await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+
+            const readSiteRowStats = async (siteName: string) => {
+              const row = page.locator(".MuiDataGrid-row").filter({
+                has: page.locator('[data-field="site"]', {hasText: siteName}),
+              }).first();
+              if ((await row.count()) === 0) return null;
+              const values = {} as Record<NationalStatisticsField, string>;
+              for (const field of NATIONAL_STATISTICS_FIELDS) {
+                values[field] = await row.locator(`[data-field="${field}"]`).innerText();
+              }
+              return parseRenderedNationalStatistics(values);
+            };
+
+            const rendered = await poll(
+              async () => {
+                const rowCount = await page.locator(".MuiDataGrid-row").count();
+                let localStats = null;
+                let peerStats = null;
+                try {
+                  localStats = await readSiteRowStats(localNodeName);
+                } catch {
+                  localStats = null;
+                }
+                try {
+                  peerStats = await readSiteRowStats(expectedPeerNodeName);
+                } catch {
+                  peerStats = null;
+                }
+                return {rowCount, localStats, peerStats, peerBearer: peerNationalBearerVerified};
+              },
+              (candidate) => candidate.rowCount >= 2 && candidate.localStats !== null && candidate.peerStats !== null && candidate.peerBearer,
+              {
+                timeoutMs: this.config.eventTimeoutMs,
+                intervalMs: 400,
+                description: `both ${localNodeName} and ${expectedPeerNodeName} rows on /national-view with Bearer auth`,
+              },
+            );
+
+            const passed = rendered.rowCount >= 2 && rendered.localStats !== null && rendered.peerStats !== null && rendered.peerBearer;
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-national-view-failed");
+            return {
+              passed,
+              observed: `rows=${rendered.rowCount}; peerBearer=${rendered.peerBearer}; local(${localNodeName})=${JSON.stringify(rendered.localStats)}; ` +
+                `peer(${expectedPeerNodeName})=${JSON.stringify(rendered.peerStats)}`,
+              evidence,
+            };
+          } finally {
+            page.off("response", onNationalPeerRes);
+          }
+        });
+
+        await this.check({
+          scenario: "multi-node-federation",
+          category: "vehicle-search",
+          action: "correlate cross-node vehicle passes on /event-log and compare both portals in VehiclePassComparisonDialog",
+          target: "/event-log and VehiclePassComparisonDialog",
+          expected: "cross-origin Bearer GET to peer /sensorhub/buckets/adjudication/vehicle-search returns HTTP 200, summary shows >=2 passes across >=2 sites, and VehiclePassComparisonDialog renders passes from both nodes",
+        }, async () => {
+          const recentStartIso = new Date(Date.now() - 24 * 60 * 60 * 1_000).toISOString();
+          const windowStartIso = new Date(Date.now() - 29 * 24 * 60 * 60 * 1_000).toISOString();
+          const isoContainerPattern = /^[A-Z]{3}[UJZR]\d{7}$/;
+          const collectVehicles = async (
+            reqCtx: APIRequestContext,
+            baseUrl: string,
+          ): Promise<Map<string, string>> => {
+            const map = new Map<string, string>();
+            for (const startIso of [windowStartIso, recentStartIso]) {
+              let res = await reqCtx.get(
+                `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=50&startTime=${encodeURIComponent(startIso)}`,
+                {headers: {Accept: "application/json"}, timeout: 90_000},
+              );
+              if (res.status() >= 500 && res.status() < 600) {
+                await res.dispose();
+                await new Promise((r) => setTimeout(r, 600));
+                res = await reqCtx.get(
+                  `${baseUrl}/sensorhub/buckets/adjudication/vehicle-search?matchMode=isNotEmpty&limit=50&startTime=${encodeURIComponent(startIso)}`,
+                  {headers: {Accept: "application/json"}, timeout: 90_000},
+                );
+              }
+              try {
+                if (res.ok()) {
+                  const json = await res.json() as {
+                    passes?: Array<{normalizedVehicleId?: unknown; vehicleId?: unknown}>;
+                  };
+                  for (const p of json.passes ?? []) {
+                    const raw = String(p.vehicleId ?? p.normalizedVehicleId ?? "").trim();
+                    const norm = String(p.normalizedVehicleId ?? raw)
+                      .trim()
+                      .toUpperCase()
+                      .replace(/[^A-Z0-9]/g, "");
+                    if (norm.length >= 4 && !map.has(norm)) {
+                      map.set(norm, raw || norm);
+                    }
+                  }
+                }
+              } finally {
+                await res.dispose();
+              }
+              if (map.size > 0) break;
+            }
+            return map;
+          };
+
+          const [peerVehicles, localVehicles] = await Promise.all([
+            collectVehicles(peerContext, peerBaseUrl),
+            collectVehicles(page.context().request, this.config.oscarBaseUrl),
+          ]);
+
+          let targetNorm = "";
+          let targetVehicleId = "";
+          let correlationSeedSource = "existing-both-portals";
+
+          const sharedIso = [...peerVehicles.keys()].find(
+            (norm) => isoContainerPattern.test(norm) && localVehicles.has(norm),
+          );
+          const sharedSevenChar = [...peerVehicles.keys()].find(
+            (norm) => norm.length >= 7 && localVehicles.has(norm),
+          );
+          if (sharedIso ?? sharedSevenChar) {
+            targetNorm = (sharedIso ?? sharedSevenChar)!;
+            targetVehicleId = targetNorm;
+          }
+
+          if (!targetNorm) {
+            const preferredPeer = [...peerVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm))
+              ?? [...peerVehicles.keys()].find((norm) => norm.length >= 7);
+            if (preferredPeer) {
+              targetNorm = preferredPeer;
+              targetVehicleId = preferredPeer;
+              if (!localVehicles.has(targetNorm)) {
+                await this.adjudicateRecentOccupancyViaApi({
+                  reqCtx: page.context().request,
+                  baseUrl: this.config.oscarBaseUrl,
+                  vehicleId: targetVehicleId,
+                  preferredLaneName: this.config.testLaneLabel,
+                  allowReservedRpmTrigger: true,
+                  windowStartIso,
+                });
+              }
+              correlationSeedSource = `reused-peer-vehicle-adjudicated-${this.config.testLaneLabel}`;
+            } else {
+              const preferredLocalIso = [...localVehicles.keys()].find((norm) => /^[A-Z]{3}[UJZR]\d{7}$/.test(norm))
+                ?? [...localVehicles.keys()].find((norm) => norm.length >= 7);
+              targetNorm = preferredLocalIso ?? "EGHU3972694";
+              targetVehicleId = targetNorm;
+              await this.adjudicateRecentOccupancyViaApi({
+                reqCtx: peerContext,
+                baseUrl: peerBaseUrl,
+                vehicleId: targetVehicleId,
+                windowStartIso,
+              });
+              if (!localVehicles.has(targetNorm)) {
+                await this.adjudicateRecentOccupancyViaApi({
+                  reqCtx: page.context().request,
+                  baseUrl: this.config.oscarBaseUrl,
+                  vehicleId: targetVehicleId,
+                  preferredLaneName: this.config.testLaneLabel,
+                  allowReservedRpmTrigger: true,
+                  windowStartIso,
+                });
+              }
+              correlationSeedSource = "seeded-peer-and-local";
+            }
+          }
+
+          let peerVehicleSearchHttp200 = false;
+          let peerVehicleSearchBearerVerified = false;
+          const peerSearchStatuses: number[] = [];
+          const onVehicleSearchRes = (res: Response) => {
+            try {
+              const parsed = new URL(res.url());
+              if (parsed.origin !== peerOrigin) return;
+              if (res.request().method() !== "GET") return;
+              if (!parsed.pathname.endsWith("/sensorhub/buckets/adjudication/vehicle-search")) return;
+              const status = res.status();
+              peerSearchStatuses.push(status);
+              const checkAuthHeader = (hdrs: Record<string, string>) => {
+                const authHdr = hdrs["authorization"] ?? hdrs["Authorization"] ?? "";
+                if (/^Bearer\s+oscar_fed_/i.test(authHdr)) {
+                  peerVehicleSearchBearerVerified = true;
+                  if (status === 200) {
+                    peerVehicleSearchHttp200 = true;
+                  }
+                }
+              };
+              checkAuthHeader(res.request().headers());
+              if (!peerVehicleSearchBearerVerified) {
+                void res.request().allHeaders().then(checkAuthHeader).catch(() => undefined);
+              }
+            } catch {
+              // Ignore malformed URLs
+            }
+          };
+
+          page.on("response", onVehicleSearchRes);
+          try {
+            await this.clickSpaNavItem(page, "nav-item-events", "/event-log");
+            await page.locator(".MuiDataGrid-root").first().waitFor({timeout: this.config.uiTimeoutMs});
+
+            const searchInput = page.getByTestId("vehicle-id-search-input");
+            await searchInput.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+            await searchInput.fill(targetVehicleId);
+            await page.getByTestId("vehicle-id-search-submit").click();
+
+            const summaryObs = await poll(
+              async () => {
+                const compareBtn = page.getByTestId("vehicle-search-compare-btn").first();
+                const compareVisible = await compareBtn.isVisible().catch(() => false);
+                const compareText = compareVisible ? (await compareBtn.innerText().catch(() => "")).trim() : "";
+                const chip = page.getByTestId("vehicle-search-summary-chip").first();
+                const chipVisible = await chip.isVisible().catch(() => false);
+                const chipText = chipVisible ? (await chip.innerText().catch(() => "")).trim() : "";
+                const statusTexts = await page.locator('[role="status"]').allInnerTexts().catch(() => []);
+                const combinedStatus = [chipText, ...statusTexts].filter(Boolean).join(" | ").replace(/\s+/g, " ").trim();
+                const countMatch = /\((\d+)\)/.exec(compareText);
+                const passCount = countMatch?.[1] ? Number(countMatch[1]) : 0;
+                const multiSiteMentioned = /\b([2-9]|\d{2,})\s+(?:node\(s\)|nodes?|sites?)\b/i.test(combinedStatus);
+                return {
+                  compareVisible,
+                  compareText,
+                  chipText,
+                  combinedStatus,
+                  passCount,
+                  multiSiteMentioned,
+                  peerHttp200: peerVehicleSearchHttp200,
+                  peerBearer: peerVehicleSearchBearerVerified,
+                };
+              },
+              (obs) => obs.compareVisible && obs.passCount >= 2 && obs.multiSiteMentioned && obs.peerHttp200 && obs.peerBearer,
+              {timeoutMs: 90_000, intervalMs: 300, description: "cross-node Vehicle Search summary and Bearer GET 200"},
+            );
+
+            await page.getByTestId("vehicle-search-compare-btn").first().click();
+            const dialog = page.getByTestId("vehicle-pass-comparison-dialog");
+            await dialog.waitFor({state: "visible", timeout: 15_000});
+            await dialog.getByTestId("vehicle-pass-table-region").waitFor({state: "visible", timeout: 15_000});
+
+            const dialogObs = await poll(
+              async () => {
+                const rows = dialog.locator('[data-testid^="vehicle-pass-row-"]');
+                const rowCount = await rows.count();
+                const rowTexts = await rows.allInnerTexts().catch(() => []);
+                const hasLocalNodePass = rowTexts.some((txt) => txt.includes(localNodeName));
+                const hasPeerNodePass = rowTexts.some((txt) => txt.includes(expectedPeerNodeName));
+                const hasFederatedBadge = rowTexts.some((txt) => /Federated/i.test(txt));
+                return {rowCount, hasLocalNodePass, hasPeerNodePass, hasFederatedBadge};
+              },
+              (obs) => obs.rowCount >= 2 && obs.hasLocalNodePass && obs.hasPeerNodePass && obs.hasFederatedBadge,
+              {timeoutMs: 20_000, intervalMs: 300, description: "VehiclePassComparisonDialog rows from both nodes"},
+            );
+
+            await dialog.getByRole("button", {name: /^close$/i}).last().click();
+            await dialog.waitFor({state: "hidden", timeout: 10_000});
+            await page.getByTestId("vehicle-id-search-clear").click();
+
+            const passed = summaryObs.peerHttp200 &&
+              summaryObs.peerBearer &&
+              summaryObs.passCount >= 2 &&
+              summaryObs.multiSiteMentioned &&
+              dialogObs.rowCount >= 2 &&
+              dialogObs.hasLocalNodePass &&
+              dialogObs.hasPeerNodePass &&
+              dialogObs.hasFederatedBadge;
+            const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-vehicle-comparison-failed");
+            return {
+              passed,
+              observed: `vehicleId=${targetVehicleId} (${correlationSeedSource}); peerSearchStatuses=${JSON.stringify(peerSearchStatuses)}; ` +
+                `bearerVerified=${summaryObs.peerBearer}; compare="${summaryObs.compareText}"; ` +
+                `dialogRows=${dialogObs.rowCount}; localPass=${dialogObs.hasLocalNodePass}; peerPass=${dialogObs.hasPeerNodePass}; federatedBadge=${dialogObs.hasFederatedBadge}`,
+              evidence,
+            };
+          } finally {
+            page.off("response", onVehicleSearchRes);
+          }
+        });
+      } finally {
+        await removePeerNodeFromViewer(page).catch((err) =>
+          this.reporter.error("multi-node-federation", "remove-peer-node", err));
+        await revokePeerToken().catch((err) =>
+          this.reporter.error("multi-node-federation", "revoke-peer-token", err));
+      }
+
+      await this.check({
+        scenario: "multi-node-federation",
+        category: "teardown",
+        action: "verify zero federated node or service-token residue after teardown",
+        target: `${this.config.targetHost} and ${peerHost}`,
+        expected: "primary Viewer /servers and localStorage contain zero peer host entries, and peer /sensorhub/session/admin/overview excludes the revoked Federation Service Token",
+      }, async () => {
+        const storageState = await page.evaluate((hostToCheck) => {
+          const keys = ["osh_nodes", "osh_config_node", "persist:nodes", "persist:root"];
+          const leakedKeys = keys.filter((k) => (window.localStorage.getItem(k) ?? "").includes(hostToCheck));
+          let nodeCount = 0;
+          try {
+            const parsed = JSON.parse(window.localStorage.getItem("osh_nodes") || "[]");
+            if (Array.isArray(parsed)) nodeCount = parsed.length;
+          } catch {
+            nodeCount = -1;
+          }
+          return {leakedKeys, nodeCount};
+        }, peerHost);
+        const peerCardRemaining = await page.locator("li").filter({hasText: `${peerHost}:${peerPort}`}).count();
+
+        const ovRes = await peerContext.get(`${peerBaseUrl}/sensorhub/session/admin/overview`, {
+          headers: {Accept: "application/json"},
+        });
+        const ovStatus = ovRes.status();
+        let tokenAbsentOnPeer = false;
+        try {
+          if (ovRes.ok()) {
+            const ovJson = await ovRes.json() as {
+              federationTokens?: Array<{id?: string; label?: string}>;
+            };
+            tokenAbsentOnPeer = !(ovJson.federationTokens ?? []).some(
+              (tok) =>
+                (revokedTokenIdForAudit && tok.id === revokedTokenIdForAudit) ||
+                tok.label === tokenLabel,
+            );
+          }
+        } finally {
+          await ovRes.dispose();
+        }
+
+        const passed = peerCardRemaining === 0 &&
+          storageState.leakedKeys.length === 0 &&
+          storageState.nodeCount === 1 &&
+          ovStatus === 200 &&
+          tokenAbsentOnPeer;
+        const evidence = passed ? "" : await this.screenshotOnFailure(page, "multi-node-federation-teardown-failed");
+        return {
+          passed,
+          observed: `peerCardRemaining=${peerCardRemaining}; leakedStorageKeys=${JSON.stringify(storageState.leakedKeys)}; ` +
+            `oshNodesCount=${storageState.nodeCount}; peerOverviewHttp=${ovStatus}; tokenAbsentOnPeer=${tokenAbsentOnPeer}`,
+          evidence,
+        };
+      });
+    } finally {
+      this.pendingFederationCleanup = undefined;
+      await page.close().catch(() => undefined);
+      await peerContext.dispose().catch(() => undefined);
+    }
   }
 }

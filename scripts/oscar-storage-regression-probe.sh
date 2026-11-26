@@ -1713,7 +1713,7 @@ case $action in
   platform)
     expected_release=3.11.0
     configured_release=$(env_value OSCAR_VERSION missing)
-    if [[ $configured_release =~ ^3\.11\.[0-9]+$ ]]; then
+    if [[ $configured_release =~ ^3\.(11|12)\.[0-9]+(-[A-Za-z0-9._-]+)?$ ]]; then
       expected_release="$configured_release"
     fi
     template_release=$(awk -F= '$1 == "OSCAR_VERSION" { print substr($0, index($0, "=") + 1); exit }' .env.example)
@@ -3416,7 +3416,8 @@ EOF
         'nonSealedGenerationCount',count(*) FILTER (WHERE state<>'SEALED'),
         'generationRowCount',coalesce(sum(row_count),0))
       FROM oscar_archive_generation
-      WHERE store_key='$store_key' AND id_scope=$id_scope AND profile='RAW_GATED'
+      WHERE store_key='$store_key' AND id_scope=$id_scope
+        AND profile IN ('RAW_GATED','RAW_EVENTS','RAW_TELEMETRY')
         AND window_start='$window_start'::timestamptz
         AND window_end='$window_end'::timestamptz;")
     [[ $window_generations == \{* ]] || fail 'Could not inspect every stage-window generation.'
@@ -4447,9 +4448,9 @@ SQL
     [[ $run =~ ^[A-Za-z0-9_]{1,96}$ ]] || fail 'Restore-drill run ID must be SQL-identifier safe.'
     [[ $confirmation == "$run:DESTRUCTIVE-RESTORE" ]] ||
       fail 'Restore drill is destructive and requires the exact per-run confirmation token.'
-    [[ $(env_value OSCAR_VERSION missing) =~ ^3\.11\.[0-9]+$ &&
+    [[ $(env_value OSCAR_VERSION missing) =~ ^3\.(11|12)\.[0-9]+(-[A-Za-z0-9._-]+)?$ &&
        $(env_value OSCAR_BACKUP_MODE disabled) == single ]] ||
-      fail 'Restore drill requires OSCAR 3.11.x with OSCAR_BACKUP_MODE=single.'
+      fail 'Restore drill requires OSCAR 3.11.x or 3.12.x with OSCAR_BACKUP_MODE=single.'
     for expected in "$expected_archive" "$expected_backup"; do
       [[ $expected == /* && $expected != / && $expected =~ ^/[A-Za-z0-9._/-]+$ ]] ||
         fail 'Restore drill requires two canonical acknowledged storage paths.'
@@ -4631,6 +4632,98 @@ SQL
       d AS (DELETE FROM obs o USING f WHERE o.id=ANY(f.cold_ids) OR o.id=f.hot_id RETURNING 1)
       SELECT count(*) FROM d;")
     printf '{"fixtureRowsDeleted":%s}\n' "$deleted"
+    ;;
+
+  compaction-health)
+    json_query "WITH event_names(name) AS (
+        VALUES ('occupancy'),('alarm'),('adjudication'),('report'),('vehicleOcr'),
+               ('emlAnalysis'),('tamper'),('siteStatistics'),('nationalSummary')
+      ),
+      legacy_event_names(name) AS (
+        SELECT name FROM event_names
+        UNION ALL
+        VALUES ('dailyFile'),('connectionStatus'),('occupancyStatus')
+      ),
+      tier_counts AS (
+        SELECT
+          count(*) FILTER (WHERE profile='RAW_GATED' AND state IN ('ACTIVE','SEALED')) raw_gated,
+          count(*) FILTER (WHERE profile='RAW_EVENTS' AND state IN ('ACTIVE','SEALED')) raw_events,
+          count(*) FILTER (WHERE profile='RAW_TELEMETRY' AND state IN ('ACTIVE','SEALED')) raw_telemetry,
+          count(*) FILTER (WHERE profile='DAILY_EVENTS' AND state IN ('ACTIVE','SEALED')) daily_events,
+          count(*) FILTER (WHERE profile='DAILY_TELEMETRY' AND state IN ('ACTIVE','SEALED')) daily_telemetry,
+          count(*) FILTER (WHERE profile='MONTHLY_EVENTS' AND state IN ('ACTIVE','SEALED')) monthly_events,
+          count(*) FILTER (WHERE state='DELETING') deleting_generations,
+          count(*) FILTER (WHERE profile IN ('DAILY_EVENTS','DAILY_TELEMETRY','MONTHLY_EVENTS')
+            AND state IN ('ACTIVE','SEALED')
+            AND (state <> 'SEALED' OR NOT parity_verified OR row_count <= 0)) invalid_compacted,
+          count(*) FILTER (WHERE state='DELETING' AND row_count <> 0
+            AND NOT EXISTS (SELECT 1 FROM oscar_deletion_plan_item dpi WHERE dpi.generation_id=id)) nonzero_deleting_rows
+        FROM oscar_archive_generation
+      ),
+      summary_gaps AS (
+        SELECT count(*) count
+        FROM oscar_archive_schema s
+        JOIN oscar_archive_generation g ON g.id=s.generation_id
+        WHERE g.profile IN ('RAW_EVENTS','RAW_TELEMETRY','DAILY_EVENTS','DAILY_TELEMETRY','MONTHLY_EVENTS')
+          AND g.state IN ('ACTIVE','SEALED')
+          AND NOT s.summary_populated
+      ),
+      telemetry_bloom AS (
+        SELECT count(*) count
+        FROM oscar_archive_schema s
+        JOIN oscar_archive_generation g ON g.id=s.generation_id
+        WHERE g.profile='RAW_TELEMETRY'
+          AND g.state IN ('ACTIVE','SEALED')
+          AND s.ocr_bloom IS NOT NULL
+      ),
+      separation AS (
+        SELECT count(*) count
+        FROM oscar_archive_schema s
+        JOIN oscar_archive_generation g ON g.id=s.generation_id
+        JOIN obs_datastreams d ON d.id=s.datastream_id
+        WHERE g.state IN ('ACTIVE','SEALED')
+          AND (
+            (g.profile='RAW_EVENTS'
+              AND coalesce(d.data->>'outputName','') NOT IN (SELECT name FROM event_names))
+            OR
+            (g.profile IN ('RAW_TELEMETRY','DAILY_TELEMETRY')
+              AND coalesce(d.data->>'outputName','') IN (SELECT name FROM event_names))
+            OR
+            (g.profile IN ('DAILY_EVENTS','MONTHLY_EVENTS')
+              AND coalesce(d.data->>'outputName','') NOT IN (SELECT name FROM legacy_event_names))
+          )
+      ),
+      orphan_refs AS (
+        SELECT
+          (SELECT count(*) FROM oscar_obs_latest l
+            LEFT JOIN oscar_archive_generation g ON g.id=l.generation_id
+            WHERE g.id IS NULL OR g.state NOT IN ('ACTIVE','SEALED')) +
+          (SELECT count(*) FROM oscar_event_locator el
+            LEFT JOIN oscar_archive_generation g ON g.id=el.generation_id
+            WHERE el.generation_id IS NOT NULL AND (g.id IS NULL OR g.state NOT IN ('ACTIVE','SEALED'))) +
+          (SELECT count(*) FROM oscar_obs_overlay ov
+            LEFT JOIN oscar_archive_generation g ON g.id=ov.generation_id
+            WHERE g.id IS NULL OR g.state NOT IN ('ACTIVE','SEALED')) +
+          (SELECT count(*) FROM oscar_tombstone tb
+            LEFT JOIN oscar_archive_generation g ON g.id=tb.generation_id
+            WHERE tb.subject_type='OBSERVATION' AND tb.generation_id IS NOT NULL
+              AND (g.id IS NULL OR g.state NOT IN ('ACTIVE','SEALED'))) AS count
+      )
+      SELECT json_build_object(
+        'rawGatedGenerations', tier_counts.raw_gated,
+        'rawEventsGenerations', tier_counts.raw_events,
+        'rawTelemetryGenerations', tier_counts.raw_telemetry,
+        'dailyEventsGenerations', tier_counts.daily_events,
+        'dailyTelemetryGenerations', tier_counts.daily_telemetry,
+        'monthlyEventsGenerations', tier_counts.monthly_events,
+        'deletingGenerations', tier_counts.deleting_generations,
+        'invalidCompactedGenerations', tier_counts.invalid_compacted,
+        'nonZeroDeletingRowCount', tier_counts.nonzero_deleting_rows,
+        'unpopulatedCompactedSummaries', summary_gaps.count,
+        'telemetryOcrBloomViolations', telemetry_bloom.count,
+        'streamSeparationViolations', separation.count,
+        'orphanCatalogReferenceCount', orphan_refs.count)
+      FROM tier_counts, summary_gaps, telemetry_bloom, separation, orphan_refs;"
     ;;
 
   *) fail "Unknown storage probe action: $action" ;;

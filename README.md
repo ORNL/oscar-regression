@@ -130,6 +130,16 @@ source review before the suite can certify that version.
   connectivity, Status of Health UI configuration, `AUTO` intercept arming (`R1=1, R2=1`),
   manual Gamma + Sound / Neutron Light / Pass-Through controls, live RPM alarm pulse
   triggering, and guaranteed configuration restoration in `finally`
+- live two-node Bearer-token federation and cross-node vehicle correlation
+  (`multi-node-federation`, gated by `FEDERATION_WORKFLOW` and `OSCAR_FEDERATED_PEER_BASE_URL`),
+  minting a short-lived `oscar_fed_...` Federation Service Token on the peer portal,
+  connecting the peer via `/servers?auth=bearer`, verifying unified multi-site rows on
+  `/national-view`, correlating cross-portal passes in `VehiclePassComparisonDialog`,
+  and revoking both the `/servers` node and the peer service token in `finally`
+- OSCAR 3.12+ opt-in Custom Dashboards workspace (`/dashboards`) with intact canonical
+  navbar routes and zero `localStorage` layout residue, `MobileDetectorSystem` module
+  provider availability in SensorHub Admin without modifying `config.json`, and the
+  26-stream `PARQUET_PRIMARY` archive allowlist
 
 See [docs/COVERAGE.md](docs/COVERAGE.md) for the detailed matrix and intentional
 exclusions.
@@ -286,7 +296,7 @@ adjudication endurance testing, run:
 
 Selectable `--scenario <name[,name...]>` identifiers:
 - **Smoke phase (`14`):** `preflight`, `viewer-navigation`, `map-national-servers`, `sensorhub-admin`, `status-of-health`, `dashboard-health`, `lane-video`, `event-filtering`, `operational-views`, `reporting`, `alarm-transfer`, `alarm-transfer-camera`, `runtime-extensions`, `storage-health`.
-- **Full phase (`10`, wrapped by `reserved-lane-setup`):** `rpm-connection`, `rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `eml-auto-adjudication`, `vehicle-ocr`, `extended-occupancy`, `adjudication-report`, `storage-lifecycle`.
+- **Full phase (`14`, wrapped by `reserved-lane-setup`):** `rpm-connection`, `rpm-faults`, `rpm-alarms`, `event-uuid`, `adjudication`, `eml-auto-adjudication`, `vehicle-ocr`, `cargo-uff`, `training-sandbox`, `lane-webrelay`, `multi-node-federation`, `extended-occupancy`, `adjudication-report`, `storage-lifecycle`.
 
 ## Configuration
 
@@ -307,6 +317,8 @@ Start from [.env.example](.env.example). Required values are:
 | `SPECTROSCOPIC_WORKFLOW` | `auto` (default) exercises real secondary-inspection `.spe` / `.n42` upload, OSCAR `N42 Report`, Sandia WebID, and operator isotope selection when local files exist in `spectroscopic-files/` or `OSCAR_SPECTRA_DIR`; `required` fails if no spectra are supplied; `disabled` skips |
 | `OSCAR_SPECTRA_DIR` | optional path to an external folder of `.spe` / `.n42` secondary-inspection files (defaults to `<repo>/spectroscopic-files`; never commit spectroscopic data to Git — see [`spectroscopic-files/README.md`](spectroscopic-files/README.md)) |
 | `VEHICLE_OCR_WORKFLOW` / `EXPECTED_VEHICLE_OCR_CONTAINER` | `auto` (default), `required`, or `disabled` for asynchronous container/plate OCR auto-fill, Multi-Pass Vehicle Comparison, Linked Adjudication, and `VEHICLE_INCIDENT` report verification (`EXPECTED_VEHICLE_OCR_CONTAINER=EGHU3972694` or `ANY`) |
+| `FEDERATION_WORKFLOW` / `OSCAR_FEDERATED_PEER_BASE_URL` | `auto` (default), `required`, or `disabled` for live two-node Bearer Federation Service Token pairing, unified `/national-view`, Cross-Node Vehicle Search (`VehiclePassComparisonDialog`), and zero-residue teardown (`OSCAR_FEDERATED_PEER_USERNAME` / `OSCAR_FEDERATED_PEER_PASSWORD` default to `OSCAR_USERNAME` / `OSCAR_PASSWORD` and are redacted in reports) |
+| `STORAGE_EXPECTED_RELEASE` | expected OSCAR release series (`3.11.<patch>` or `3.12.<patch>`, e.g., `3.11.15` or `3.12.0`) |
 | `STORAGE_WORKFLOW` | `required` (default), explicit legacy `auto`, or `disabled` for the OSCAR 3.11.0 storage profile |
 | `OSCAR_BACKUP_MODE` | exact product policy to certify: `disabled` (default) or optional `single` |
 | `STORAGE_BACKUP_WORKFLOW` | `required` validates the selected mode, `auto` follows configured coverage, and `disabled` skips its mode-specific gate |

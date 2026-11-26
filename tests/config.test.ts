@@ -8,7 +8,15 @@ import {
   loadConfig,
   MIN_EXTENDED_OCCUPANCY_SECONDS,
   requiresRemoteSuiteLease,
+  suiteReporterSecrets,
 } from "../src/config.js";
+import {RunReporter} from "../src/reporter.js";
+import {
+  expectedParquetPrimaryOutputNames,
+  PARQUET_PRIMARY_OUTPUT_NAMES_3_11,
+  PARQUET_PRIMARY_OUTPUT_NAMES_3_12,
+  parquetPrimaryOutputNamesMatchRelease,
+} from "../src/scenarios.js";
 
 const baseEnvironment = {
   OSCAR_BASE_URL: "https://192.0.2.10",
@@ -579,5 +587,191 @@ test("configuration supports STORAGE_EXPECTED_RELEASE=3.11.15", () => {
   withEnvironment({...baseEnvironment, STORAGE_EXPECTED_RELEASE: "3.11.15"}, () => {
     const cfg = loadConfig(["--profile", "smoke"]);
     assert.equal(cfg.storageExpectedRelease, "3.11.15");
+    assert.equal(expectedParquetPrimaryOutputNames(cfg.storageExpectedRelease).length, 22);
+    assert.equal(PARQUET_PRIMARY_OUTPUT_NAMES_3_11.at(-1), "vehicleOcr");
+    assert.equal(
+      parquetPrimaryOutputNamesMatchRelease(
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_11,
+        cfg.storageExpectedRelease,
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_11,
+      ),
+      true,
+    );
+    assert.equal(
+      parquetPrimaryOutputNamesMatchRelease(
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_12,
+        cfg.storageExpectedRelease,
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_12,
+      ),
+      true,
+    );
   });
+});
+
+test("configuration supports STORAGE_EXPECTED_RELEASE=3.12.0 and enforces 26-stream PARQUET_PRIMARY allowlist", () => {
+  withEnvironment({...baseEnvironment, STORAGE_EXPECTED_RELEASE: "3.12.0"}, () => {
+    const cfg = loadConfig(["--profile", "smoke"]);
+    assert.equal(cfg.storageExpectedRelease, "3.12.0");
+    const expected = expectedParquetPrimaryOutputNames(cfg.storageExpectedRelease);
+    assert.equal(expected.length, 26);
+    assert.deepEqual(expected.slice(0, 22), PARQUET_PRIMARY_OUTPUT_NAMES_3_11);
+    assert.deepEqual(expected.slice(22), [
+      "location",
+      "alarm",
+      "KromekDetectorRadiometricsV1Report",
+      "KromekSerialRadiometricStatusReport",
+    ]);
+    assert.equal(
+      parquetPrimaryOutputNamesMatchRelease(
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_12,
+        cfg.storageExpectedRelease,
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_12,
+      ),
+      true,
+    );
+    assert.equal(
+      parquetPrimaryOutputNamesMatchRelease(
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_11,
+        cfg.storageExpectedRelease,
+        PARQUET_PRIMARY_OUTPUT_NAMES_3_11,
+      ),
+      false,
+    );
+  });
+
+  for (const invalid of ["3.10.0", "3.13.0", "3.12"]) {
+    withEnvironment({...baseEnvironment, STORAGE_EXPECTED_RELEASE: invalid}, () => {
+      assert.throws(() => loadConfig([]), /STORAGE_EXPECTED_RELEASE must match/);
+    });
+  }
+});
+
+test("configuration validates FEDERATION_WORKFLOW, peer URL constraints, credential fallback, and secret redaction", () => {
+  withEnvironment(baseEnvironment, () => {
+    const cfg = loadConfig(["--profile", "smoke"]);
+    assert.equal(cfg.federationWorkflow, "auto");
+    assert.equal(cfg.oscarFederatedPeerBaseUrl, undefined);
+    assert.equal(cfg.oscarFederatedPeerUsername, undefined);
+    assert.equal(cfg.oscarFederatedPeerPassword, undefined);
+  });
+
+  withEnvironment({...baseEnvironment, FEDERATION_WORKFLOW: "required"}, () => {
+    assert.throws(
+      () => loadConfig(["--profile", "full"]),
+      /FEDERATION_WORKFLOW=required requires OSCAR_FEDERATED_PEER_BASE_URL/,
+    );
+  });
+
+  withEnvironment({
+    ...baseEnvironment,
+    OSCAR_FEDERATED_PEER_BASE_URL: "http://peer-portal.example.org",
+  }, () => {
+    assert.throws(() => loadConfig([]), /OSCAR_FEDERATED_PEER_BASE_URL must use https/);
+  });
+
+  withEnvironment({
+    ...baseEnvironment,
+    OSCAR_FEDERATED_PEER_BASE_URL: "https://operator:secret@peer-portal.example.org",
+  }, () => {
+    assert.throws(
+      () => loadConfig([]),
+      /OSCAR_FEDERATED_PEER_BASE_URL must not include embedded credentials/,
+    );
+  });
+
+  for (const sameOriginUrl of ["https://192.0.2.10", "https://192.0.2.10:443/"]) {
+    withEnvironment({
+      ...baseEnvironment,
+      OSCAR_FEDERATED_PEER_BASE_URL: sameOriginUrl,
+    }, () => {
+      assert.throws(
+        () => loadConfig([]),
+        /OSCAR_FEDERATED_PEER_BASE_URL must not have the same origin as OSCAR_BASE_URL/,
+      );
+    });
+  }
+
+  withEnvironment({
+    ...baseEnvironment,
+    OSCAR_FEDERATED_PEER_BASE_URL: "https://peer-portal.example.org/",
+  }, () => {
+    const cfg = loadConfig(["--profile", "full", "--scenario", "multi-node-federation"]);
+    assert.equal(cfg.oscarFederatedPeerBaseUrl, "https://peer-portal.example.org");
+    assert.equal(cfg.oscarFederatedPeerUsername, "admin");
+    assert.equal(cfg.oscarFederatedPeerPassword, "test-only");
+    assert.equal(requiresRemoteSuiteLease(cfg), true);
+  });
+
+  const tempResults = mkdtempSync(join(tmpdir(), "oscar-fed-redact-"));
+  try {
+    withEnvironment({
+      ...baseEnvironment,
+      FEDERATION_WORKFLOW: "required",
+      OSCAR_FEDERATED_PEER_BASE_URL: "https://198.51.100.20",
+      OSCAR_FEDERATED_PEER_USERNAME: "peer-admin",
+      OSCAR_FEDERATED_PEER_PASSWORD: "peer-ultra-secret-pw",
+    }, () => {
+      const cfg = loadConfig(["--profile", "full", "--scenario", "multi-node-federation"]);
+      assert.equal(cfg.federationWorkflow, "required");
+      assert.equal(cfg.oscarFederatedPeerBaseUrl, "https://198.51.100.20");
+      assert.equal(cfg.oscarFederatedPeerUsername, "peer-admin");
+      assert.equal(cfg.oscarFederatedPeerPassword, "peer-ultra-secret-pw");
+
+      const secrets = suiteReporterSecrets(cfg);
+      assert.ok(secrets.includes("peer-ultra-secret-pw"));
+      assert.ok(secrets.includes("test-only"));
+
+      const reporter = new RunReporter("fed-redact-check", tempResults, secrets, {
+        suiteVersion: "1.1.0",
+        suiteGitCommit: "0".repeat(40),
+        profile: cfg.profile,
+        scenarioFilter: [...cfg.scenarioFilter],
+        nodeVersion: process.version,
+        platform: process.platform,
+        architecture: process.arch,
+        browser: "playwright-managed-chromium",
+        oscarBaseUrl: cfg.oscarBaseUrl,
+        oscarBuildLabel: "3.12.0-test",
+        rpmEmulatorUrl: cfg.rpmEmulatorUrl,
+        emulatorBuildLabel: "test",
+        testRpmId: cfg.testRpmId,
+        testLaneLabel: cfg.testLaneLabel,
+        expectedLaneCount: cfg.expectedLaneCount,
+        expectedCameraCount: cfg.expectedCameraCount,
+        operationalViewWorkflow: cfg.operationalViewWorkflow,
+        oscarLaneConfigPath: cfg.oscarLaneConfigPath,
+        eventUuidWorkflow: cfg.eventUuidWorkflow,
+        alarmTransferCameraWorkflow: cfg.alarmTransferCameraWorkflow,
+        federationWorkflow: cfg.federationWorkflow,
+        federationPeerConfigured: Boolean(cfg.oscarFederatedPeerBaseUrl),
+        oscarFederatedPeerBaseUrl: cfg.oscarFederatedPeerBaseUrl,
+        storageWorkflow: cfg.storageWorkflow,
+        storageExpectedRelease: cfg.storageExpectedRelease,
+        storageBackupWorkflow: cfg.storageBackupWorkflow,
+        storageBackupMode: cfg.storageBackupMode,
+        storageProbeTimeoutMs: cfg.storageProbeTimeoutMs,
+        storageRestoreProbeTimeoutMs: cfg.storageRestoreProbeTimeoutMs,
+        remoteMetricsExpected: false,
+      });
+      reporter.outcome(
+        "multi-node-federation",
+        "federation",
+        "probe redaction",
+        "https://198.51.100.20",
+        "redacts peer password and bearer tokens",
+        "pw=peer-ultra-secret-pw hdr=Authorization: Bearer oscar_fed_abcdef123456_secretToken99",
+        "correct",
+        5,
+      );
+      const finalized = reporter.finalize(new Date());
+      const runJsonText = readFileSync(join(finalized.outputDir, "run.json"), "utf8");
+      const csvText = readFileSync(join(finalized.outputDir, "functional-results.csv"), "utf8");
+      assert.ok(!runJsonText.includes("peer-ultra-secret-pw"));
+      assert.ok(!csvText.includes("peer-ultra-secret-pw"));
+      assert.ok(!csvText.includes("secretToken99"));
+      assert.match(csvText, /\[REDACTED\]/);
+    });
+  } finally {
+    rmSync(tempResults, {recursive: true, force: true});
+  }
 });

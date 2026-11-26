@@ -6,7 +6,7 @@ export type CapabilityMode = "auto" | "required" | "disabled";
 
 export type BackupMode = "disabled" | "single";
 
-export type StorageExpectedRelease = `3.11.${number}`;
+export type StorageExpectedRelease = `3.11.${number}` | `3.12.${number}`;
 
 export type ResultStatus = "correct" | "incorrect" | "skipped";
 
@@ -59,6 +59,10 @@ export interface SuiteConfig {
   cargoUffSmbPassword?: string;
   trainingSandboxWorkflow: CapabilityMode;
   laneWebRelayWorkflow: CapabilityMode;
+  federationWorkflow: CapabilityMode;
+  oscarFederatedPeerBaseUrl?: string;
+  oscarFederatedPeerUsername?: string;
+  oscarFederatedPeerPassword?: string;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: StorageExpectedRelease;
   storageBackupWorkflow: CapabilityMode;
@@ -232,6 +236,9 @@ export interface RunMetadata {
   vehicleOcrWorkflow?: CapabilityMode;
   cargoUffWorkflow?: CapabilityMode;
   cargoUffSmbConfigured?: boolean;
+  federationWorkflow?: CapabilityMode;
+  federationPeerConfigured?: boolean;
+  oscarFederatedPeerBaseUrl?: string;
   storageWorkflow: CapabilityMode;
   storageExpectedRelease: StorageExpectedRelease;
   storageBackupWorkflow: CapabilityMode;
