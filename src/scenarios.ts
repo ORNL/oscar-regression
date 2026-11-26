@@ -5557,8 +5557,17 @@ export class RegressionScenarios {
       ]);
       const uuidValue = page.getByTestId("event-uuid-value");
       await uuidValue.waitFor({timeout: this.config.eventTimeoutMs});
-      const eventId = (await uuidValue.innerText()).trim();
-      const url = new URL(page.url());
+      const hydrateDeadline = Date.now() + Math.min(this.config.eventTimeoutMs, 15_000);
+      let eventId = (await uuidValue.innerText()).trim();
+      let url = new URL(page.url());
+      while (
+        Date.now() < hydrateDeadline &&
+        (!isPublicObservationId(eventId) || url.searchParams.get("eventId") !== eventId)
+      ) {
+        await sleep(150);
+        eventId = (await uuidValue.innerText()).trim();
+        url = new URL(page.url());
+      }
       const alreadyResolved = this.resolvedAlarmEventIds.has(eventId);
       const passed = isPublicObservationId(eventId) && url.searchParams.get("eventId") === eventId &&
         !alreadyResolved;
