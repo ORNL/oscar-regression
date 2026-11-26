@@ -8294,9 +8294,10 @@ export class RegressionScenarios {
       }, async () => {
         let candidates: OcrObservationRecord[] = [];
         let best: OcrObservationRecord | undefined;
-        // Multi-scene container-transit RTSP loops contain ~90s non-box-container segments between
-        // ISO 6346 container passes; allow up to 6 phase-shifted 12s alarm triggers (~180s span).
-        for (let passAttempt = 0; passAttempt < 6; passAttempt++) {
+        // Multi-scene container-transit RTSP loops can contain >3-minute non-box-container/plate
+        // segments between ISO 6346 container passes; allow up to 10 phase-shifted alarm triggers
+        // (exiting immediately on the first valid container match).
+        for (let passAttempt = 0; passAttempt < 10; passAttempt++) {
           if (passAttempt > 0) {
             await sleep(3_500);
             const nextTrigger = await this.triggerAlarm("gamma", "vehicle-ocr");
@@ -8319,7 +8320,7 @@ export class RegressionScenarios {
             () => fetchMatchingOcrObservationsFor(triggeredEventIds),
             items => items.some(c => c.idType === "container" && c.checksumValid && matchesExpectedContainer(c.normalizedValue)),
             {
-              timeoutMs: passAttempt < 5 ? 20_000 : Math.max(this.config.eventTimeoutMs, 45_000),
+              timeoutMs: passAttempt < 9 ? 20_000 : Math.max(this.config.eventTimeoutMs, 45_000),
               intervalMs: 1_000,
               description: `vehicleOcr ISO 6346 container observation (${expectedContainer}) for occupancies [${[...triggeredEventIds].join(",")}]`,
             },
@@ -8333,7 +8334,10 @@ export class RegressionScenarios {
             eventId = validContainer.occupancyObsId;
             break;
           }
-          best = candidates[0] ?? best;
+          if (candidates[0]) {
+            best = candidates[0];
+            eventId = candidates[0].occupancyObsId;
+          }
         }
 
         if (!best) {
