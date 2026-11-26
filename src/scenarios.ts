@@ -7062,17 +7062,22 @@ export class RegressionScenarios {
             ).catch(() => page.locator("body").innerText());
 
             let specPassCount = 0;
-            try {
-              const vSearchRes = await page.context().request.get(
-                `${this.config.oscarBaseUrl}/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(specVehicleId)}&matchMode=equals`,
-              );
-              if (vSearchRes.ok()) {
-                const vJson = (await vSearchRes.json()) as {summary?: {spectroscopicPasses?: unknown}};
-                specPassCount = Number(vJson.summary?.spectroscopicPasses ?? 0);
+            const specSearchStartIso = new Date(Date.now() - 3_600_000).toISOString();
+            for (let attempt = 0; attempt < 2 && specPassCount < 1; attempt += 1) {
+              try {
+                const vSearchRes = await page.context().request.get(
+                  `${this.config.oscarBaseUrl}/sensorhub/buckets/adjudication/vehicle-search?vehicleId=${encodeURIComponent(specVehicleId)}&matchMode=equals&startTime=${encodeURIComponent(specSearchStartIso)}`,
+                );
+                if (vSearchRes.ok()) {
+                  const vJson = (await vSearchRes.json()) as {summary?: {spectroscopicPasses?: unknown}};
+                  specPassCount = Number(vJson.summary?.spectroscopicPasses ?? 0);
+                } else if (vSearchRes.status() === 503 && attempt === 0) {
+                  await sleep(1_000);
+                }
+                await vSearchRes.dispose();
+              } catch {
+                specPassCount = 0;
               }
-              await vSearchRes.dispose();
-            } catch {
-              specPassCount = 0;
             }
 
             const passedSpec = autoPretoggledCompleted && n42Visible && n42Persisted && specPassCount >= 1 &&
