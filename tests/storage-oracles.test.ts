@@ -391,6 +391,36 @@ test("platform/metric contracts preserve PostgreSQL, archive, and batch counters
     {...platform, archiveMarker: {...platform.archiveMarker, initializedAt: "not-an-instant"}},
     "3.9.2",
   ), false);
+  const upgraded3121 = {
+    ...platform,
+    expectedRelease: "3.12.1",
+    configuredRelease: "3.12.1",
+    templateRelease: "3.12.1",
+    appImage: {...platform.appImage, reference: "oscar:3.12.1", versionLabel: "3.12.1"},
+    postgisImage: {
+      ...platform.postgisImage,
+      reference: "oscar-postgis:3.12.1",
+      versionLabel: "3.12.1",
+      storageProfileLabel: "3.12.1",
+    },
+    gatewayImage: {
+      ...platform.gatewayImage,
+      reference: "nginx/nginx-unprivileged:1.30.7-alpine",
+      versionLabel: "1.30.7-alpine",
+    },
+  };
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...upgraded3121, archiveMarker: {...platform.archiveMarker, version: "3.11.0", exact: true}},
+    "3.12.1",
+  ), true, "3.12.x in-place upgrade from a 3.11.x same-profile cluster must pass");
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...upgraded3121, archiveMarker: {...platform.archiveMarker, version: "3.12.0", exact: true}},
+    "3.12.1",
+  ), true, "3.12.x in-place upgrade from a 3.12.0 same-profile cluster must pass");
+  assert.equal(storagePlatformHasExactReleaseIdentity(
+    {...upgraded3121, archiveMarker: {...platform.archiveMarker, version: "3.10.0", exact: true}},
+    "3.12.1",
+  ), false, "pre-3.11 storage-profile marker must remain rejected on 3.12.x");
   assert.equal(storagePlatformHasExactReleaseIdentity(
     {...platform, storageRoots: {...platform.storageRoots,
       backup: {...platform.storageRoots.backup!, rootKind: "archive"}}},

@@ -2127,7 +2127,9 @@ case $action in
       marker_checksums=$(printf '%s\n' "$marker_text" | awk -F= '$1=="data_checksums" {print substr($0,index($0,"=")+1); exit}')
       marker_initialized=$(printf '%s\n' "$marker_text" | awk -F= '$1=="initialized_at" {print substr($0,index($0,"=")+1); exit}')
       if [[ $marker_lines == 4 && $marker_format == oscar-storage-profile &&
-            ( $marker_version == "$expected_release" || ( $expected_release =~ ^3\.11\.[0-9]+$ && $marker_version =~ ^3\.11\.[0-9]+$ ) ) &&
+            ( $marker_version == "$expected_release" ||
+              ( $expected_release =~ ^3\.11\.[0-9]+$ && $marker_version =~ ^3\.11\.[0-9]+$ ) ||
+              ( $expected_release =~ ^3\.12\.[0-9]+$ && $marker_version =~ ^3\.(11|12)\.[0-9]+$ ) ) &&
             $marker_checksums == on &&
             $marker_initialized =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
         marker_exact=true
