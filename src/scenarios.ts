@@ -12141,7 +12141,7 @@ export class RegressionScenarios {
     const findRecentObsId = async (): Promise<string> => {
       const endIso = new Date(Date.now() + 60_000).toISOString();
       const obsRes = await reqCtx.get(
-        `${baseUrl}/sensorhub/api/observations?datastream=${encodeURIComponent(occDsId)}&phenomenonTime=${encodeURIComponent(windowStartIso)}/${encodeURIComponent(endIso)}&limit=5`,
+        `${baseUrl}/sensorhub/api/observations?dataStream=${encodeURIComponent(occDsId)}&phenomenonTime=${encodeURIComponent(windowStartIso)}/${encodeURIComponent(endIso)}&limit=5`,
         {headers: {Accept: "application/om+json, application/json"}},
       );
       try {
