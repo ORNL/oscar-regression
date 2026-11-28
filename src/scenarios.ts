@@ -122,7 +122,9 @@ import {isPublicObservationId} from "./public-observation-id.js";
 import {alarmRowMatchesTrigger, type AlarmTriggerIdentity} from "./alarm-trigger.js";
 import {
   assessDailyJournalStatus,
+  directJournalRestartPreserved,
   type DailyJournalStatus,
+  type DirectJournalLaneState,
 } from "./daily-journal-oracle.js";
 import type {RpmConfig, RpmStatus, StorageExpectedRelease, SuiteConfig} from "./types.js";
 import {describeError, normalizePathname, poll, safeName, sleep} from "./util.js";
@@ -208,23 +210,6 @@ function parseBoundedEventApiJson(response: BoundedFetchResult, context: string)
   } catch (error) {
     throw new Error(`${context} returned invalid bounded JSON`, {cause: error});
   }
-}
-
-interface DirectJournalLaneState {
-  directoryId: string;
-  present: boolean;
-  files: number;
-  bytes: number;
-  openSegments: number;
-  sealedSegments: number;
-  partialFiles: number;
-  unsafeEntries: number;
-  segments: Array<{
-    path: string;
-    kind: "open" | "seg";
-    bytes: number;
-    sha256: string;
-  }>;
 }
 
 function directJournalInventoryValid(state: DirectJournalLaneState): boolean {
@@ -6565,6 +6550,19 @@ export class RegressionScenarios {
       }, async () => {
         await this.goto(page, "/event-log");
         await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
+        // Switch Event Log to chronological Newest-first sort so accumulated
+        // historical Neutron + Code 9 alarms in default Priority sort do not
+        // push a newly adjudicated Gamma + Code 9 occupancy off Page 1.
+        const newestSortBtn = page.getByTestId("toolbar-sort-time-only").first();
+        await newestSortBtn.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+        if ((await newestSortBtn.getAttribute("aria-pressed")) !== "true") {
+          await newestSortBtn.click();
+          await poll(
+            async () => (await newestSortBtn.getAttribute("aria-pressed")) === "true",
+            Boolean,
+            {timeoutMs: 5_000, intervalMs: 50, description: "Event Log Newest first sort active before Code 9 filter"},
+          );
+        }
         await page.getByRole("button", {name: /advanced filters/i}).first().click();
         const dialog = page.getByRole("dialog", {name: /advanced filters/i});
         await dialog.waitFor({timeout: this.config.uiTimeoutMs});
@@ -6699,6 +6697,16 @@ export class RegressionScenarios {
       }, async () => {
         await this.goto(page, "/event-log");
         await page.locator(".MuiDataGrid-root").waitFor({timeout: this.config.eventTimeoutMs});
+        const newestSortBtn = page.getByTestId("toolbar-sort-time-only").first();
+        await newestSortBtn.waitFor({state: "visible", timeout: this.config.uiTimeoutMs});
+        if ((await newestSortBtn.getAttribute("aria-pressed")) !== "true") {
+          await newestSortBtn.click();
+          await poll(
+            async () => (await newestSortBtn.getAttribute("aria-pressed")) === "true",
+            Boolean,
+            {timeoutMs: 5_000, intervalMs: 50, description: "Event Log Newest first sort active before Code 4 filter"},
+          );
+        }
         await page.getByRole("button", {name: /advanced filters/i}).first().click();
         const dialog = page.getByRole("dialog", {name: /advanced filters/i});
         await dialog.waitFor({timeout: this.config.uiTimeoutMs});
@@ -10097,7 +10105,7 @@ export class RegressionScenarios {
           [directJournalLaneUid!],
         );
         const laneDurable = lane.present && directJournalInventoryValid(lane) &&
-          lane.bytes >= directJournalAfterAppend!.bytes &&
+          directJournalRestartPreserved(directJournalAfterAppend!, lane) &&
           lane.files > 0 && lane.openSegments + lane.sealedSegments > 0 &&
           lane.partialFiles === 0 && lane.unsafeEntries === 0;
         const exactRestartPreservation = Number.isSafeInteger(value.segmentsChecked) &&
