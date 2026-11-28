@@ -1267,7 +1267,7 @@ test("storage lifecycle proves direct journal, whole-child retirement, retrieval
     "unaccountedSingletonDeletes === 0",
     "512 * 1024 * 1024", "65_536",
   ]) assert.ok(block.includes(required), `missing 3.9.2 storage lifecycle assertion: ${required}`);
-  assert.match(block, /lane\.bytes >= directJournalAfterAppend!\.bytes/);
+  assert.match(block, /directJournalRestartPreserved\(directJournalAfterAppend!, lane\)/);
 });
 
 test("restore drill re-runs release identity and scopes metrics disruption to the supported restore", () => {
