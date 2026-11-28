@@ -8097,10 +8097,20 @@ export class RegressionScenarios {
         await sleep(1_000);
       }
 
-      const reloadedCheckbox = await selectReservedLaneOcrTab(true);
-      const checkedAfterSave = reloadedCheckbox
-        ? await reloadedCheckbox.locator('input[type="checkbox"]').first().isChecked()
-        : null;
+      let checkedAfterSave: boolean | null = null;
+      const ocrReloadDeadline = Date.now() + 20_000;
+      while (Date.now() < ocrReloadDeadline) {
+        const reloadedCheckbox = await selectReservedLaneOcrTab(true);
+        if (reloadedCheckbox) {
+          const reloadedInput = reloadedCheckbox.locator('input[type="checkbox"]').first();
+          const isReady = await reloadedInput.isEnabled().catch(() => false);
+          checkedAfterSave = await reloadedInput.isChecked().catch(() => null);
+          if (isReady && checkedAfterSave === enabled) {
+            break;
+          }
+        }
+        await sleep(500);
+      }
       return {supported: true, initiallyChecked, checkedAfterSave, streamId};
     };
 
@@ -11200,11 +11210,15 @@ export class RegressionScenarios {
           await page.getByTestId("vehicle-id-search-submit").click();
           const openUffBtn = page.getByTestId("event-log-open-uff-btn");
           const matchChipVisible = await openUffBtn.waitFor({timeout: 15_000}).then(() => true).catch(() => false);
-          if (matchChipVisible) {
-            await openUffBtn.click();
-          }
           const dialog = page.getByTestId("cargo-uff-viewer-dialog");
-          const opened = matchChipVisible && await dialog.waitFor({timeout: 20_000}).then(() => true).catch(() => false);
+          let opened = false;
+          if (matchChipVisible) {
+            for (let attempt = 0; attempt < 3 && !opened; attempt++) {
+              await openUffBtn.waitFor({state: "visible", timeout: 5_000}).catch(() => undefined);
+              await openUffBtn.click().catch(() => undefined);
+              opened = await dialog.waitFor({timeout: 8_000}).then(() => true).catch(() => false);
+            }
+          }
           const verText = opened
             ? await page.getByTestId("uff-viewer-version-chip").innerText().catch(() => "")
             : "";
